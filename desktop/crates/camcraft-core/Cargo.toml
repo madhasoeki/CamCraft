@@ -1,0 +1,15 @@
+[package]
+name = "camcraft-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Core async networking, ADB tunneling, decoding, and virtual device sinks for CamCraft"
+
+[dependencies]
+anyhow.workspace = true
+camcraft-protocol = { path = "../camcraft-protocol" }
+crossbeam-channel.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

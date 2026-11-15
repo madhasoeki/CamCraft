@@ -1,0 +1,34 @@
+# Rust / Cargo
+desktop/target/
+**/*.rs.bk
+
+# Android / Gradle
+android/.gradle/
+android/build/
+android/app/build/
+android/**/build/
+local.properties
+android/local.properties
+*.apk
+*.aab
+*.ap_
+*.dex
+*.keystore
+*.jks
+.idea/
+*.iml
+*.hprof
+captures/
+
+# Graphify temporary working files (keep GRAPH_REPORT.md, graph.json, graph.html)
+graphify-out/.graphify_*
+graphify-out/cache/
+
+# OS / Editor temporary artifacts
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.tmp
+*.bak
+*~

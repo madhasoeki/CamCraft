@@ -1,0 +1,53 @@
+{
+  "version": 2,
+  "skills": {
+    "android-cli": {
+      "source": "android/skills",
+      "sourceType": "github",
+      "skillPath": "devtools/android-cli/SKILL.md",
+      "computedHash": "83e2185e315636bfd2fa89d7f77639c8604c4d1da7ad4f7cd5876da282d11527"
+    },
+    "android-profiler": {
+      "source": "android/skills",
+      "sourceType": "github",
+      "skillPath": "profilers/android-profiler/SKILL.md",
+      "computedHash": "6653692bba419d55bfdfdffeb30c2a96d409177296556645cd314287304e3341"
+    },
+    "camerax": {
+      "source": "android/skills",
+      "sourceType": "github",
+      "skillPath": "camera/camerax/SKILL.md",
+      "computedHash": "228d5b7222b81e0c08c796e9944cd8b74ba1951db6d3b5b5e0e5600d62bd2144"
+    },
+    "grill-me": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/productivity/grill-me/SKILL.md",
+      "computedHash": "ab1acb9fbd9eaee03da254abb8a8de228d1e7a07475fe959da4a5eefa34ea4b9"
+    },
+    "improve-codebase-architecture": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/engineering/improve-codebase-architecture/SKILL.md",
+      "computedHash": "f0820b18426a7d9a6c823a890988ba0ac70bf0fd596d30d7ef07c88558728c23"
+    },
+    "rust-patterns": {
+      "source": "kodrunhq/opencode-autopilot",
+      "sourceType": "github",
+      "skillPath": "assets/skills/rust-patterns/SKILL.md",
+      "computedHash": "69915ff8a57a00d37f34c91d197964dd87c74f6a4367859997c1101ba20809af"
+    },
+    "rust-pro": {
+      "source": "vudovn/ag-kit",
+      "sourceType": "github",
+      "skillPath": ".agents/skills/rust-pro/SKILL.md",
+      "computedHash": "f6c8c786c104cdaf0f26310f3a6d27e1df65e533f4579cb4e56b0648540725c6"
+    },
+    "to-spec": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/engineering/to-spec/SKILL.md",
+      "computedHash": "eb934b5eda9523c7853a2741544bd4721ee1bea471f5a04f8397827f67bdbdda"
+    }
+  }
+}

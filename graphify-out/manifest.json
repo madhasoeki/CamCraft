@@ -1,0 +1,446 @@
+{
+  ".agents/skills/android-profiler/references/perfetto/bin/trace_processor": {
+    "mtime": 1794734050.575828,
+    "seen": 1794734347.5089712,
+    "ast_hash": "434e94d7fba509a6acf03d34f4c11b87",
+    "semantic_hash": "434e94d7fba509a6acf03d34f4c11b87"
+  },
+  ".zed/settings.json": {
+    "mtime": 1794708190.0,
+    "seen": 1794734347.5089927,
+    "ast_hash": "f836ad842146d345bde169b8c66d1efb",
+    "semantic_hash": "f836ad842146d345bde169b8c66d1efb"
+  },
+  ".zed/tasks.json": {
+    "mtime": 1794708190.0,
+    "seen": 1794734347.5089996,
+    "ast_hash": "12ce76d24f7f7b01c543e90459c10ebd",
+    "semantic_hash": "12ce76d24f7f7b01c543e90459c10ebd"
+  },
+  "scripts/setup-fedora-dev.sh": {
+    "mtime": 1794708190.0,
+    "seen": 1794734347.509005,
+    "ast_hash": "7354a644f32cafc39f3fb89e77a8a766",
+    "semantic_hash": "7354a644f32cafc39f3fb89e77a8a766"
+  },
+  ".agents/skills/android-cli/SKILL.md": {
+    "mtime": 1794734046.7253036,
+    "seen": 1794734347.5090108,
+    "ast_hash": "6441e0415420c724159b8ce4ef3fb82b",
+    "semantic_hash": "6441e0415420c724159b8ce4ef3fb82b"
+  },
+  ".agents/skills/android-profiler/SKILL.md": {
+    "mtime": 1794734050.563281,
+    "seen": 1794734347.509016,
+    "ast_hash": "af33304fe7bd6986a2be0439b823a59e",
+    "semantic_hash": "af33304fe7bd6986a2be0439b823a59e"
+  },
+  ".agents/skills/android-profiler/analysis/analysis_orchestrator.md": {
+    "mtime": 1794734050.5663655,
+    "seen": 1794734347.5090218,
+    "ast_hash": "98215405aa0bc07116d93192f8873444",
+    "semantic_hash": "98215405aa0bc07116d93192f8873444"
+  },
+  ".agents/skills/android-profiler/analysis/workflows/perfetto-sql/perfetto_sql.md": {
+    "mtime": 1794734050.5753815,
+    "seen": 1794734347.5090268,
+    "ast_hash": "ab94cd7c8729639c84b0884449537804",
+    "semantic_hash": "ab94cd7c8729639c84b0884449537804"
+  },
+  ".agents/skills/android-profiler/analysis/workflows/perfetto-trace-analysis/perfetto_trace_analysis.md": {
+    "mtime": 1794734050.575529,
+    "seen": 1794734347.5090322,
+    "ast_hash": "c63b793960c3f831c1d77d56ee427a5d",
+    "semantic_hash": "c63b793960c3f831c1d77d56ee427a5d"
+  },
+  ".agents/skills/android-profiler/analysis/workflows/perfetto-trace-analysis/references/hints/hints_cpu.md": {
+    "mtime": 1794734050.5796688,
+    "seen": 1794734347.5090375,
+    "ast_hash": "16a1e96406b8a570cb4472bbc859876b",
+    "semantic_hash": "16a1e96406b8a570cb4472bbc859876b"
+  },
+  ".agents/skills/android-profiler/analysis/workflows/perfetto-trace-analysis/references/hints/hints_graphics.md": {
+    "mtime": 1794734050.5801327,
+    "seen": 1794734347.5090427,
+    "ast_hash": "d112368b16b4c9e2c86c4c1fcaa290f6",
+    "semantic_hash": "d112368b16b4c9e2c86c4c1fcaa290f6"
+  },
+  ".agents/skills/android-profiler/analysis/workflows/perfetto-trace-analysis/references/hints/hints_io.md": {
+    "mtime": 1794734050.5801985,
+    "seen": 1794734347.5090485,
+    "ast_hash": "3b7e2bd94a0fe3528ec56e27e0d3fbe8",
+    "semantic_hash": "3b7e2bd94a0fe3528ec56e27e0d3fbe8"
+  },
+  ".agents/skills/android-profiler/analysis/workflows/perfetto-trace-analysis/references/hints/hints_ipc.md": {
+    "mtime": 1794734050.5823808,
+    "seen": 1794734347.5090537,
+    "ast_hash": "b8aaf94ffdb1639cd12a15ab0eac29c2",
+    "semantic_hash": "b8aaf94ffdb1639cd12a15ab0eac29c2"
+  },
+  ".agents/skills/android-profiler/analysis/workflows/perfetto-trace-analysis/references/hints/hints_memory.md": {
+    "mtime": 1794734050.5811338,
+    "seen": 1794734347.5090592,
+    "ast_hash": "fd5bcad45103b97d8297d9bbbda50d7f",
+    "semantic_hash": "fd5bcad45103b97d8297d9bbbda50d7f"
+  },
+  ".agents/skills/android-profiler/analysis/workflows/perfetto-trace-analysis/references/hints/hints_power.md": {
+    "mtime": 1794734050.5802498,
+    "seen": 1794734347.5090642,
+    "ast_hash": "48e170405f02bf25a598e5cf77fcd474",
+    "semantic_hash": "48e170405f02bf25a598e5cf77fcd474"
+  },
+  ".agents/skills/android-profiler/analysis/workflows/perfetto-trace-analysis/references/per_candidate_analysis.md": {
+    "mtime": 1794734050.5796688,
+    "seen": 1794734347.5090697,
+    "ast_hash": "97f591d9facd86995a9c3a82ef9b8d49",
+    "semantic_hash": "97f591d9facd86995a9c3a82ef9b8d49"
+  },
+  ".agents/skills/android-profiler/analysis/workflows/perfetto-trace-analysis/references/triage.md": {
+    "mtime": 1794734050.5778987,
+    "seen": 1794734347.5090747,
+    "ast_hash": "cba3b33f8dc7378cc3fd149e6d706da1",
+    "semantic_hash": "cba3b33f8dc7378cc3fd149e6d706da1"
+  },
+  ".agents/skills/android-profiler/recording/recording_orchestrator.md": {
+    "mtime": 1794734050.5664766,
+    "seen": 1794734347.5090802,
+    "ast_hash": "16b7b37e7f3da5352d4686ad7cd34d71",
+    "semantic_hash": "16b7b37e7f3da5352d4686ad7cd34d71"
+  },
+  ".agents/skills/android-profiler/recording/workflows/perfetto-trace-recording/perfetto_trace_recording.md": {
+    "mtime": 1794734050.575684,
+    "seen": 1794734347.5090854,
+    "ast_hash": "d5a07f854198101d63a1a2401db4379d",
+    "semantic_hash": "d5a07f854198101d63a1a2401db4379d"
+  },
+  ".agents/skills/android-profiler/recording/workflows/perfetto-trace-recording/references/trace_config_reference.md": {
+    "mtime": 1794734050.5796688,
+    "seen": 1794734347.5090907,
+    "ast_hash": "a0e5e9a83c76d2981f4f2dc89cd1c6dc",
+    "semantic_hash": "a0e5e9a83c76d2981f4f2dc89cd1c6dc"
+  },
+  ".agents/skills/android-profiler/references/env_setup.md": {
+    "mtime": 1794734050.5673807,
+    "seen": 1794734347.509096,
+    "ast_hash": "ec4ca0edfe083191d3b813d5fdd11948",
+    "semantic_hash": "ec4ca0edfe083191d3b813d5fdd11948"
+  },
+  ".agents/skills/android-profiler/references/perfetto/setup.md": {
+    "mtime": 1794734050.5735292,
+    "seen": 1794734347.5091014,
+    "ast_hash": "4c26a8d533eb4baab68eb34c1548f08a",
+    "semantic_hash": "4c26a8d533eb4baab68eb34c1548f08a"
+  },
+  ".agents/skills/android-profiler/references/perfetto/sql.md": {
+    "mtime": 1794734050.5739322,
+    "seen": 1794734347.5091069,
+    "ast_hash": "aa7b3eea344396ed83780ae1100b3be1",
+    "semantic_hash": "aa7b3eea344396ed83780ae1100b3be1"
+  },
+  ".agents/skills/camerax/SKILL.md": {
+    "mtime": 1794734042.3582897,
+    "seen": 1794734347.5091124,
+    "ast_hash": "f4952f1fd772e68ecc1506e44c6f0b5a",
+    "semantic_hash": "f4952f1fd772e68ecc1506e44c6f0b5a"
+  },
+  ".agents/skills/camerax/references/camera1-to-camerax.md": {
+    "mtime": 1794734042.3609538,
+    "seen": 1794734347.5091174,
+    "ast_hash": "e171e6c9c16abb03c355ce940bf986ee",
+    "semantic_hash": "e171e6c9c16abb03c355ce940bf986ee"
+  },
+  ".agents/skills/camerax/references/camera2-to-camerax.md": {
+    "mtime": 1794734042.3609538,
+    "seen": 1794734347.5091228,
+    "ast_hash": "650e4383819647fd188af92f154a65b1",
+    "semantic_hash": "650e4383819647fd188af92f154a65b1"
+  },
+  ".agents/skills/camerax/references/expert-blueprints.md": {
+    "mtime": 1794734042.3611403,
+    "seen": 1794734347.509128,
+    "ast_hash": "61e3e753d48dcac731ed866b55f177bd",
+    "semantic_hash": "61e3e753d48dcac731ed866b55f177bd"
+  },
+  ".agents/skills/camerax/references/foldables.md": {
+    "mtime": 1794734042.3612187,
+    "seen": 1794734347.5091336,
+    "ast_hash": "99de84c47ed2cec0b43e7b5a234f5322",
+    "semantic_hash": "99de84c47ed2cec0b43e7b5a234f5322"
+  },
+  ".agents/skills/camerax/references/immutability.md": {
+    "mtime": 1794734042.3612187,
+    "seen": 1794734347.5091386,
+    "ast_hash": "09814c4cff0000db162d8149a277d9da",
+    "semantic_hash": "09814c4cff0000db162d8149a277d9da"
+  },
+  ".agents/skills/camerax/references/low-light.md": {
+    "mtime": 1794734042.3613245,
+    "seen": 1794734347.509144,
+    "ast_hash": "600ff22cb49ba83d2cca48ce5fbdcdcd",
+    "semantic_hash": "600ff22cb49ba83d2cca48ce5fbdcdcd"
+  },
+  ".agents/skills/camerax/references/mlkit-spatial.md": {
+    "mtime": 1794734042.361399,
+    "seen": 1794734347.5091496,
+    "ast_hash": "2fbe6b0d43cebace111be97a28be68c2",
+    "semantic_hash": "2fbe6b0d43cebace111be97a28be68c2"
+  },
+  ".agents/skills/camerax/references/modern-apis.md": {
+    "mtime": 1794734042.3614953,
+    "seen": 1794734347.5091546,
+    "ast_hash": "ea96520c29d0f49a95e2118410c27a1f",
+    "semantic_hash": "ea96520c29d0f49a95e2118410c27a1f"
+  },
+  ".agents/skills/camerax/references/testing.md": {
+    "mtime": 1794734042.3616607,
+    "seen": 1794734347.50916,
+    "ast_hash": "3c2b283ee12cc409776bb0d9952a7768",
+    "semantic_hash": "3c2b283ee12cc409776bb0d9952a7768"
+  },
+  ".agents/skills/camerax/references/thermals.md": {
+    "mtime": 1794734042.3614953,
+    "seen": 1794734347.5091653,
+    "ast_hash": "cb92dae563181a3ead586bde8f850a5c",
+    "semantic_hash": "cb92dae563181a3ead586bde8f850a5c"
+  },
+  ".agents/skills/camerax/references/wear-os.md": {
+    "mtime": 1794734042.3615618,
+    "seen": 1794734347.5091708,
+    "ast_hash": "b097085e790b9bd0af1a5adf1db4347d",
+    "semantic_hash": "b097085e790b9bd0af1a5adf1db4347d"
+  },
+  ".agents/skills/camerax/references/xr.md": {
+    "mtime": 1794734042.3616607,
+    "seen": 1794734347.5091758,
+    "ast_hash": "b7b51ea719caaeb606b63dd6cd47c875",
+    "semantic_hash": "b7b51ea719caaeb606b63dd6cd47c875"
+  },
+  "AGENTS.md": {
+    "mtime": 1794734119.537145,
+    "seen": 1794734347.5091813,
+    "ast_hash": "0b53db235d2fbc4e5966be0106fa9d1c",
+    "semantic_hash": "0b53db235d2fbc4e5966be0106fa9d1c"
+  },
+  "CLAUDE.md": {
+    "mtime": 1794734119.537145,
+    "seen": 1794734347.5091865,
+    "ast_hash": "0b53db235d2fbc4e5966be0106fa9d1c",
+    "semantic_hash": "0b53db235d2fbc4e5966be0106fa9d1c"
+  },
+  "PROMPTS.md": {
+    "mtime": 1794708190.0,
+    "seen": 1794734347.509192,
+    "ast_hash": "2131627b36bf24b196ec5877d4815f24",
+    "semantic_hash": "2131627b36bf24b196ec5877d4815f24"
+  },
+  "README.md": {
+    "mtime": 1794708190.0,
+    "seen": 1794734347.5091972,
+    "ast_hash": "d4ba24362f37b67ec8d6a7dfe47b3400",
+    "semantic_hash": "d4ba24362f37b67ec8d6a7dfe47b3400"
+  },
+  "docs/DESIGN.md": {
+    "mtime": 1794708190.0,
+    "seen": 1794734347.5092025,
+    "ast_hash": "a9b30c985b93af6905ee090d049daedc",
+    "semantic_hash": "a9b30c985b93af6905ee090d049daedc"
+  },
+  "docs/PLAN.md": {
+    "mtime": 1794708190.0,
+    "seen": 1794734347.5092077,
+    "ast_hash": "d0d8be206f940f06d0ad51aa1683a5eb",
+    "semantic_hash": "d0d8be206f940f06d0ad51aa1683a5eb"
+  },
+  "docs/PRD.md": {
+    "mtime": 1794708190.0,
+    "seen": 1794734347.509213,
+    "ast_hash": "7d5e351fd2599c4ee8a2a553f2d7d61a",
+    "semantic_hash": "7d5e351fd2599c4ee8a2a553f2d7d61a"
+  },
+  "docs/PROTOCOL.md": {
+    "mtime": 1794708190.0,
+    "seen": 1794734347.5092194,
+    "ast_hash": "3f9186ac21a5a8582c8baaaaf9e30f5c",
+    "semantic_hash": "3f9186ac21a5a8582c8baaaaf9e30f5c"
+  },
+  ".agents/skills/grill-me/agents/openai.yaml": {
+    "mtime": 1794734061.6739912,
+    "seen": 1794734969.4644358,
+    "ast_hash": "aff7b6f7b10220e3b4537c42a2d08917",
+    "semantic_hash": ""
+  },
+  ".agents/skills/improve-codebase-architecture/agents/openai.yaml": {
+    "mtime": 1794734068.7236154,
+    "seen": 1794734969.4644406,
+    "ast_hash": "e73ee28ebe885ee90bec6f34554efdd1",
+    "semantic_hash": ""
+  },
+  ".agents/skills/to-spec/agents/openai.yaml": {
+    "mtime": 1794734065.12173,
+    "seen": 1794734969.4644434,
+    "ast_hash": "886d06b1f83b51e39bd2874b75730f87",
+    "semantic_hash": ""
+  },
+  "android/app/build.gradle.kts": {
+    "mtime": 1794734860.8283591,
+    "seen": 1794734969.4644547,
+    "ast_hash": "1401da9be0baa3bf957befcc708c53f0",
+    "semantic_hash": ""
+  },
+  "android/app/src/main/java/org/artcraft/camcraft/MainActivity.kt": {
+    "mtime": 1794734882.122595,
+    "seen": 1794734969.4644568,
+    "ast_hash": "c306cac3bbb580dbf064f9e629d24dd1",
+    "semantic_hash": ""
+  },
+  "android/app/src/main/java/org/artcraft/camcraft/camera/CameraController.kt": {
+    "mtime": 1794734882.1425953,
+    "seen": 1794734969.4644585,
+    "ast_hash": "4aa724706de0b322db1686b4eb9b1edd",
+    "semantic_hash": ""
+  },
+  "android/app/src/main/java/org/artcraft/camcraft/encoder/EncoderStubs.kt": {
+    "mtime": 1794734882.1435955,
+    "seen": 1794734969.4644606,
+    "ast_hash": "63f027a505040389fe140fcd2336d572",
+    "semantic_hash": ""
+  },
+  "android/app/src/main/java/org/artcraft/camcraft/network/StreamConnectionService.kt": {
+    "mtime": 1794734882.1435955,
+    "seen": 1794734969.4644625,
+    "ast_hash": "d4ae0159001ac293bc4a421f24151707",
+    "semantic_hash": ""
+  },
+  "android/app/src/main/java/org/artcraft/camcraft/protocol/CcftProtocolConstants.kt": {
+    "mtime": 1794734882.1425953,
+    "seen": 1794734969.464465,
+    "ast_hash": "04a2c6f184bbe13df9b7b85d1c9605f8",
+    "semantic_hash": ""
+  },
+  "android/app/src/main/java/org/artcraft/camcraft/ui/CamCraftScreen.kt": {
+    "mtime": 1794734882.1435955,
+    "seen": 1794734969.4644673,
+    "ast_hash": "362378c8937a8c860d4cea58155a0dd1",
+    "semantic_hash": ""
+  },
+  "android/app/src/test/java/org/artcraft/camcraft/ScaffoldingSmokeTest.kt": {
+    "mtime": 1794734882.1205952,
+    "seen": 1794734969.4644692,
+    "ast_hash": "2e8a30c2bfd4ba96bc174a086f33809c",
+    "semantic_hash": ""
+  },
+  "android/build.gradle.kts": {
+    "mtime": 1794734860.8263593,
+    "seen": 1794734969.4644713,
+    "ast_hash": "2f1df9005df7916217db80a27fac621e",
+    "semantic_hash": ""
+  },
+  "android/gradlew": {
+    "mtime": 1794734932.653155,
+    "seen": 1794734969.4644732,
+    "ast_hash": "a43be8432bac3ffd05b3769aa42fe996",
+    "semantic_hash": ""
+  },
+  "android/settings.gradle.kts": {
+    "mtime": 1794734860.8263593,
+    "seen": 1794734969.4644752,
+    "ast_hash": "9edd282282c8191efd419c5e0330b22c",
+    "semantic_hash": ""
+  },
+  "desktop/Cargo.toml": {
+    "mtime": 1794734600.9714797,
+    "seen": 1794734969.4644773,
+    "ast_hash": "44c32714468088f1553b70c46a253ad1",
+    "semantic_hash": ""
+  },
+  "desktop/crates/camcraft-cli/Cargo.toml": {
+    "mtime": 1794734600.98148,
+    "seen": 1794734969.464479,
+    "ast_hash": "3f3d3c4847ec49ce38881789b029e8aa",
+    "semantic_hash": ""
+  },
+  "desktop/crates/camcraft-cli/src/main.rs": {
+    "mtime": 1794734601.0074801,
+    "seen": 1794734969.464481,
+    "ast_hash": "2327a1d1e41d76b9f5b0578c6608cec2",
+    "semantic_hash": ""
+  },
+  "desktop/crates/camcraft-core/Cargo.toml": {
+    "mtime": 1794734600.9824798,
+    "seen": 1794734969.464483,
+    "ast_hash": "4f6e371ae6ab4f34e957c59209f3a2ff",
+    "semantic_hash": ""
+  },
+  "desktop/crates/camcraft-core/src/lib.rs": {
+    "mtime": 1794734706.231646,
+    "seen": 1794734969.4644852,
+    "ast_hash": "a29ee40e76e775e45416adc7a45e88e6",
+    "semantic_hash": ""
+  },
+  "desktop/crates/camcraft-gui/Cargo.toml": {
+    "mtime": 1794734600.98348,
+    "seen": 1794734969.4644868,
+    "ast_hash": "04dae5464d789f3f39b8af43741b36b8",
+    "semantic_hash": ""
+  },
+  "desktop/crates/camcraft-gui/src/main.rs": {
+    "mtime": 1794734702.7656078,
+    "seen": 1794734969.4644887,
+    "ast_hash": "d95677fee09aae3b19034a71193ea785",
+    "semantic_hash": ""
+  },
+  "desktop/crates/camcraft-protocol/Cargo.toml": {
+    "mtime": 1794734600.98048,
+    "seen": 1794734969.4644904,
+    "ast_hash": "015dcf1aaaf37db80f9ffcb45c96e9a8",
+    "semantic_hash": ""
+  },
+  "desktop/crates/camcraft-protocol/src/lib.rs": {
+    "mtime": 1794734600.98448,
+    "seen": 1794734969.4644923,
+    "ast_hash": "babfcdf11e86231771fe7226c30bcdff",
+    "semantic_hash": ""
+  },
+  "skills-lock.json": {
+    "mtime": 1794734068.727582,
+    "seen": 1794734969.4644973,
+    "ast_hash": "d7df44019002e1a18ede3ecb944cb787",
+    "semantic_hash": ""
+  },
+  ".agents/skills/grill-me/SKILL.md": {
+    "mtime": 1794734061.6736696,
+    "seen": 1794734969.464574,
+    "ast_hash": "51ba9306293963bb76680d5e41525aea",
+    "semantic_hash": ""
+  },
+  ".agents/skills/improve-codebase-architecture/HTML-REPORT.md": {
+    "mtime": 1794734068.723243,
+    "seen": 1794734969.4645762,
+    "ast_hash": "2ee5137278168f65fa79115c8c3faa43",
+    "semantic_hash": ""
+  },
+  ".agents/skills/improve-codebase-architecture/SKILL.md": {
+    "mtime": 1794734068.7233078,
+    "seen": 1794734969.4645782,
+    "ast_hash": "5985cfe04d73ee4917b4c42050827420",
+    "semantic_hash": ""
+  },
+  ".agents/skills/rust-patterns/SKILL.md": {
+    "mtime": 1794734058.310784,
+    "seen": 1794734969.46458,
+    "ast_hash": "e2f0a5ef17ed8c1abfb2b2f141ba8b9f",
+    "semantic_hash": ""
+  },
+  ".agents/skills/rust-pro/SKILL.md": {
+    "mtime": 1794734054.0757496,
+    "seen": 1794734969.464582,
+    "ast_hash": "f28b0a8e90fed2d0cfb1afbcb30a5248",
+    "semantic_hash": ""
+  },
+  ".agents/skills/to-spec/SKILL.md": {
+    "mtime": 1794734065.1215062,
+    "seen": 1794734969.4645836,
+    "ast_hash": "e3dfdcab6ad16aabbd935deb664172b1",
+    "semantic_hash": ""
+  }
+}
