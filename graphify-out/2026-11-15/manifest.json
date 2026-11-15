@@ -9,13 +9,15 @@
     "mtime": 1794708190.0,
     "seen": 1794734347.5089927,
     "ast_hash": "f836ad842146d345bde169b8c66d1efb",
-    "semantic_hash": "f836ad842146d345bde169b8c66d1efb"
+    "semantic_hash": "f836ad842146d345bde169b8c66d1efb",
+    "ast_empty": true
   },
   ".zed/tasks.json": {
     "mtime": 1794708190.0,
     "seen": 1794734347.5089996,
     "ast_hash": "12ce76d24f7f7b01c543e90459c10ebd",
-    "semantic_hash": "12ce76d24f7f7b01c543e90459c10ebd"
+    "semantic_hash": "12ce76d24f7f7b01c543e90459c10ebd",
+    "ast_empty": true
   },
   "scripts/setup-fedora-dev.sh": {
     "mtime": 1794708190.0,
@@ -262,5 +264,187 @@
     "seen": 1794734347.5092194,
     "ast_hash": "3f9186ac21a5a8582c8baaaaf9e30f5c",
     "semantic_hash": "3f9186ac21a5a8582c8baaaaf9e30f5c"
+  },
+  ".agents/skills/grill-me/agents/openai.yaml": {
+    "mtime": 1794734061.6739912,
+    "seen": 1794739663.9644697,
+    "ast_hash": "aff7b6f7b10220e3b4537c42a2d08917",
+    "semantic_hash": "aff7b6f7b10220e3b4537c42a2d08917"
+  },
+  ".agents/skills/improve-codebase-architecture/agents/openai.yaml": {
+    "mtime": 1794734068.7236154,
+    "seen": 1794739663.9645414,
+    "ast_hash": "e73ee28ebe885ee90bec6f34554efdd1",
+    "semantic_hash": "e73ee28ebe885ee90bec6f34554efdd1"
+  },
+  ".agents/skills/to-spec/agents/openai.yaml": {
+    "mtime": 1794734065.12173,
+    "seen": 1794739663.9646087,
+    "ast_hash": "886d06b1f83b51e39bd2874b75730f87",
+    "semantic_hash": "886d06b1f83b51e39bd2874b75730f87"
+  },
+  "android/app/build.gradle.kts": {
+    "mtime": 1794734860.8283591,
+    "seen": 1794739663.9647923,
+    "ast_hash": "1401da9be0baa3bf957befcc708c53f0",
+    "semantic_hash": "1401da9be0baa3bf957befcc708c53f0"
+  },
+  "android/app/src/main/java/org/artcraft/camcraft/MainActivity.kt": {
+    "mtime": 1794734882.122595,
+    "seen": 1794739663.9648447,
+    "ast_hash": "c306cac3bbb580dbf064f9e629d24dd1",
+    "semantic_hash": "c306cac3bbb580dbf064f9e629d24dd1"
+  },
+  "android/app/src/main/java/org/artcraft/camcraft/camera/CameraController.kt": {
+    "mtime": 1794734882.1425953,
+    "seen": 1794739663.9649282,
+    "ast_hash": "4aa724706de0b322db1686b4eb9b1edd",
+    "semantic_hash": "4aa724706de0b322db1686b4eb9b1edd"
+  },
+  "android/app/src/main/java/org/artcraft/camcraft/encoder/EncoderStubs.kt": {
+    "mtime": 1794734882.1435955,
+    "seen": 1794739663.9650412,
+    "ast_hash": "63f027a505040389fe140fcd2336d572",
+    "semantic_hash": "63f027a505040389fe140fcd2336d572"
+  },
+  "android/app/src/main/java/org/artcraft/camcraft/network/StreamConnectionService.kt": {
+    "mtime": 1794734882.1435955,
+    "seen": 1794739663.9651246,
+    "ast_hash": "d4ae0159001ac293bc4a421f24151707",
+    "semantic_hash": "d4ae0159001ac293bc4a421f24151707"
+  },
+  "android/app/src/main/java/org/artcraft/camcraft/protocol/CcftProtocolConstants.kt": {
+    "mtime": 1794734882.1425953,
+    "seen": 1794739663.9652073,
+    "ast_hash": "04a2c6f184bbe13df9b7b85d1c9605f8",
+    "semantic_hash": "04a2c6f184bbe13df9b7b85d1c9605f8"
+  },
+  "android/app/src/main/java/org/artcraft/camcraft/ui/CamCraftScreen.kt": {
+    "mtime": 1794734882.1435955,
+    "seen": 1794739663.9652858,
+    "ast_hash": "362378c8937a8c860d4cea58155a0dd1",
+    "semantic_hash": "362378c8937a8c860d4cea58155a0dd1"
+  },
+  "android/app/src/test/java/org/artcraft/camcraft/ScaffoldingSmokeTest.kt": {
+    "mtime": 1794734882.1205952,
+    "seen": 1794739663.9653656,
+    "ast_hash": "2e8a30c2bfd4ba96bc174a086f33809c",
+    "semantic_hash": "2e8a30c2bfd4ba96bc174a086f33809c"
+  },
+  "android/build.gradle.kts": {
+    "mtime": 1794734860.8263593,
+    "seen": 1794739663.9654417,
+    "ast_hash": "2f1df9005df7916217db80a27fac621e",
+    "semantic_hash": "2f1df9005df7916217db80a27fac621e"
+  },
+  "android/gradlew": {
+    "mtime": 1794734932.653155,
+    "seen": 1794739663.9654884,
+    "ast_hash": "a43be8432bac3ffd05b3769aa42fe996",
+    "semantic_hash": "a43be8432bac3ffd05b3769aa42fe996"
+  },
+  "android/settings.gradle.kts": {
+    "mtime": 1794734860.8263593,
+    "seen": 1794739663.965532,
+    "ast_hash": "9edd282282c8191efd419c5e0330b22c",
+    "semantic_hash": "9edd282282c8191efd419c5e0330b22c"
+  },
+  "desktop/Cargo.toml": {
+    "mtime": 1794734600.9714797,
+    "seen": 1794739663.9656143,
+    "ast_hash": "44c32714468088f1553b70c46a253ad1",
+    "semantic_hash": "44c32714468088f1553b70c46a253ad1",
+    "ast_empty": true
+  },
+  "desktop/crates/camcraft-cli/Cargo.toml": {
+    "mtime": 1794734600.98148,
+    "seen": 1794739663.96562,
+    "ast_hash": "3f3d3c4847ec49ce38881789b029e8aa",
+    "semantic_hash": "3f3d3c4847ec49ce38881789b029e8aa"
+  },
+  "desktop/crates/camcraft-cli/src/main.rs": {
+    "mtime": 1794734601.0074801,
+    "seen": 1794739663.9657145,
+    "ast_hash": "2327a1d1e41d76b9f5b0578c6608cec2",
+    "semantic_hash": "2327a1d1e41d76b9f5b0578c6608cec2"
+  },
+  "desktop/crates/camcraft-core/Cargo.toml": {
+    "mtime": 1794734600.9824798,
+    "seen": 1794739663.9658458,
+    "ast_hash": "4f6e371ae6ab4f34e957c59209f3a2ff",
+    "semantic_hash": "4f6e371ae6ab4f34e957c59209f3a2ff"
+  },
+  "desktop/crates/camcraft-core/src/lib.rs": {
+    "mtime": 1794734706.231646,
+    "seen": 1794739663.9659445,
+    "ast_hash": "a29ee40e76e775e45416adc7a45e88e6",
+    "semantic_hash": "a29ee40e76e775e45416adc7a45e88e6"
+  },
+  "desktop/crates/camcraft-gui/Cargo.toml": {
+    "mtime": 1794734600.98348,
+    "seen": 1794739663.9660332,
+    "ast_hash": "04dae5464d789f3f39b8af43741b36b8",
+    "semantic_hash": "04dae5464d789f3f39b8af43741b36b8"
+  },
+  "desktop/crates/camcraft-gui/src/main.rs": {
+    "mtime": 1794734702.7656078,
+    "seen": 1794739663.966091,
+    "ast_hash": "d95677fee09aae3b19034a71193ea785",
+    "semantic_hash": "d95677fee09aae3b19034a71193ea785"
+  },
+  "desktop/crates/camcraft-protocol/Cargo.toml": {
+    "mtime": 1794734600.98048,
+    "seen": 1794739663.9661489,
+    "ast_hash": "015dcf1aaaf37db80f9ffcb45c96e9a8",
+    "semantic_hash": "015dcf1aaaf37db80f9ffcb45c96e9a8"
+  },
+  "desktop/crates/camcraft-protocol/src/lib.rs": {
+    "mtime": 1794739585.2999594,
+    "seen": 1794739663.966214,
+    "ast_hash": "09594776b00e7874213e1845626a645b",
+    "semantic_hash": "09594776b00e7874213e1845626a645b"
+  },
+  "skills-lock.json": {
+    "mtime": 1794734068.727582,
+    "seen": 1794739663.9663887,
+    "ast_hash": "d7df44019002e1a18ede3ecb944cb787",
+    "semantic_hash": "d7df44019002e1a18ede3ecb944cb787",
+    "ast_empty": true
+  },
+  ".agents/skills/grill-me/SKILL.md": {
+    "mtime": 1794734061.6736696,
+    "seen": 1794734969.464574,
+    "ast_hash": "51ba9306293963bb76680d5e41525aea",
+    "semantic_hash": ""
+  },
+  ".agents/skills/improve-codebase-architecture/HTML-REPORT.md": {
+    "mtime": 1794734068.723243,
+    "seen": 1794734969.4645762,
+    "ast_hash": "2ee5137278168f65fa79115c8c3faa43",
+    "semantic_hash": ""
+  },
+  ".agents/skills/improve-codebase-architecture/SKILL.md": {
+    "mtime": 1794734068.7233078,
+    "seen": 1794734969.4645782,
+    "ast_hash": "5985cfe04d73ee4917b4c42050827420",
+    "semantic_hash": ""
+  },
+  ".agents/skills/rust-patterns/SKILL.md": {
+    "mtime": 1794734058.310784,
+    "seen": 1794734969.46458,
+    "ast_hash": "e2f0a5ef17ed8c1abfb2b2f141ba8b9f",
+    "semantic_hash": ""
+  },
+  ".agents/skills/rust-pro/SKILL.md": {
+    "mtime": 1794734054.0757496,
+    "seen": 1794734969.464582,
+    "ast_hash": "f28b0a8e90fed2d0cfb1afbcb30a5248",
+    "semantic_hash": ""
+  },
+  ".agents/skills/to-spec/SKILL.md": {
+    "mtime": 1794734065.1215062,
+    "seen": 1794734969.4645836,
+    "ast_hash": "e3dfdcab6ad16aabbd935deb664172b1",
+    "semantic_hash": ""
   }
 }
