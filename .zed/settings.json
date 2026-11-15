@@ -1,0 +1,56 @@
+{
+  "project_name": "CamCraft Monorepo",
+  "format_on_save": "on",
+  "tab_size": 4,
+  "hard_tabs": false,
+  "assistant": {
+    "enabled": true,
+    "version": "2",
+    "default_model": {
+      "provider": "antigravity",
+      "model": "hydrogen"
+    }
+  },
+  "lsp": {
+    "rust-analyzer": {
+      "initialization_options": {
+        "linkedProjects": [
+          "desktop/Cargo.toml"
+        ],
+        "check": {
+          "command": "clippy",
+          "extraArgs": [
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings"
+          ]
+        },
+        "cargo": {
+          "allFeatures": true
+        }
+      }
+    }
+  },
+  "languages": {
+    "Rust": {
+      "tab_size": 4,
+      "format_on_save": "on"
+    },
+    "Kotlin": {
+      "tab_size": 4,
+      "format_on_save": "on"
+    },
+    "Markdown": {
+      "tab_size": 2,
+      "soft_wrap": "preferred_line_length"
+    }
+  },
+  "file_scan_exclusions": [
+    "**/.git",
+    "**/target",
+    "**/.gradle",
+    "**/build",
+    "**/.idea"
+  ]
+}

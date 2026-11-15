@@ -1,0 +1,58 @@
+[
+  {
+    "label": "CamCraft: Check All (Rust + Android Tests)",
+    "command": "just check-all",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "Rust: Cargo Check & Clippy",
+    "command": "just rust-check && just rust-lint",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "Rust: Run Protocol & Core Unit Tests",
+    "command": "just rust-test",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "Rust: Run Desktop GUI (Release)",
+    "command": "just run-gui",
+    "use_new_terminal": true,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "Android: Build & Install Debug APK via USB",
+    "command": "just android-install",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "Fedora: Setup USB ADB Tunnel (Port 9876)",
+    "command": "just usb-tunnel",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "Fedora: Setup Virtual Camera (/dev/video10) & Virtual Mic",
+    "command": "just setup-vcam && just setup-vmic",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "Graphify: Update Knowledge Graph",
+    "command": "just graph",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  }
+]
