@@ -38,7 +38,7 @@
             android:name=".network.CamCraftStreamService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="connectedDevice" />
+            android:foregroundServiceType="connectedDevice|camera|microphone" />
     </application>
 
 </manifest>

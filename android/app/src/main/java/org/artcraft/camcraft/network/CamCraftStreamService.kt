@@ -11,6 +11,7 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
+import androidx.camera.view.PreviewView
 import androidx.core.app.NotificationCompat
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
@@ -26,7 +27,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -34,6 +34,8 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.artcraft.camcraft.MainActivity
+import org.artcraft.camcraft.camera.CameraEnumerator
+import org.artcraft.camcraft.camera.CameraStreamManager
 import org.artcraft.camcraft.protocol.ActiveCameraState
 import org.artcraft.camcraft.protocol.CameraInfo
 import org.artcraft.camcraft.protocol.CcftFlags
@@ -103,8 +105,18 @@ class CamCraftStreamService : Service() {
     private var serverSocket: ServerSocket? = null
     private var serverJob: Job? = null
 
+    private var cameraStreamManager: CameraStreamManager? = null
+
     @Volatile
-    private var requestKeyframePending: Boolean = false
+    private var activeClientOutputStream: OutputStream? = null
+    private val clientOutputLock = Any()
+
+    @Volatile
+    private var totalFramesSent: Long = 0
+    @Volatile
+    private var windowFrames: Long = 0
+    @Volatile
+    private var windowStartNs: Long = System.nanoTime()
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -112,6 +124,19 @@ class CamCraftStreamService : Service() {
         super.onCreate()
         createNotificationChannel()
         startInForeground()
+
+        try {
+            val manager = CameraStreamManager(this) { packetType, flags, ptsUs, payload ->
+                handleVideoPacketFromEncoder(packetType, flags, ptsUs, payload)
+            }
+            cameraStreamManager = manager
+            activeInstance = this
+            pendingPreviewView?.let { previewView ->
+                manager.attachPreviewView(previewView)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to initialize CameraStreamManager: ${e.message}", e)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -135,13 +160,26 @@ class CamCraftStreamService : Service() {
         super.onDestroy()
         Log.i(TAG, "Destroying CamCraft service")
         stopServer()
+        cameraStreamManager?.release()
+        cameraStreamManager = null
+        if (activeInstance == this) {
+            activeInstance = null
+        }
         serviceScope.cancel()
         _serviceState.value = StreamServiceState(status = StreamConnectionStatus.STOPPED)
     }
 
     private fun startInForeground() {
         val notification = buildNotification("Starting CamCraft Server...")
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE,
+            )
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
                 NOTIFICATION_ID,
                 notification,
@@ -197,6 +235,52 @@ class CamCraftStreamService : Service() {
         }
     }
 
+    private fun handleVideoPacketFromEncoder(
+        packetType: PacketType,
+        flags: Int,
+        ptsUs: Long,
+        payload: ByteArray,
+    ) {
+        val stream = activeClientOutputStream ?: return
+        try {
+            synchronized(clientOutputLock) {
+                CcftPacket.writePacket(
+                    output = stream,
+                    type = packetType,
+                    flags = flags,
+                    ptsUs = ptsUs,
+                    payload = payload,
+                    offset = 0,
+                    length = payload.size,
+                    flush = true,
+                )
+            }
+            onFrameSent(packetType)
+        } catch (e: IOException) {
+            Log.w(TAG, "Failed writing video packet to client: ${e.message}")
+        }
+    }
+
+    private fun onFrameSent(packetType: PacketType) {
+        if (packetType != PacketType.VIDEO_FRAME) return
+        totalFramesSent++
+        windowFrames++
+
+        val now = System.nanoTime()
+        val elapsedSec = (now - windowStartNs) / 1_000_000_000.0
+        if (elapsedSec >= 1.0) {
+            val fps = (windowFrames / elapsedSec).toFloat()
+            _serviceState.update {
+                it.copy(
+                    framesSent = totalFramesSent,
+                    currentFps = fps,
+                )
+            }
+            windowFrames = 0
+            windowStartNs = now
+        }
+    }
+
     private suspend fun handleClientConnection(clientSocket: Socket) {
         val clientIp = clientSocket.inetAddress?.hostAddress ?: "unknown"
         Log.i(TAG, "PC Client connected from $clientIp")
@@ -211,7 +295,6 @@ class CamCraftStreamService : Service() {
         }
         updateNotification("Connected to PC ($clientIp) • 60 FPS")
 
-        val outputLock = Any()
         var inputStream: DataInputStream? = null
         var outputStream: OutputStream? = null
 
@@ -220,28 +303,51 @@ class CamCraftStreamService : Service() {
             inputStream = DataInputStream(BufferedInputStream(clientSocket.getInputStream(), 16384))
 
             // 1. Send CONTROL_HELLO (0x10)
-            val hello = createDeviceHello(_serviceState.value.activeState)
+            val hello = createDeviceHello(_serviceState.value.activeState, this)
             val helloPacket = CcftPacket.controlHello(System.nanoTime() / 1_000L, hello)
-            synchronized(outputLock) {
+            synchronized(clientOutputLock) {
                 helloPacket.encodeTo(outputStream, flush = true)
             }
             Log.i(TAG, "Sent CONTROL_HELLO to client")
 
-            // 2. Launch concurrent Synthetic Streamer and Packet Reader jobs
-            val streamJob = serviceScope.launch {
-                runSyntheticStreamer(outputStream, outputLock)
+            // 2. Set active output stream for encoder video packets
+            activeClientOutputStream = outputStream
+
+            // 3. Start real CameraX + H.264 hardware encoder pipeline
+            val activeState = _serviceState.value.activeState
+            cameraStreamManager?.startStream(
+                cameraId = activeState.cameraId,
+                width = activeState.width,
+                height = activeState.height,
+                fps = activeState.fps,
+                bitrateKbps = activeState.bitrateKbps,
+            )
+
+            // 4. If encoder already cached SPS/PPS config, immediately dispatch it
+            cameraStreamManager?.cachedConfig?.let { spsPps ->
+                synchronized(clientOutputLock) {
+                    CcftPacket.writePacket(
+                        output = outputStream,
+                        type = PacketType.VIDEO_CONFIG,
+                        flags = CcftFlags.NONE,
+                        ptsUs = System.nanoTime() / 1_000L,
+                        payload = spsPps,
+                        offset = 0,
+                        length = spsPps.size,
+                        flush = true,
+                    )
+                }
+                cameraStreamManager?.requestKeyFrame()
             }
 
-            val readerJob = serviceScope.launch {
-                runPacketReader(inputStream, outputStream, outputLock)
-            }
-
-            // Wait for either the stream or the reader to finish / encounter EOF
-            readerJob.join()
-            streamJob.cancel()
+            // 5. Run reader loop to process incoming heartbeats and control commands
+            runPacketReader(inputStream, outputStream, clientOutputLock)
         } catch (e: Exception) {
             Log.w(TAG, "Client session terminated: ${e.message}")
         } finally {
+            cameraStreamManager?.stopStream()
+            activeClientOutputStream = null
+
             try {
                 inputStream?.close()
                 outputStream?.close()
@@ -315,6 +421,13 @@ class CamCraftStreamService : Service() {
             val current = _serviceState.value.activeState
             val updated = when (cmd) {
                 is ControlCmd.ConfigureStream -> {
+                    cameraStreamManager?.rebindCamera(
+                        cameraId = cmd.cameraId,
+                        width = cmd.width,
+                        height = cmd.height,
+                        fps = cmd.fps,
+                        bitrateKbps = cmd.bitrateKbps,
+                    )
                     current.copy(
                         cameraId = cmd.cameraId,
                         width = cmd.width,
@@ -324,6 +437,11 @@ class CamCraftStreamService : Service() {
                     )
                 }
                 is ControlCmd.SetCameraParams -> {
+                    cmd.zoomRatio?.let { cameraStreamManager?.setZoomRatio(it) }
+                    cmd.exposureEv?.let { cameraStreamManager?.setExposureEv(it) }
+                    cmd.torchOn?.let { cameraStreamManager?.setTorch(it) }
+                    cmd.autofocus?.let { cameraStreamManager?.setAutoFocus(it) }
+
                     current.copy(
                         zoomRatio = cmd.zoomRatio ?: current.zoomRatio,
                         exposureEv = cmd.exposureEv ?: current.exposureEv,
@@ -340,7 +458,7 @@ class CamCraftStreamService : Service() {
                     )
                 }
                 is ControlCmd.RequestKeyframe -> {
-                    requestKeyframePending = true
+                    cameraStreamManager?.requestKeyFrame()
                     current
                 }
             }
@@ -366,72 +484,7 @@ class CamCraftStreamService : Service() {
         }
     }
 
-    /**
-     * Streams synthetic video packets at ~60 FPS (approx. 16.6ms intervals)
-     * with ~24 KB dummy payloads to simulate a 1080p60 H.264 stream (~11.8 Mbps).
-     */
-    private suspend fun runSyntheticStreamer(output: OutputStream, outputLock: Any) {
-        val dummyPayload = ByteArray(24_576) { index -> (index and 0xFF).toByte() }
 
-        var frameCounter: Long = 0
-        var windowFrames: Long = 0
-        var windowStartNs = System.nanoTime()
-
-        while (serviceScope.isActive) {
-            val frameStartNs = System.nanoTime()
-            val ptsUs = frameStartNs / 1_000L
-
-            // Every 60 frames (1 second interval) or upon PC keyframe request, set IDR flag
-            val isKeyframe = requestKeyframePending || (frameCounter % 60L == 0L)
-            if (requestKeyframePending) {
-                requestKeyframePending = false
-            }
-
-            val flags = if (isKeyframe) CcftFlags.KEYFRAME else CcftFlags.NONE
-
-            try {
-                synchronized(outputLock) {
-                    CcftPacket.writePacket(
-                        output = output,
-                        type = PacketType.VIDEO_FRAME,
-                        flags = flags,
-                        ptsUs = ptsUs,
-                        payload = dummyPayload,
-                        offset = 0,
-                        length = dummyPayload.size,
-                        flush = true,
-                    )
-                }
-            } catch (e: IOException) {
-                Log.w(TAG, "Write failure in synthetic video stream: ${e.message}")
-                break
-            }
-
-            frameCounter++
-            windowFrames++
-
-            // Calculate instantaneous FPS every second
-            val elapsedSec = (System.nanoTime() - windowStartNs) / 1_000_000_000.0
-            if (elapsedSec >= 1.0) {
-                val fps = (windowFrames / elapsedSec).toFloat()
-                _serviceState.update {
-                    it.copy(
-                        framesSent = frameCounter,
-                        currentFps = fps,
-                    )
-                }
-                windowFrames = 0
-                windowStartNs = System.nanoTime()
-            }
-
-            // Maintain steady 60 FPS cadence (~16.6 ms per frame)
-            val durationNs = System.nanoTime() - frameStartNs
-            val sleepMs = 16L - (durationNs / 1_000_000L)
-            if (sleepMs > 0) {
-                delay(sleepMs)
-            }
-        }
-    }
 
     private fun stopServer() {
         try {
@@ -485,8 +538,22 @@ class CamCraftStreamService : Service() {
         const val ACTION_START = "org.artcraft.camcraft.action.START"
         const val ACTION_STOP = "org.artcraft.camcraft.action.STOP"
 
+        @Volatile
+        private var activeInstance: CamCraftStreamService? = null
+        private var pendingPreviewView: PreviewView? = null
+
         private val _serviceState = MutableStateFlow(StreamServiceState())
         val serviceState: StateFlow<StreamServiceState> = _serviceState.asStateFlow()
+
+        fun attachPreviewView(previewView: PreviewView) {
+            pendingPreviewView = previewView
+            activeInstance?.cameraStreamManager?.attachPreviewView(previewView)
+        }
+
+        fun detachPreviewView() {
+            pendingPreviewView = null
+            activeInstance?.cameraStreamManager?.detachPreviewView()
+        }
 
         fun start(context: Context) {
             val intent = Intent(context, CamCraftStreamService::class.java).apply {
@@ -509,7 +576,7 @@ class CamCraftStreamService : Service() {
         /**
          * Builds device metadata matching `docs/PROTOCOL.md` §5.1.
          */
-        fun createDeviceHello(activeState: ActiveCameraState): ControlHello {
+        fun createDeviceHello(activeState: ActiveCameraState, context: Context? = null): ControlHello {
             val manufacturer = Build.MANUFACTURER?.replaceFirstChar { it.uppercase() } ?: "Android"
             val model = Build.MODEL ?: "CamCraft Device"
             val deviceName = if (model.startsWith(manufacturer, ignoreCase = true)) {
@@ -518,33 +585,7 @@ class CamCraftStreamService : Service() {
                 "$manufacturer $model".trim()
             }
 
-            val cameras = listOf(
-                CameraInfo(
-                    id = "0",
-                    facing = "back",
-                    label = "Rear Main Camera",
-                    resolutions = listOf(
-                        ResolutionOption(1280, 720, 60),
-                        ResolutionOption(1920, 1080, 60),
-                        ResolutionOption(3840, 2160, 60),
-                    ),
-                    maxZoom = 8.0f,
-                    evRange = listOf(-4.0f, 4.0f),
-                    hasFlash = true,
-                ),
-                CameraInfo(
-                    id = "1",
-                    facing = "front",
-                    label = "Front Selfie Camera",
-                    resolutions = listOf(
-                        ResolutionOption(1280, 720, 60),
-                        ResolutionOption(1920, 1080, 60),
-                    ),
-                    maxZoom = 2.0f,
-                    evRange = listOf(-2.0f, 2.0f),
-                    hasFlash = false,
-                ),
-            )
+            val cameras = CameraEnumerator.enumerateCameras(context)
 
             return ControlHello(
                 deviceName = deviceName.ifBlank { "Android CamCraft Device" },

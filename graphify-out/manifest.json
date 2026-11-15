@@ -290,22 +290,22 @@
     "semantic_hash": "1401da9be0baa3bf957befcc708c53f0"
   },
   "android/app/src/main/java/org/artcraft/camcraft/MainActivity.kt": {
-    "mtime": 1794743147.7385075,
-    "seen": 1794743258.8514974,
-    "ast_hash": "5d31b9bd859a8d52d6f8fac04b3177ca",
-    "semantic_hash": "5d31b9bd859a8d52d6f8fac04b3177ca"
+    "mtime": 1794750403.5425527,
+    "seen": 1794750589.4162056,
+    "ast_hash": "12aa154112f79055cca5d2d5c9b12da0",
+    "semantic_hash": ""
   },
   "android/app/src/main/java/org/artcraft/camcraft/camera/CameraController.kt": {
-    "mtime": 1794734882.1425953,
-    "seen": 1794739663.9649282,
-    "ast_hash": "4aa724706de0b322db1686b4eb9b1edd",
-    "semantic_hash": "4aa724706de0b322db1686b4eb9b1edd"
+    "mtime": 1794750206.0224023,
+    "seen": 1794750589.4162123,
+    "ast_hash": "0d3419e7abaae943caf794928fa06b87",
+    "semantic_hash": ""
   },
   "android/app/src/main/java/org/artcraft/camcraft/encoder/EncoderStubs.kt": {
-    "mtime": 1794734882.1435955,
-    "seen": 1794739663.9650412,
-    "ast_hash": "63f027a505040389fe140fcd2336d572",
-    "semantic_hash": "63f027a505040389fe140fcd2336d572"
+    "mtime": 1794750236.3897328,
+    "seen": 1794750589.416241,
+    "ast_hash": "d765b3ca8fbfbb798d6bb86682bdf8a6",
+    "semantic_hash": ""
   },
   "android/app/src/main/java/org/artcraft/camcraft/network/StreamConnectionService.kt": {
     "mtime": 1794734882.1435955,
@@ -320,10 +320,10 @@
     "semantic_hash": "d9e81a59cd30af71acbcc03248c4f5cf"
   },
   "android/app/src/main/java/org/artcraft/camcraft/ui/CamCraftScreen.kt": {
-    "mtime": 1794743136.1053796,
-    "seen": 1794743258.8529127,
-    "ast_hash": "779f98c995b754d7d1522730850e5688",
-    "semantic_hash": "779f98c995b754d7d1522730850e5688"
+    "mtime": 1794750513.5217502,
+    "seen": 1794750589.4163017,
+    "ast_hash": "c894922f2c6be10db6bcd19ee977b954",
+    "semantic_hash": ""
   },
   "android/app/src/test/java/org/artcraft/camcraft/ScaffoldingSmokeTest.kt": {
     "mtime": 1794734882.1205952,
@@ -363,10 +363,10 @@
     "semantic_hash": "3f3d3c4847ec49ce38881789b029e8aa"
   },
   "desktop/crates/camcraft-cli/src/main.rs": {
-    "mtime": 1794742928.6190975,
-    "seen": 1794743258.8537605,
-    "ast_hash": "302e80a092277b0097ceccc66204b3c3",
-    "semantic_hash": "302e80a092277b0097ceccc66204b3c3"
+    "mtime": 1794749955.9496796,
+    "seen": 1794750589.4163704,
+    "ast_hash": "534ae8abe855afde7c45ad79bcc1ef1d",
+    "semantic_hash": ""
   },
   "desktop/crates/camcraft-core/Cargo.toml": {
     "mtime": 1794742896.6037452,
@@ -478,10 +478,10 @@
     "semantic_hash": "6c077c9c568abd3a4c1bae94036058a2"
   },
   "android/app/src/main/java/org/artcraft/camcraft/network/CamCraftStreamService.kt": {
-    "mtime": 1794743226.794377,
-    "seen": 1794743258.8519862,
-    "ast_hash": "6ba36c5edcad4e19ce3ea409541320d1",
-    "semantic_hash": "6ba36c5edcad4e19ce3ea409541320d1"
+    "mtime": 1794750478.9233735,
+    "seen": 1794750589.4162524,
+    "ast_hash": "87f5fb71543ace28da7a3045c1a5d400",
+    "semantic_hash": ""
   },
   "android/app/src/test/java/org/artcraft/camcraft/network/CamCraftStreamServiceTest.kt": {
     "mtime": 1794743198.3650644,
@@ -496,15 +496,45 @@
     "semantic_hash": "00530029383be6f60246aa6f6411932a"
   },
   "desktop/crates/camcraft-core/src/client.rs": {
-    "mtime": 1794742900.6277895,
-    "seen": 1794743258.8537745,
-    "ast_hash": "d9dfaa39674b540b8d058612fe63d5e3",
-    "semantic_hash": "d9dfaa39674b540b8d058612fe63d5e3"
+    "mtime": 1794749911.991201,
+    "seen": 1794750589.4163907,
+    "ast_hash": "d484c79ce035c92adf95c2e6e1b597df",
+    "semantic_hash": ""
   },
   "desktop/crates/camcraft-core/tests/client_integration_test.rs": {
     "mtime": 1794743044.3943708,
     "seen": 1794743258.853782,
     "ast_hash": "239935b4d74fd4addb2b5687061abf54",
     "semantic_hash": "239935b4d74fd4addb2b5687061abf54"
+  },
+  "android/app/src/main/java/org/artcraft/camcraft/camera/CameraEnumerator.kt": {
+    "mtime": 1794750001.6901777,
+    "seen": 1794750589.4162233,
+    "ast_hash": "df91a6598c6d338eaa121077e7d603bd",
+    "semantic_hash": ""
+  },
+  "android/app/src/main/java/org/artcraft/camcraft/camera/CameraStreamManager.kt": {
+    "mtime": 1794750194.060272,
+    "seen": 1794750589.4162295,
+    "ast_hash": "99bfcd2ce52263895f77b2d791dad1d6",
+    "semantic_hash": ""
+  },
+  "android/app/src/main/java/org/artcraft/camcraft/encoder/H264SurfaceEncoder.kt": {
+    "mtime": 1794750131.7195933,
+    "seen": 1794750589.4162464,
+    "ast_hash": "0e947d9fb89de6e04f12087390518b97",
+    "semantic_hash": ""
+  },
+  "android/app/src/test/java/org/artcraft/camcraft/encoder/H264SurfaceEncoderTest.kt": {
+    "mtime": 1794750094.8851924,
+    "seen": 1794750589.416314,
+    "ast_hash": "2e6198cd776803ee3f60dfca6c97b515",
+    "semantic_hash": ""
+  },
+  "skills/system/run-workflow/SKILL.md": {
+    "mtime": 1794738661.1069782,
+    "seen": 1794750589.4167564,
+    "ast_hash": "5e34b725e1e38bbc8fcfb6217b441eb4",
+    "semantic_hash": ""
   }
 }

@@ -1,81 +1,96 @@
 {
   "communities": {
     "0": [
-      "bufmut",
-      "bytes",
-      "bytesmut",
-      "deserialize",
-      "desktop_crates_camcraft_protocol_src_lib",
-      "desktop_crates_camcraft_protocol_src_lib_activecamerastate",
-      "desktop_crates_camcraft_protocol_src_lib_audio_config_payload_roundtrip",
-      "desktop_crates_camcraft_protocol_src_lib_audioconfigpayload",
-      "desktop_crates_camcraft_protocol_src_lib_camerainfo",
-      "desktop_crates_camcraft_protocol_src_lib_canonical_hex_vector_decode_and_encode",
-      "desktop_crates_camcraft_protocol_src_lib_canonical_test_frame",
-      "desktop_crates_camcraft_protocol_src_lib_control_ack_json_schema_matches_spec",
-      "desktop_crates_camcraft_protocol_src_lib_control_hello_json_schema_matches_spec",
-      "desktop_crates_camcraft_protocol_src_lib_controlack",
-      "desktop_crates_camcraft_protocol_src_lib_controlack_failure",
-      "desktop_crates_camcraft_protocol_src_lib_controlack_success",
-      "desktop_crates_camcraft_protocol_src_lib_controlcommand",
-      "desktop_crates_camcraft_protocol_src_lib_controlhello",
-      "desktop_crates_camcraft_protocol_src_lib_decode",
-      "desktop_crates_camcraft_protocol_src_lib_default_port",
-      "desktop_crates_camcraft_protocol_src_lib_empty_payload",
-      "desktop_crates_camcraft_protocol_src_lib_encode",
-      "desktop_crates_camcraft_protocol_src_lib_flag_codec_hevc",
-      "desktop_crates_camcraft_protocol_src_lib_flag_keyframe",
-      "desktop_crates_camcraft_protocol_src_lib_flag_mirror_h",
-      "desktop_crates_camcraft_protocol_src_lib_flag_none",
-      "desktop_crates_camcraft_protocol_src_lib_flag_rotate_180",
-      "desktop_crates_camcraft_protocol_src_lib_flag_rotate_270",
-      "desktop_crates_camcraft_protocol_src_lib_flag_rotate_90",
-      "desktop_crates_camcraft_protocol_src_lib_frameflags_empty",
-      "desktop_crates_camcraft_protocol_src_lib_frameflags_from_bits",
-      "desktop_crates_camcraft_protocol_src_lib_header_len",
-      "desktop_crates_camcraft_protocol_src_lib_header_size",
-      "desktop_crates_camcraft_protocol_src_lib_header_size_and_constants_match_spec",
-      "desktop_crates_camcraft_protocol_src_lib_magic",
-      "desktop_crates_camcraft_protocol_src_lib_max_payload_len",
-      "desktop_crates_camcraft_protocol_src_lib_multiple_packets_in_single_buffer",
-      "desktop_crates_camcraft_protocol_src_lib_packet",
-      "desktop_crates_camcraft_protocol_src_lib_packet_control_ack",
-      "desktop_crates_camcraft_protocol_src_lib_packet_control_cmd",
-      "desktop_crates_camcraft_protocol_src_lib_packet_control_hello",
-      "desktop_crates_camcraft_protocol_src_lib_packet_decode",
-      "desktop_crates_camcraft_protocol_src_lib_packet_decode_json",
-      "desktop_crates_camcraft_protocol_src_lib_packet_encode",
-      "desktop_crates_camcraft_protocol_src_lib_packet_from_parts",
-      "desktop_crates_camcraft_protocol_src_lib_packet_heartbeat_ping",
-      "desktop_crates_camcraft_protocol_src_lib_packet_heartbeat_pong",
-      "desktop_crates_camcraft_protocol_src_lib_packet_new",
-      "desktop_crates_camcraft_protocol_src_lib_packet_type_roundtrip_and_discriminants",
-      "desktop_crates_camcraft_protocol_src_lib_packet_video_config",
-      "desktop_crates_camcraft_protocol_src_lib_packet_video_frame",
-      "desktop_crates_camcraft_protocol_src_lib_packetheader",
-      "desktop_crates_camcraft_protocol_src_lib_packetheader_encode",
-      "desktop_crates_camcraft_protocol_src_lib_packetheader_from_bytes",
-      "desktop_crates_camcraft_protocol_src_lib_packetheader_from_slice",
-      "desktop_crates_camcraft_protocol_src_lib_packetheader_new",
-      "desktop_crates_camcraft_protocol_src_lib_packetheader_to_bytes",
-      "desktop_crates_camcraft_protocol_src_lib_packettype_try_from",
-      "desktop_crates_camcraft_protocol_src_lib_partial_tcp_stream_chunking_byte_by_byte",
-      "desktop_crates_camcraft_protocol_src_lib_protocol_header_error_cases",
-      "desktop_crates_camcraft_protocol_src_lib_protocol_magic",
-      "desktop_crates_camcraft_protocol_src_lib_protocol_version",
-      "desktop_crates_camcraft_protocol_src_lib_protocolerror",
-      "desktop_crates_camcraft_protocol_src_lib_protocolerror_buffertooshort",
-      "desktop_crates_camcraft_protocol_src_lib_protocolerror_invalidmagic",
-      "desktop_crates_camcraft_protocol_src_lib_protocolerror_json",
-      "desktop_crates_camcraft_protocol_src_lib_protocolerror_payloadtoolarge",
-      "desktop_crates_camcraft_protocol_src_lib_protocolerror_unknownpackettype",
-      "desktop_crates_camcraft_protocol_src_lib_protocolerror_unsupportedversion",
-      "desktop_crates_camcraft_protocol_src_lib_resolutionoption",
-      "desktop_crates_camcraft_protocol_src_lib_rotation_mask",
-      "desktop_crates_camcraft_protocol_src_lib_rs_t",
-      "serialize"
+      "arc",
+      "asyncreadext",
+      "asyncwriteext",
+      "atomicbool",
+      "clientconfig",
+      "clientevent",
+      "controlack",
+      "controlcmd",
+      "controlhello",
+      "desktop_crates_camcraft_cli_src_main",
+      "desktop_crates_camcraft_cli_src_main_cli",
+      "desktop_crates_camcraft_cli_src_main_command",
+      "desktop_crates_camcraft_cli_src_main_command_connect",
+      "desktop_crates_camcraft_cli_src_main_command_status",
+      "desktop_crates_camcraft_cli_src_main_main",
+      "desktop_crates_camcraft_cli_src_main_print_device_banner",
+      "desktop_crates_camcraft_cli_src_main_print_stats",
+      "desktop_crates_camcraft_cli_src_main_rs_controlhello",
+      "desktop_crates_camcraft_cli_src_main_run_connect",
+      "desktop_crates_camcraft_core_src_client",
+      "desktop_crates_camcraft_core_src_client_clientconfig",
+      "desktop_crates_camcraft_core_src_client_clientconfig_new",
+      "desktop_crates_camcraft_core_src_client_clientconfig_usb_default",
+      "desktop_crates_camcraft_core_src_client_clienterror",
+      "desktop_crates_camcraft_core_src_client_clienterror_channel",
+      "desktop_crates_camcraft_core_src_client_clienterror_connectionclosed",
+      "desktop_crates_camcraft_core_src_client_clienterror_io",
+      "desktop_crates_camcraft_core_src_client_clienterror_json",
+      "desktop_crates_camcraft_core_src_client_clienterror_protocol",
+      "desktop_crates_camcraft_core_src_client_clientevent",
+      "desktop_crates_camcraft_core_src_client_clientevent_audioconfig",
+      "desktop_crates_camcraft_core_src_client_clientevent_audioframe",
+      "desktop_crates_camcraft_core_src_client_clientevent_controlack",
+      "desktop_crates_camcraft_core_src_client_clientevent_disconnected",
+      "desktop_crates_camcraft_core_src_client_clientevent_hello",
+      "desktop_crates_camcraft_core_src_client_clientevent_stats",
+      "desktop_crates_camcraft_core_src_client_clientevent_videoconfig",
+      "desktop_crates_camcraft_core_src_client_clientevent_videoframe",
+      "desktop_crates_camcraft_core_src_client_clientsender",
+      "desktop_crates_camcraft_core_src_client_clientsender_send_cmd",
+      "desktop_crates_camcraft_core_src_client_clientsender_send_ping",
+      "desktop_crates_camcraft_core_src_client_current_time_us",
+      "desktop_crates_camcraft_core_src_client_current_time_us_is_strictly_positive",
+      "desktop_crates_camcraft_core_src_client_rs_controlhello",
+      "desktop_crates_camcraft_core_src_client_rs_sender",
+      "desktop_crates_camcraft_core_src_client_run_client_loop",
+      "desktop_crates_camcraft_core_src_client_stream_stats_default_is_zeroed",
+      "desktop_crates_camcraft_core_src_client_streamstats",
+      "desktop_crates_camcraft_core_src_client_streamstats_default",
+      "desktop_crates_camcraft_core_tests_client_integration_test",
+      "desktop_crates_camcraft_core_tests_client_integration_test_test_client_receiver_end_to_end_mock_stream",
+      "duration",
+      "instant",
+      "mpsc",
+      "ordering",
+      "packettype",
+      "parser",
+      "result",
+      "run_client_loop",
+      "subcommand",
+      "systemtime",
+      "tcplistener",
+      "tcpstream",
+      "unix_epoch",
+      "warn"
     ],
     "1": [
+      "android_app_src_main_java_org_artcraft_camcraft_network_camcraftstreamservice_camcraftstreamservice_runpacketreader",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_ccftheader",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_ccftheader_equals",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_ccftheader_frombytearray",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_ccftheader_frombytebuffer",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_ccftheader_hashcode",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_ccftheader_tobytearray",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_ccftheader_writeto",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_kt_bytearray",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_kt_bytebuffer",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_packettype",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_packettype_audio_config",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_packettype_audio_frame",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_packettype_control_ack",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_packettype_control_cmd",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_packettype_control_hello",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_packettype_fromid",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_packettype_fromint",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_packettype_heartbeat_ping",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_packettype_heartbeat_pong",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_packettype_video_config",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_packettype_video_frame",
       "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftpacket",
       "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftpacket_ccftpacket",
       "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftpacket_ccftpacket_audioconfig",
@@ -97,13 +112,128 @@
       "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftpacket_ccftpacket_writepacket",
       "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftpacket_kt_bytearray",
       "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftpacket_kt_bytebuffer",
+      "android_app_src_test_java_org_artcraft_camcraft_protocol_ccftprotocoltest_ccftprotocoltest_multiplepacketsinsinglestream",
+      "android_app_src_test_java_org_artcraft_camcraft_protocol_ccftprotocoltest_ccftprotocoltest_packettyperoundtripanddiscriminants",
+      "byteorder",
+      "datainputstream",
+      "encodetostring",
+      "inputstream",
+      "outputstream"
+    ],
+    "2": [
+      "command",
+      "debug",
+      "desktop_crates_camcraft_core_src_adb",
+      "desktop_crates_camcraft_core_src_adb_adbdevice",
+      "desktop_crates_camcraft_core_src_adb_adbdevicestate",
+      "desktop_crates_camcraft_core_src_adb_adbdevicestate_connecting",
+      "desktop_crates_camcraft_core_src_adb_adbdevicestate_device",
+      "desktop_crates_camcraft_core_src_adb_adbdevicestate_is_ready",
+      "desktop_crates_camcraft_core_src_adb_adbdevicestate_offline",
+      "desktop_crates_camcraft_core_src_adb_adbdevicestate_other",
+      "desktop_crates_camcraft_core_src_adb_adbdevicestate_parse",
+      "desktop_crates_camcraft_core_src_adb_adbdevicestate_unauthorized",
+      "desktop_crates_camcraft_core_src_adb_adberror",
+      "desktop_crates_camcraft_core_src_adb_adberror_deviceunauthorized",
+      "desktop_crates_camcraft_core_src_adb_adberror_executionfailed",
+      "desktop_crates_camcraft_core_src_adb_adberror_io",
+      "desktop_crates_camcraft_core_src_adb_adberror_multipledevices",
+      "desktop_crates_camcraft_core_src_adb_adberror_nodevicesfound",
+      "desktop_crates_camcraft_core_src_adb_adberror_notfound",
+      "desktop_crates_camcraft_core_src_adb_check_adb_available",
+      "desktop_crates_camcraft_core_src_adb_list_devices",
+      "desktop_crates_camcraft_core_src_adb_parse_adb_devices_output",
+      "desktop_crates_camcraft_core_src_adb_remove_adb_forward",
+      "desktop_crates_camcraft_core_src_adb_setup_adb_forward",
+      "desktop_crates_camcraft_core_src_adb_test_parse_adb_devices_empty",
+      "desktop_crates_camcraft_core_src_adb_test_parse_adb_devices_output_single_device",
+      "desktop_crates_camcraft_core_src_adb_test_parse_adb_devices_output_unauthorized_and_offline",
+      "desktop_crates_camcraft_core_src_lib",
+      "desktop_crates_camcraft_core_src_lib_audiooutputsink",
+      "desktop_crates_camcraft_core_src_lib_audiooutputsink_write_samples",
+      "desktop_crates_camcraft_core_src_lib_bounded_channel_preserves_realtime_capacity",
+      "desktop_crates_camcraft_core_src_lib_bounded_video_channel",
+      "desktop_crates_camcraft_core_src_lib_coreerror",
+      "desktop_crates_camcraft_core_src_lib_coreerror_adb",
+      "desktop_crates_camcraft_core_src_lib_coreerror_client",
+      "desktop_crates_camcraft_core_src_lib_coreerror_io",
+      "desktop_crates_camcraft_core_src_lib_coreerror_protocol",
+      "desktop_crates_camcraft_core_src_lib_coreerror_unimplemented",
+      "desktop_crates_camcraft_core_src_lib_default_video_queue_capacity",
+      "desktop_crates_camcraft_core_src_lib_rs_protocolerror",
+      "desktop_crates_camcraft_core_src_lib_rs_sender",
+      "desktop_crates_camcraft_core_src_lib_usb_loopback_addr",
+      "desktop_crates_camcraft_core_src_lib_videooutputsink",
+      "desktop_crates_camcraft_core_src_lib_videooutputsink_write_frame",
+      "error",
+      "info",
+      "receiver",
+      "super",
+      "t"
+    ],
+    "3": [
+      "android_app_src_main_java_org_artcraft_camcraft_network_camcraftstreamservice",
+      "android_app_src_main_java_org_artcraft_camcraft_network_camcraftstreamservice_camcraftstreamservice",
+      "android_app_src_main_java_org_artcraft_camcraft_network_camcraftstreamservice_camcraftstreamservice_buildnotification",
+      "android_app_src_main_java_org_artcraft_camcraft_network_camcraftstreamservice_camcraftstreamservice_createnotificationchannel",
+      "android_app_src_main_java_org_artcraft_camcraft_network_camcraftstreamservice_camcraftstreamservice_handleclientconnection",
+      "android_app_src_main_java_org_artcraft_camcraft_network_camcraftstreamservice_camcraftstreamservice_onbind",
+      "android_app_src_main_java_org_artcraft_camcraft_network_camcraftstreamservice_camcraftstreamservice_oncreate",
+      "android_app_src_main_java_org_artcraft_camcraft_network_camcraftstreamservice_camcraftstreamservice_ondestroy",
+      "android_app_src_main_java_org_artcraft_camcraft_network_camcraftstreamservice_camcraftstreamservice_onstartcommand",
+      "android_app_src_main_java_org_artcraft_camcraft_network_camcraftstreamservice_camcraftstreamservice_runsyntheticstreamer",
+      "android_app_src_main_java_org_artcraft_camcraft_network_camcraftstreamservice_camcraftstreamservice_startinforeground",
+      "android_app_src_main_java_org_artcraft_camcraft_network_camcraftstreamservice_camcraftstreamservice_startserver",
+      "android_app_src_main_java_org_artcraft_camcraft_network_camcraftstreamservice_camcraftstreamservice_stopserver",
+      "android_app_src_main_java_org_artcraft_camcraft_network_camcraftstreamservice_camcraftstreamservice_updatenotification",
+      "asstateflow",
+      "bufferedinputstream",
+      "bufferedoutputstream",
+      "camerainfo",
+      "cancel",
+      "ccftflags",
+      "coroutinescope",
+      "delay",
+      "dispatchers",
+      "eofexception",
+      "ibinder",
+      "intent",
+      "isactive",
+      "job",
+      "launch",
+      "log",
+      "mutablestateflow",
+      "notification",
+      "notificationchannel",
+      "notificationcompat",
+      "notificationmanager",
+      "pendingintent",
+      "resolutionoption",
+      "serversocket",
+      "service",
+      "serviceinfo",
+      "socket",
+      "socketexception",
+      "stateflow",
+      "supervisorjob",
+      "update",
+      "volatile"
+    ],
+    "4": [
+      "activecamerastate",
+      "android_app_src_main_java_org_artcraft_camcraft_network_camcraftstreamservice_defaultactivecamerastate",
+      "android_app_src_main_java_org_artcraft_camcraft_network_camcraftstreamservice_streamservicestate",
       "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftprotocolconstants",
       "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftprotocolconstants_ccftflags",
       "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftprotocolconstants_ccftflags_flagsforrotation",
       "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftprotocolconstants_ccftflags_rotationdegrees",
       "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftprotocolconstants_ccftprotocolconstants",
       "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftprotocolconstants_kt_bytearray",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_controlmodels_controlack_failure",
+      "android_app_src_test_java_org_artcraft_camcraft_network_camcraftstreamservicetest",
+      "android_app_src_test_java_org_artcraft_camcraft_network_camcraftstreamservicetest_camcraftstreamservicetest",
+      "android_app_src_test_java_org_artcraft_camcraft_network_camcraftstreamservicetest_camcraftstreamservicetest_createdevicehelloproducesvalidhandshake",
+      "android_app_src_test_java_org_artcraft_camcraft_network_camcraftstreamservicetest_camcraftstreamservicetest_defaultactivecamerastateconformsto1080p60spec",
+      "android_app_src_test_java_org_artcraft_camcraft_network_camcraftstreamservicetest_camcraftstreamservicetest_streamservicestateinitialstateisstopped",
       "android_app_src_test_java_org_artcraft_camcraft_protocol_ccftprotocoltest",
       "android_app_src_test_java_org_artcraft_camcraft_protocol_ccftprotocoltest_ccftprotocoltest",
       "android_app_src_test_java_org_artcraft_camcraft_protocol_ccftprotocoltest_ccftprotocoltest_audioconfigpayloadroundtrip",
@@ -113,7 +243,6 @@
       "android_app_src_test_java_org_artcraft_camcraft_protocol_ccftprotocoltest_ccftprotocoltest_controlhellojsonschemamatchesspec",
       "android_app_src_test_java_org_artcraft_camcraft_protocol_ccftprotocoltest_ccftprotocoltest_frameflagsoperationsandrotations",
       "android_app_src_test_java_org_artcraft_camcraft_protocol_ccftprotocoltest_ccftprotocoltest_headersizeandconstantsmatchspec",
-      "android_app_src_test_java_org_artcraft_camcraft_protocol_ccftprotocoltest_ccftprotocoltest_multiplepacketsinsinglestream",
       "android_app_src_test_java_org_artcraft_camcraft_protocol_ccftprotocoltest_ccftprotocoltest_protocolheadererrorcases",
       "android_app_src_test_java_org_artcraft_camcraft_scaffoldingsmoketest",
       "android_app_src_test_java_org_artcraft_camcraft_scaffoldingsmoketest_scaffoldingsmoketest",
@@ -127,53 +256,10 @@
       "bytearrayinputstream",
       "bytearrayoutputstream",
       "bytebuffer",
-      "byteorder",
-      "datainputstream",
-      "encodetostring",
       "fail",
-      "inputstream",
-      "outputstream",
       "test"
     ],
-    "2": [
-      "agents_android_foreground_service",
-      "agents_android_surface_pipeline",
-      "agents_rust_unsafe_safety_rule",
-      "agents_rust_zero_copy_hot_loop",
-      "agents_rust_zero_panic_rule",
-      "claude_android_guidelines",
-      "claude_rust_guidelines",
-      "docs_design_audiocaptureengine",
-      "docs_design_bounded_video_queue",
-      "docs_design_camcraft_cli_crate",
-      "docs_design_camcraft_core_crate",
-      "docs_design_cameracontroller",
-      "docs_design_ffmpeg_decoder",
-      "docs_design_hardwarevideoencoder",
-      "docs_design_pipewire_vmic_sink",
-      "docs_design_streamconnectionservice",
-      "docs_design_v4l2loopback_sink",
-      "docs_plan_tahap_2",
-      "docs_plan_tahap_3",
-      "docs_plan_tahap_4",
-      "docs_plan_tahap_6",
-      "docs_plan_tahap_7",
-      "docs_plan_tahap_8",
-      "docs_prd_fr02_usb_adb",
-      "docs_prd_fr03_wifi_mdns",
-      "docs_prd_fr04_v4l2_virtual_cam",
-      "docs_prd_fr06_audio_pipewire",
-      "docs_prd_fr07_oled_battery_saver",
-      "docs_prd_fr08_auto_reconnect",
-      "docs_prd_nfr_performance",
-      "prompts_tahap_2_usb_dummy",
-      "prompts_tahap_3_camerax_h264",
-      "prompts_tahap_4_v4l2_decode",
-      "prompts_tahap_6_wifi_mdns",
-      "prompts_tahap_7_audio_pipewire",
-      "prompts_tahap_8_oled_polish"
-    ],
-    "3": [
+    "5": [
       "_agents_skills_android_cli_skill_android_cli",
       "_agents_skills_android_cli_skill_android_cli_skill",
       "_agents_skills_android_cli_skill_android_profiler_cmd",
@@ -209,43 +295,43 @@
       "_agents_skills_android_profiler_skill_android_profiler_skill",
       "_agents_skills_android_profiler_skill_intent_disambiguation"
     ],
-    "4": [
-      "alignment",
-      "android_app_src_main_java_org_artcraft_camcraft_mainactivity",
-      "android_app_src_main_java_org_artcraft_camcraft_mainactivity_mainactivity",
-      "android_app_src_main_java_org_artcraft_camcraft_mainactivity_mainactivity_oncreate",
-      "android_app_src_main_java_org_artcraft_camcraft_ui_camcraftscreen",
-      "android_app_src_main_java_org_artcraft_camcraft_ui_camcraftscreen_artcraftcolors",
-      "android_app_src_main_java_org_artcraft_camcraft_ui_camcraftscreen_camcraftscreen",
-      "android_app_src_main_java_org_artcraft_camcraft_ui_camcraftscreen_camcrafttheme",
-      "android_app_src_main_java_org_artcraft_camcraft_ui_camcraftscreen_camcraftuistate",
-      "arrangement",
-      "background",
-      "box",
-      "bundle",
-      "button",
-      "buttondefaults",
-      "color",
-      "column",
-      "componentactivity",
-      "composable",
-      "darkcolorscheme",
-      "dp",
-      "enableedgetoedge",
-      "fillmaxsize",
-      "fillmaxwidth",
-      "fontweight",
-      "materialtheme",
-      "modifier",
-      "padding",
-      "roundedcornershape",
-      "row",
-      "safedrawingpadding",
-      "setcontent",
-      "surface",
-      "text"
+    "6": [
+      "bufmut",
+      "deserialize",
+      "desktop_crates_camcraft_protocol_src_lib",
+      "desktop_crates_camcraft_protocol_src_lib_activecamerastate",
+      "desktop_crates_camcraft_protocol_src_lib_audio_config_payload_roundtrip",
+      "desktop_crates_camcraft_protocol_src_lib_audioconfigpayload",
+      "desktop_crates_camcraft_protocol_src_lib_camerainfo",
+      "desktop_crates_camcraft_protocol_src_lib_canonical_test_frame",
+      "desktop_crates_camcraft_protocol_src_lib_control_ack_json_schema_matches_spec",
+      "desktop_crates_camcraft_protocol_src_lib_controlack",
+      "desktop_crates_camcraft_protocol_src_lib_controlack_failure",
+      "desktop_crates_camcraft_protocol_src_lib_controlack_success",
+      "desktop_crates_camcraft_protocol_src_lib_controlcommand",
+      "desktop_crates_camcraft_protocol_src_lib_controlhello",
+      "desktop_crates_camcraft_protocol_src_lib_default_port",
+      "desktop_crates_camcraft_protocol_src_lib_empty_payload",
+      "desktop_crates_camcraft_protocol_src_lib_flag_codec_hevc",
+      "desktop_crates_camcraft_protocol_src_lib_flag_keyframe",
+      "desktop_crates_camcraft_protocol_src_lib_flag_mirror_h",
+      "desktop_crates_camcraft_protocol_src_lib_flag_none",
+      "desktop_crates_camcraft_protocol_src_lib_flag_rotate_180",
+      "desktop_crates_camcraft_protocol_src_lib_flag_rotate_270",
+      "desktop_crates_camcraft_protocol_src_lib_flag_rotate_90",
+      "desktop_crates_camcraft_protocol_src_lib_header_len",
+      "desktop_crates_camcraft_protocol_src_lib_header_size",
+      "desktop_crates_camcraft_protocol_src_lib_header_size_and_constants_match_spec",
+      "desktop_crates_camcraft_protocol_src_lib_magic",
+      "desktop_crates_camcraft_protocol_src_lib_max_payload_len",
+      "desktop_crates_camcraft_protocol_src_lib_packet_type_roundtrip_and_discriminants",
+      "desktop_crates_camcraft_protocol_src_lib_protocol_magic",
+      "desktop_crates_camcraft_protocol_src_lib_protocol_version",
+      "desktop_crates_camcraft_protocol_src_lib_resolutionoption",
+      "desktop_crates_camcraft_protocol_src_lib_rotation_mask",
+      "serialize"
     ],
-    "5": [
+    "7": [
       "bitand",
       "bitor",
       "bitorassign",
@@ -277,63 +363,59 @@
       "desktop_crates_camcraft_protocol_src_lib_u16",
       "desktop_crates_camcraft_protocol_src_lib_u16_from"
     ],
-    "6": [
-      "anyhow",
-      "app",
-      "color32",
-      "context",
-      "desktop_crates_camcraft_cli_src_main",
-      "desktop_crates_camcraft_cli_src_main_cli",
-      "desktop_crates_camcraft_cli_src_main_command",
-      "desktop_crates_camcraft_cli_src_main_command_connect",
-      "desktop_crates_camcraft_cli_src_main_command_status",
-      "desktop_crates_camcraft_cli_src_main_main",
-      "desktop_crates_camcraft_gui_src_main",
-      "desktop_crates_camcraft_gui_src_main_apply_artcraft_dark_theme",
-      "desktop_crates_camcraft_gui_src_main_camcraftapp",
-      "desktop_crates_camcraft_gui_src_main_camcraftapp_new",
-      "desktop_crates_camcraft_gui_src_main_camcraftapp_ui",
-      "desktop_crates_camcraft_gui_src_main_color_accent_blue",
-      "desktop_crates_camcraft_gui_src_main_color_bg_carbon",
-      "desktop_crates_camcraft_gui_src_main_color_status_emerald",
-      "desktop_crates_camcraft_gui_src_main_color_surface_card",
-      "desktop_crates_camcraft_gui_src_main_color_text_muted",
-      "desktop_crates_camcraft_gui_src_main_color_text_primary",
-      "desktop_crates_camcraft_gui_src_main_main",
-      "egui",
-      "frame",
-      "info",
-      "parser",
-      "result",
-      "subcommand",
-      "ui"
-    ],
-    "7": [
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_ccftheader",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_ccftheader_equals",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_ccftheader_frombytearray",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_ccftheader_frombytebuffer",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_ccftheader_hashcode",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_ccftheader_tobytearray",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_ccftheader_writeto",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_kt_bytearray",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_kt_bytebuffer",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_packettype",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_packettype_audio_config",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_packettype_audio_frame",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_packettype_control_ack",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_packettype_control_cmd",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_packettype_control_hello",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_packettype_fromid",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_packettype_fromint",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_packettype_heartbeat_ping",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_packettype_heartbeat_pong",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_packettype_video_config",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_packettype_video_frame",
-      "android_app_src_test_java_org_artcraft_camcraft_protocol_ccftprotocoltest_ccftprotocoltest_packettyperoundtripanddiscriminants"
-    ],
     "8": [
+      "alignment",
+      "android_app_src_main_java_org_artcraft_camcraft_ui_camcraftscreen",
+      "android_app_src_main_java_org_artcraft_camcraft_ui_camcraftscreen_artcraftcolors",
+      "arrangement",
+      "background",
+      "box",
+      "button",
+      "buttondefaults",
+      "color",
+      "column",
+      "darkcolorscheme",
+      "dp",
+      "fillmaxsize",
+      "fillmaxwidth",
+      "fontfamily",
+      "fontweight",
+      "height",
+      "materialtheme",
+      "padding",
+      "roundedcornershape",
+      "row",
+      "sp",
+      "spacer",
+      "surface",
+      "text"
+    ],
+    "9": [
+      "android_app_src_main_java_org_artcraft_camcraft_network_camcraftstreamservice_camcraftstreamservice_createdevicehello",
+      "android_app_src_main_java_org_artcraft_camcraft_network_camcraftstreamservice_camcraftstreamservice_handlecontrolcommand",
+      "android_app_src_main_java_org_artcraft_camcraft_network_camcraftstreamservice_kt_controlhello",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_controlmodels",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_controlmodels_activecamerastate",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_controlmodels_audioconfigpayload",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_controlmodels_camerainfo",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_controlmodels_camerainfo_create",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_controlmodels_configurestream",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_controlmodels_controlack",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_controlmodels_controlack_failure",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_controlmodels_controlack_success",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_controlmodels_controlcmd",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_controlmodels_controlhello",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_controlmodels_requestkeyframe",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_controlmodels_resolutionoption",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_controlmodels_setaudiostate",
+      "android_app_src_main_java_org_artcraft_camcraft_protocol_controlmodels_setcameraparams",
+      "experimentalserializationapi",
+      "json",
+      "jsonclassdiscriminator",
+      "serializable",
+      "serialname"
+    ],
+    "10": [
       "agents_skills_improve_codebase_architecture_html_report",
       "agents_skills_improve_codebase_architecture_html_report_call_graph_collapse",
       "agents_skills_improve_codebase_architecture_html_report_candidate_card",
@@ -355,7 +437,7 @@
       "agents_skills_improve_codebase_architecture_skill_improve_codebase_architecture",
       "agents_skills_improve_codebase_architecture_skill_process"
     ],
-    "9": [
+    "11": [
       "agents_skills_rust_pro_skill",
       "agents_skills_rust_pro_skill_async_programming_concurrency",
       "agents_skills_rust_pro_skill_behavioral_traits",
@@ -377,67 +459,48 @@
       "agents_skills_rust_pro_skill_use_this_skill_when",
       "agents_skills_rust_pro_skill_web_development_services"
     ],
-    "10": [
-      "debug",
-      "desktop_crates_camcraft_core_src_lib",
-      "desktop_crates_camcraft_core_src_lib_audiooutputsink",
-      "desktop_crates_camcraft_core_src_lib_audiooutputsink_write_samples",
-      "desktop_crates_camcraft_core_src_lib_bounded_channel_preserves_realtime_capacity",
-      "desktop_crates_camcraft_core_src_lib_bounded_video_channel",
-      "desktop_crates_camcraft_core_src_lib_coreerror",
-      "desktop_crates_camcraft_core_src_lib_coreerror_io",
-      "desktop_crates_camcraft_core_src_lib_coreerror_protocol",
-      "desktop_crates_camcraft_core_src_lib_coreerror_unimplemented",
-      "desktop_crates_camcraft_core_src_lib_default_video_queue_capacity",
-      "desktop_crates_camcraft_core_src_lib_rs_t",
-      "desktop_crates_camcraft_core_src_lib_usb_loopback_addr",
-      "desktop_crates_camcraft_core_src_lib_videooutputsink",
-      "desktop_crates_camcraft_core_src_lib_videooutputsink_write_frame",
-      "error",
-      "protocolerror",
-      "receiver",
-      "sender",
-      "super"
-    ],
-    "11": [
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_controlmodels",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_controlmodels_activecamerastate",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_controlmodels_audioconfigpayload",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_controlmodels_camerainfo",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_controlmodels_camerainfo_create",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_controlmodels_configurestream",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_controlmodels_controlack",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_controlmodels_controlack_success",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_controlmodels_controlcmd",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_controlmodels_controlhello",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_controlmodels_requestkeyframe",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_controlmodels_resolutionoption",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_controlmodels_setaudiostate",
-      "android_app_src_main_java_org_artcraft_camcraft_protocol_controlmodels_setcameraparams",
-      "experimentalserializationapi",
-      "json",
-      "jsonclassdiscriminator",
-      "serializable",
-      "serialname"
-    ],
     "12": [
-      "docs_design_camcraft_gui_crate",
-      "docs_design_camcraft_protocol_crate",
-      "docs_plan_tahap_1",
-      "docs_plan_tahap_5",
-      "docs_prd_fr05_two_way_controls",
-      "docs_protocol_ccft_header",
-      "docs_protocol_control_ack",
-      "docs_protocol_control_cmd",
-      "docs_protocol_control_hello",
-      "docs_protocol_frame_flags",
-      "docs_protocol_heartbeat",
-      "docs_protocol_packet_type",
-      "docs_protocol_tcp_multiplexed_transport",
-      "prompts_tahap_1_protocol",
-      "prompts_tahap_5_gui_control"
+      "android_app_src_main_java_org_artcraft_camcraft_network_camcraftstreamservice_camcraftstreamservice_stop",
+      "anyhow",
+      "app",
+      "color32",
+      "context",
+      "desktop_crates_camcraft_gui_src_main",
+      "desktop_crates_camcraft_gui_src_main_apply_artcraft_dark_theme",
+      "desktop_crates_camcraft_gui_src_main_camcraftapp",
+      "desktop_crates_camcraft_gui_src_main_camcraftapp_new",
+      "desktop_crates_camcraft_gui_src_main_camcraftapp_ui",
+      "desktop_crates_camcraft_gui_src_main_color_accent_blue",
+      "desktop_crates_camcraft_gui_src_main_color_bg_carbon",
+      "desktop_crates_camcraft_gui_src_main_color_status_emerald",
+      "desktop_crates_camcraft_gui_src_main_color_surface_card",
+      "desktop_crates_camcraft_gui_src_main_color_text_muted",
+      "desktop_crates_camcraft_gui_src_main_color_text_primary",
+      "desktop_crates_camcraft_gui_src_main_main",
+      "egui",
+      "frame",
+      "ui"
     ],
     "13": [
+      "desktop_crates_camcraft_protocol_src_lib_packetheader",
+      "desktop_crates_camcraft_protocol_src_lib_packetheader_encode",
+      "desktop_crates_camcraft_protocol_src_lib_packetheader_new",
+      "desktop_crates_camcraft_protocol_src_lib_packetheader_to_bytes",
+      "desktop_crates_camcraft_protocol_src_lib_packettype",
+      "desktop_crates_camcraft_protocol_src_lib_packettype_as_u8",
+      "desktop_crates_camcraft_protocol_src_lib_packettype_audioconfig",
+      "desktop_crates_camcraft_protocol_src_lib_packettype_audioframe",
+      "desktop_crates_camcraft_protocol_src_lib_packettype_controlack",
+      "desktop_crates_camcraft_protocol_src_lib_packettype_controlcmd",
+      "desktop_crates_camcraft_protocol_src_lib_packettype_controlhello",
+      "desktop_crates_camcraft_protocol_src_lib_packettype_heartbeatping",
+      "desktop_crates_camcraft_protocol_src_lib_packettype_heartbeatpong",
+      "desktop_crates_camcraft_protocol_src_lib_packettype_videoconfig",
+      "desktop_crates_camcraft_protocol_src_lib_packettype_videoframe",
+      "desktop_crates_camcraft_protocol_src_lib_u8",
+      "desktop_crates_camcraft_protocol_src_lib_u8_from"
+    ],
+    "14": [
       "agents_doc",
       "agents_vibecoding_loop",
       "claude_doc",
@@ -453,22 +516,22 @@
       "scripts_setup_fedora_dev",
       "scripts_setup_fedora_dev_sh__entry"
     ],
-    "14": [
-      "desktop_crates_camcraft_protocol_src_lib_packettype",
-      "desktop_crates_camcraft_protocol_src_lib_packettype_as_u8",
-      "desktop_crates_camcraft_protocol_src_lib_packettype_audioconfig",
-      "desktop_crates_camcraft_protocol_src_lib_packettype_audioframe",
-      "desktop_crates_camcraft_protocol_src_lib_packettype_controlack",
-      "desktop_crates_camcraft_protocol_src_lib_packettype_controlcmd",
-      "desktop_crates_camcraft_protocol_src_lib_packettype_controlhello",
-      "desktop_crates_camcraft_protocol_src_lib_packettype_heartbeatping",
-      "desktop_crates_camcraft_protocol_src_lib_packettype_heartbeatpong",
-      "desktop_crates_camcraft_protocol_src_lib_packettype_videoconfig",
-      "desktop_crates_camcraft_protocol_src_lib_packettype_videoframe",
-      "desktop_crates_camcraft_protocol_src_lib_u8",
-      "desktop_crates_camcraft_protocol_src_lib_u8_from"
-    ],
     "15": [
+      "bytes",
+      "desktop_crates_camcraft_protocol_src_lib_frameflags_empty",
+      "desktop_crates_camcraft_protocol_src_lib_multiple_packets_in_single_buffer",
+      "desktop_crates_camcraft_protocol_src_lib_packet",
+      "desktop_crates_camcraft_protocol_src_lib_packet_control_ack",
+      "desktop_crates_camcraft_protocol_src_lib_packet_control_cmd",
+      "desktop_crates_camcraft_protocol_src_lib_packet_control_hello",
+      "desktop_crates_camcraft_protocol_src_lib_packet_from_parts",
+      "desktop_crates_camcraft_protocol_src_lib_packet_heartbeat_ping",
+      "desktop_crates_camcraft_protocol_src_lib_packet_heartbeat_pong",
+      "desktop_crates_camcraft_protocol_src_lib_packet_new",
+      "desktop_crates_camcraft_protocol_src_lib_packet_video_config",
+      "desktop_crates_camcraft_protocol_src_lib_packet_video_frame"
+    ],
+    "16": [
       "_agents_skills_camerax_references_expert_blueprints_media3_effects_pipeline",
       "_agents_skills_camerax_references_expert_blueprints_raw_jpeg_capture",
       "_agents_skills_camerax_references_expert_blueprints_structural_blueprinting",
@@ -482,7 +545,7 @@
       "_agents_skills_camerax_references_modern_apis_modern_camerax_apis",
       "_agents_skills_camerax_references_thermals_powermanager_thermal_degradation"
     ],
-    "16": [
+    "17": [
       "agents_skills_android_profiler_references_perfetto_bin_trace_processor",
       "agents_skills_android_profiler_references_perfetto_bin_trace_processor_download_or_get_cached",
       "agents_skills_android_profiler_references_perfetto_bin_trace_processor_get_perfetto_prebuilt",
@@ -496,7 +559,47 @@
       "subprocess",
       "sys"
     ],
-    "17": [
+    "18": [
+      "desktop_crates_camcraft_protocol_src_lib_frameflags_from_bits",
+      "desktop_crates_camcraft_protocol_src_lib_packet_decode",
+      "desktop_crates_camcraft_protocol_src_lib_packetheader_from_bytes",
+      "desktop_crates_camcraft_protocol_src_lib_packetheader_from_slice",
+      "desktop_crates_camcraft_protocol_src_lib_packettype_try_from",
+      "desktop_crates_camcraft_protocol_src_lib_protocolerror",
+      "desktop_crates_camcraft_protocol_src_lib_protocolerror_buffertooshort",
+      "desktop_crates_camcraft_protocol_src_lib_protocolerror_invalidmagic",
+      "desktop_crates_camcraft_protocol_src_lib_protocolerror_json",
+      "desktop_crates_camcraft_protocol_src_lib_protocolerror_payloadtoolarge",
+      "desktop_crates_camcraft_protocol_src_lib_protocolerror_unknownpackettype",
+      "desktop_crates_camcraft_protocol_src_lib_protocolerror_unsupportedversion"
+    ],
+    "19": [
+      "activityresultcontracts",
+      "android_app_src_main_java_org_artcraft_camcraft_mainactivity",
+      "build",
+      "collectasstate",
+      "contextcompat",
+      "enableedgetoedge",
+      "getvalue",
+      "manifest",
+      "packagemanager",
+      "safedrawingpadding",
+      "setcontent"
+    ],
+    "20": [
+      "docs_design_camcraft_protocol_crate",
+      "docs_plan_tahap_1",
+      "docs_protocol_ccft_header",
+      "docs_protocol_control_ack",
+      "docs_protocol_control_cmd",
+      "docs_protocol_control_hello",
+      "docs_protocol_frame_flags",
+      "docs_protocol_heartbeat",
+      "docs_protocol_packet_type",
+      "docs_protocol_tcp_multiplexed_transport",
+      "prompts_tahap_1_protocol"
+    ],
+    "21": [
       "_agents_skills_camerax_references_camera1_to_camerax_camera1_migration_guide",
       "_agents_skills_camerax_references_camera1_to_camerax_cameraxviewfinder",
       "_agents_skills_camerax_references_camera1_to_camerax_imagecapture",
@@ -507,7 +610,18 @@
       "_agents_skills_camerax_references_camera2_to_camerax_imageanalysis",
       "_agents_skills_camerax_references_camera2_to_camerax_usecase_abstraction"
     ],
-    "18": [
+    "22": [
+      "agents_android_foreground_service",
+      "docs_design_camcraft_cli_crate",
+      "docs_design_streamconnectionservice",
+      "docs_plan_tahap_2",
+      "docs_plan_tahap_6",
+      "docs_prd_fr02_usb_adb",
+      "docs_prd_fr03_wifi_mdns",
+      "prompts_tahap_2_usb_dummy",
+      "prompts_tahap_6_wifi_mdns"
+    ],
+    "23": [
       "agents_skills_rust_patterns_skill",
       "agents_skills_rust_patterns_skill_1_ownership_and_borrowing",
       "agents_skills_rust_patterns_skill_2_error_handling",
@@ -518,7 +632,7 @@
       "agents_skills_rust_patterns_skill_7_anti_pattern_catalog",
       "agents_skills_rust_patterns_skill_rust_patterns"
     ],
-    "19": [
+    "24": [
       "agents_skills_to_spec_skill",
       "agents_skills_to_spec_skill_further_notes",
       "agents_skills_to_spec_skill_implementation_decisions",
@@ -529,7 +643,7 @@
       "agents_skills_to_spec_skill_testing_decisions",
       "agents_skills_to_spec_skill_user_stories"
     ],
-    "20": [
+    "25": [
       "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftprotocolexception",
       "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftprotocolexception_buffertooshort",
       "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftprotocolexception_ccftprotocolexception",
@@ -540,7 +654,7 @@
       "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftprotocolexception_unsupportedversion",
       "ioexception"
     ],
-    "21": [
+    "26": [
       "desktop_crates_camcraft_protocol_src_lib_control_cmd_variants_serialize_and_deserialize",
       "desktop_crates_camcraft_protocol_src_lib_controlcmd",
       "desktop_crates_camcraft_protocol_src_lib_controlcmd_configure_stream",
@@ -551,7 +665,7 @@
       "desktop_crates_camcraft_protocol_src_lib_controlcmd_setaudiostate",
       "desktop_crates_camcraft_protocol_src_lib_controlcmd_setcameraparams"
     ],
-    "22": [
+    "27": [
       "_agents_skills_camerax_references_camera1_to_camerax_meteringpointfactory",
       "_agents_skills_camerax_references_mlkit_spatial_double_rotation_and_mirroring",
       "_agents_skills_camerax_references_mlkit_spatial_mlkit_spatial_mapping",
@@ -561,7 +675,7 @@
       "_agents_skills_camerax_references_xr_spatial_sdks",
       "_agents_skills_camerax_references_xr_xr_camera_guide"
     ],
-    "23": [
+    "28": [
       "_agents_skills_camerax_references_immutability_immutable_builder_pattern",
       "_agents_skills_camerax_references_immutability_pendingrecording",
       "_agents_skills_camerax_references_immutability_recorder_builder",
@@ -570,7 +684,43 @@
       "_agents_skills_camerax_skill_immutable_api_pattern",
       "_agents_skills_camerax_skill_semantic_ui_merging"
     ],
-    "24": [
+    "29": [
+      "agents_android_surface_pipeline",
+      "claude_android_guidelines",
+      "docs_design_cameracontroller",
+      "docs_design_hardwarevideoencoder",
+      "docs_plan_tahap_3",
+      "docs_prd_nfr_performance",
+      "prompts_tahap_3_camerax_h264"
+    ],
+    "30": [
+      "agents_rust_unsafe_safety_rule",
+      "docs_design_v4l2loopback_sink",
+      "docs_plan_tahap_8",
+      "docs_prd_fr04_v4l2_virtual_cam",
+      "docs_prd_fr07_oled_battery_saver",
+      "docs_prd_fr08_auto_reconnect",
+      "prompts_tahap_8_oled_polish"
+    ],
+    "31": [
+      "bytesmut",
+      "desktop_crates_camcraft_protocol_src_lib_canonical_hex_vector_decode_and_encode",
+      "desktop_crates_camcraft_protocol_src_lib_decode",
+      "desktop_crates_camcraft_protocol_src_lib_encode",
+      "desktop_crates_camcraft_protocol_src_lib_packet_encode",
+      "desktop_crates_camcraft_protocol_src_lib_partial_tcp_stream_chunking_byte_by_byte",
+      "desktop_crates_camcraft_protocol_src_lib_protocol_header_error_cases"
+    ],
+    "32": [
+      "docs_design_camcraft_gui_crate",
+      "docs_design_ffmpeg_decoder",
+      "docs_plan_tahap_4",
+      "docs_plan_tahap_5",
+      "docs_prd_fr05_two_way_controls",
+      "prompts_tahap_4_v4l2_decode",
+      "prompts_tahap_5_gui_control"
+    ],
+    "33": [
       "_agents_skills_camerax_references_camera2_to_camerax_camera2interop_extender",
       "_agents_skills_camerax_references_expert_blueprints_manual_controls_blueprint",
       "_agents_skills_camerax_references_thermals_isp_double_work_pitfall",
@@ -578,7 +728,7 @@
       "_agents_skills_camerax_references_thermals_thermal_management_strategy",
       "_agents_skills_camerax_skill_camera2interop"
     ],
-    "25": [
+    "34": [
       "agents_skills_grill_me_agents_openai",
       "agents_skills_grill_me_agents_openai_interface",
       "agents_skills_grill_me_agents_openai_interface_display_name",
@@ -586,7 +736,7 @@
       "agents_skills_grill_me_agents_openai_policy",
       "agents_skills_grill_me_agents_openai_policy_allow_implicit_invocation"
     ],
-    "26": [
+    "35": [
       "agents_skills_improve_codebase_architecture_agents_openai",
       "agents_skills_improve_codebase_architecture_agents_openai_interface",
       "agents_skills_improve_codebase_architecture_agents_openai_interface_display_name",
@@ -594,7 +744,7 @@
       "agents_skills_improve_codebase_architecture_agents_openai_policy",
       "agents_skills_improve_codebase_architecture_agents_openai_policy_allow_implicit_invocation"
     ],
-    "27": [
+    "36": [
       "agents_skills_to_spec_agents_openai",
       "agents_skills_to_spec_agents_openai_interface",
       "agents_skills_to_spec_agents_openai_interface_display_name",
@@ -602,162 +752,201 @@
       "agents_skills_to_spec_agents_openai_policy",
       "agents_skills_to_spec_agents_openai_policy_allow_implicit_invocation"
     ],
-    "28": [
+    "37": [
+      "android_app_src_main_java_org_artcraft_camcraft_mainactivity_mainactivity",
+      "android_app_src_main_java_org_artcraft_camcraft_mainactivity_mainactivity_oncreate",
+      "android_app_src_main_java_org_artcraft_camcraft_mainactivity_mainactivity_startserverwithpermissioncheck",
+      "android_app_src_main_java_org_artcraft_camcraft_network_camcraftstreamservice_camcraftstreamservice_start",
+      "bundle",
+      "componentactivity"
+    ],
+    "38": [
       "_agents_skills_camerax_references_foldables_foldable_camera_guide",
       "_agents_skills_camerax_references_foldables_foldingfeature_postures",
       "_agents_skills_camerax_references_foldables_rear_display_mode",
       "_agents_skills_camerax_references_foldables_viewport_usecasegroup",
       "_agents_skills_camerax_references_immutability_viewport_builder"
     ],
-    "29": [
+    "39": [
+      "agents_rust_zero_copy_hot_loop",
+      "agents_rust_zero_panic_rule",
+      "claude_rust_guidelines",
+      "docs_design_bounded_video_queue",
+      "docs_design_camcraft_core_crate"
+    ],
+    "40": [
+      "android_app_src_main_java_org_artcraft_camcraft_network_camcraftstreamservice_streamconnectionstatus",
+      "android_app_src_main_java_org_artcraft_camcraft_network_camcraftstreamservice_streamconnectionstatus_connected",
+      "android_app_src_main_java_org_artcraft_camcraft_network_camcraftstreamservice_streamconnectionstatus_error",
+      "android_app_src_main_java_org_artcraft_camcraft_network_camcraftstreamservice_streamconnectionstatus_listening",
+      "android_app_src_main_java_org_artcraft_camcraft_network_camcraftstreamservice_streamconnectionstatus_stopped"
+    ],
+    "41": [
+      "docs_design_audiocaptureengine",
+      "docs_design_pipewire_vmic_sink",
+      "docs_plan_tahap_7",
+      "docs_prd_fr06_audio_pipewire",
+      "prompts_tahap_7_audio_pipewire"
+    ],
+    "42": [
       "_agents_skills_android_cli_skill_adb_shell_input",
       "_agents_skills_android_cli_skill_annotated_screenshot",
       "_agents_skills_android_cli_skill_journey_test",
       "_agents_skills_android_cli_skill_ui_dump_layout"
     ],
-    "30": [
+    "43": [
       "agents_monorepo_structure",
       "docs_plan_tahap_0",
       "docs_plan_vertical_slices",
       "prompts_tahap_0_scaffolding"
     ],
-    "31": [
+    "44": [
+      "android_app_src_main_java_org_artcraft_camcraft_ui_camcraftscreen_camcraftscreen",
+      "android_app_src_main_java_org_artcraft_camcraft_ui_camcraftscreen_camcrafttheme",
+      "composable",
+      "modifier"
+    ],
+    "45": [
       "android_gradlew",
       "android_gradlew__entry",
       "android_gradlew_die",
       "android_gradlew_warn"
     ],
-    "32": [
+    "46": [
       "pkg_camcraft_cli",
       "pkg_camcraft_core",
       "pkg_camcraft_gui",
       "pkg_camcraft_protocol"
     ],
-    "33": [
+    "47": [
       "_agents_skills_camerax_references_testing_async_lifecycle_testing",
       "_agents_skills_camerax_references_testing_fakes_over_mocks",
       "_agents_skills_camerax_references_testing_hermetic_camera_testing"
     ],
-    "34": [
+    "48": [
       "_agents_skills_camerax_references_wear_os_circular_ui_and_rotary",
       "_agents_skills_camerax_references_wear_os_wear_os_remote_viewfinder",
       "_agents_skills_camerax_references_wear_os_wearable_data_message_layer"
     ],
-    "35": [
+    "49": [
       "android_app_src_main_java_org_artcraft_camcraft_encoder_encoderstubs",
       "android_app_src_main_java_org_artcraft_camcraft_encoder_encoderstubs_audiocaptureengine",
       "android_app_src_main_java_org_artcraft_camcraft_encoder_encoderstubs_hardwarevideoencoder"
     ],
-    "36": [
+    "50": [
+      "desktop_crates_camcraft_protocol_src_lib_control_hello_json_schema_matches_spec",
+      "desktop_crates_camcraft_protocol_src_lib_packet_decode_json",
+      "desktop_crates_camcraft_protocol_src_lib_rs_t"
+    ],
+    "51": [
       "android_app_build_gradle",
       "jvmtarget"
     ],
-    "37": [
+    "52": [
       "android_app_src_main_java_org_artcraft_camcraft_camera_cameracontroller",
       "android_app_src_main_java_org_artcraft_camcraft_camera_cameracontroller_cameracontroller"
     ],
-    "38": [
+    "53": [
       "android_app_src_main_java_org_artcraft_camcraft_network_streamconnectionservice",
       "android_app_src_main_java_org_artcraft_camcraft_network_streamconnectionservice_streamconnectionservice"
     ],
-    "39": [
+    "54": [
       "docs_prd_mvp_vision",
       "docs_prd_non_goals"
     ],
-    "40": [
+    "55": [
       "agents_android_mvvm_udf"
     ],
-    "41": [
+    "56": [
       "agents_camcraft_project"
     ],
-    "42": [
+    "57": [
       "agents_skills_grill_me_skill"
     ],
-    "43": [
+    "58": [
       "android_build_gradle"
     ],
-    "44": [
+    "59": [
       "android_settings_gradle"
     ],
-    "45": [
+    "60": [
       "audioconfigpayload"
     ],
-    "46": [
-      "controlack"
-    ],
-    "47": [
-      "controlcmd"
-    ],
-    "48": [
-      "controlhello"
-    ],
-    "49": [
+    "61": [
       "docs_design_end_to_end_pipeline"
     ],
-    "50": [
+    "62": [
       "docs_prd_fr01_video_streaming"
     ],
-    "51": [
-      "packettype"
-    ],
-    "52": [
+    "63": [
       "readme_vibecoding_stack"
     ]
   },
   "cohesion": {
-    "0": 0.05213089802130898,
-    "1": 0.062310949788263764,
-    "2": 0.06507936507936508,
-    "3": 0.0784313725490196,
-    "4": 0.08021390374331551,
-    "5": 0.08275862068965517,
-    "6": 0.09359605911330049,
-    "7": 0.12648221343873517,
-    "8": 0.1,
-    "9": 0.1,
-    "10": 0.11052631578947368,
-    "11": 0.2573099415204678,
-    "12": 0.1619047619047619,
-    "13": 0.27472527472527475,
-    "14": 0.1794871794871795,
-    "15": 0.18181818181818182,
-    "16": 0.19696969696969696,
-    "17": 0.25,
-    "18": 0.2222222222222222,
-    "19": 0.2222222222222222,
-    "20": 0.25,
-    "21": 0.2777777777777778,
-    "22": 0.25,
-    "23": 0.3333333333333333,
-    "24": 0.3333333333333333,
-    "25": 0.3333333333333333,
-    "26": 0.3333333333333333,
-    "27": 0.3333333333333333,
-    "28": 0.4,
-    "29": 0.6666666666666666,
-    "30": 0.5,
-    "31": 0.8333333333333334,
-    "32": 0.8333333333333334,
-    "33": 0.6666666666666666,
-    "34": 0.6666666666666666,
-    "35": 0.6666666666666666,
-    "36": 1.0,
-    "37": 1.0,
-    "38": 1.0,
-    "39": 1.0,
-    "40": 1.0,
-    "41": 1.0,
-    "42": 1.0,
-    "43": 1.0,
-    "44": 1.0,
-    "45": 1.0,
-    "46": 1.0,
-    "47": 1.0,
-    "48": 1.0,
-    "49": 1.0,
-    "50": 1.0,
+    "0": 0.052884615384615384,
+    "1": 0.07294117647058823,
+    "2": 0.058673469387755105,
+    "3": 0.06280193236714976,
+    "4": 0.08534850640113797,
+    "5": 0.0784313725490196,
+    "6": 0.06951871657754011,
+    "7": 0.08275862068965517,
+    "8": 0.08,
+    "9": 0.1976284584980237,
+    "10": 0.1,
+    "11": 0.1,
+    "12": 0.14210526315789473,
+    "13": 0.15441176470588236,
+    "14": 0.27472527472527475,
+    "15": 0.3974358974358974,
+    "16": 0.18181818181818182,
+    "17": 0.19696969696969696,
+    "18": 0.25757575757575757,
+    "19": 0.18181818181818182,
+    "20": 0.23636363636363636,
+    "21": 0.25,
+    "22": 0.2222222222222222,
+    "23": 0.2222222222222222,
+    "24": 0.2222222222222222,
+    "25": 0.25,
+    "26": 0.2777777777777778,
+    "27": 0.25,
+    "28": 0.3333333333333333,
+    "29": 0.3333333333333333,
+    "30": 0.2857142857142857,
+    "31": 0.38095238095238093,
+    "32": 0.2857142857142857,
+    "33": 0.3333333333333333,
+    "34": 0.3333333333333333,
+    "35": 0.3333333333333333,
+    "36": 0.3333333333333333,
+    "37": 0.4666666666666667,
+    "38": 0.4,
+    "39": 0.4,
+    "40": 0.4,
+    "41": 0.5,
+    "42": 0.6666666666666666,
+    "43": 0.5,
+    "44": 0.5,
+    "45": 0.8333333333333334,
+    "46": 0.8333333333333334,
+    "47": 0.6666666666666666,
+    "48": 0.6666666666666666,
+    "49": 0.6666666666666666,
+    "50": 0.6666666666666666,
     "51": 1.0,
-    "52": 1.0
+    "52": 1.0,
+    "53": 1.0,
+    "54": 1.0,
+    "55": 1.0,
+    "56": 1.0,
+    "57": 1.0,
+    "58": 1.0,
+    "59": 1.0,
+    "60": 1.0,
+    "61": 1.0,
+    "62": 1.0,
+    "63": 1.0
   },
   "gods": [
     {
@@ -766,13 +955,23 @@
       "degree": 35
     },
     {
+      "id": "android_app_src_main_java_org_artcraft_camcraft_network_camcraftstreamservice_camcraftstreamservice",
+      "label": "CamCraftStreamService",
+      "degree": 25
+    },
+    {
       "id": "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftpacket_ccftpacket",
       "label": "CcftPacket",
-      "degree": 21
+      "degree": 23
     },
     {
       "id": "desktop_crates_camcraft_protocol_src_lib_packet",
       "label": "Packet",
+      "degree": 20
+    },
+    {
+      "id": "desktop_crates_camcraft_protocol_src_lib_protocolerror",
+      "label": "ProtocolError",
       "degree": 17
     },
     {
@@ -791,24 +990,14 @@
       "degree": 15
     },
     {
-      "id": "desktop_crates_camcraft_protocol_src_lib_protocolerror",
-      "label": "ProtocolError",
-      "degree": 15
+      "id": "desktop_crates_camcraft_core_src_client_clientevent",
+      "label": "ClientEvent",
+      "degree": 14
     },
     {
-      "id": "_agents_skills_android_profiler_analysis_workflows_perfetto_trace_analysis_references_per_candidate_analysis_per_candidate_protocol",
-      "label": "Per-Candidate Root Cause Protocol",
-      "degree": 12
-    },
-    {
-      "id": "android_app_src_test_java_org_artcraft_camcraft_protocol_ccftprotocoltest_ccftprotocoltest",
-      "label": "CcftProtocolTest",
-      "degree": 11
-    },
-    {
-      "id": "agents_skills_rust_pro_skill_capabilities",
-      "label": "Capabilities",
-      "degree": 11
+      "id": "desktop_crates_camcraft_core_src_client_run_client_loop",
+      "label": "run_client_loop()",
+      "degree": 14
     }
   ],
   "surprises": [
@@ -868,41 +1057,8 @@
       "why": "inferred connection - not explicitly stated in source; connects across different repos/directories"
     }
   ],
-  "questions": [
-    {
-      "type": "bridge_node",
-      "question": "Why does `CcftProtocolConstants` connect `Perfetto Trace Analysis & Profiling` to `Project Specs & Agent Workflow`?",
-      "why": "High betweenness centrality (0.020) - this node is a cross-community bridge."
-    },
-    {
-      "type": "isolated_nodes",
-      "question": "What connects `PayloadTooLarge`, `UnknownPacketType`, `UnsupportedVersion` to the rest of the system?",
-      "why": "78 weakly-connected nodes found - possible documentation gaps or missing edges."
-    },
-    {
-      "type": "low_cohesion",
-      "question": "Should `camcraft-protocol/src/lib.rs` be split into smaller, more focused modules?",
-      "why": "Cohesion score 0.05213089802130898 - nodes in this community are weakly interconnected."
-    },
-    {
-      "type": "bridge_node",
-      "question": "Why does `FrameFlags` connect `CCFT v1 Protocol & Control` to `camcraft-protocol/src/lib.rs`?",
-      "why": "High betweenness centrality (0.020) - this node is a cross-community bridge."
-    },
-    {
-      "type": "low_cohesion",
-      "question": "Should `Perfetto Trace Analysis & Profiling` be split into smaller, more focused modules?",
-      "why": "Cohesion score 0.062310949788263764 - nodes in this community are weakly interconnected."
-    },
-    {
-      "type": "bridge_node",
-      "question": "Why does `PacketType` connect `Android MVVM Data Flow` to `camcraft-protocol/src/lib.rs`?",
-      "why": "High betweenness centrality (0.010) - this node is a cross-community bridge."
-    },
-    {
-      "type": "low_cohesion",
-      "question": "Should `Rust Media Sink & Decode` be split into smaller, more focused modules?",
-      "why": "Cohesion score 0.06507936507936508 - nodes in this community are weakly interconnected."
-    }
-  ]
+  "tokens": {
+    "input": 0,
+    "output": 0
+  }
 }

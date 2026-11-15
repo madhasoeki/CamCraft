@@ -3,11 +3,13 @@
 //! Provides the `connect` sub-command for USB ADB and TCP Wi-Fi connections,
 //! displaying discovered device cameras, real-time FPS, bitrate, and RTT latency.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -53,6 +55,10 @@ enum Command {
         /// Target TCP port.
         #[arg(long, default_value_t = camcraft_protocol::DEFAULT_PORT)]
         port: u16,
+
+        /// Optional file path to dump raw received H.264 stream (testable with `ffplay <path.h264>`).
+        #[arg(long = "dump-h264")]
+        dump_h264: Option<PathBuf>,
     },
 
     /// Print compiled CamCraft protocol and core configuration.
@@ -78,8 +84,9 @@ async fn main() -> Result<()> {
             serial,
             vcam,
             port,
+            dump_h264,
         } => {
-            run_connect(usb, host, wifi, serial, vcam, port).await?;
+            run_connect(usb, host, wifi, serial, vcam, port, dump_h264).await?;
         }
         Command::Status => {
             info!(
@@ -102,6 +109,7 @@ async fn run_connect(
     serial: Option<String>,
     vcam: String,
     port: u16,
+    dump_h264: Option<PathBuf>,
 ) -> Result<()> {
     let is_usb = use_usb || (host.is_none() && wifi.is_none());
 
@@ -130,6 +138,17 @@ async fn run_connect(
     let (event_tx, mut event_rx) = mpsc::channel::<ClientEvent>(64);
     let shutdown = Arc::new(AtomicBool::new(false));
 
+    let mut dump_file =
+        if let Some(ref path) = dump_h264 {
+            info!(path = %path.display(), "Opening file to dump raw H.264 stream");
+            Some(tokio::fs::File::create(path).await.with_context(|| {
+                format!("Failed to create H.264 dump file at {}", path.display())
+            })?)
+        } else {
+            None
+        };
+    let mut dumped_bytes: u64 = 0;
+
     // Spawn client network loop in background
     let client_shutdown = shutdown.clone();
     let client_handle =
@@ -155,11 +174,26 @@ async fn run_connect(
             ClientEvent::Stats(stats) => {
                 print_stats(&stats);
             }
-            ClientEvent::VideoConfig { payload_len, .. } => {
+            ClientEvent::VideoConfig {
+                payload_len,
+                payload,
+                ..
+            } => {
                 info!(payload_len, "Received VIDEO_CONFIG SPS/PPS parameters");
+                if let Some(ref mut file) = dump_file {
+                    file.write_all(&payload)
+                        .await
+                        .context("Failed to write VIDEO_CONFIG to dump file")?;
+                    dumped_bytes += payload.len() as u64;
+                }
             }
-            ClientEvent::VideoFrame { .. } => {
-                // Video frames are counted in stats; frame decode sink will attach here in Stage 4
+            ClientEvent::VideoFrame { payload, .. } => {
+                if let Some(ref mut file) = dump_file {
+                    file.write_all(&payload)
+                        .await
+                        .context("Failed to write VIDEO_FRAME to dump file")?;
+                    dumped_bytes += payload.len() as u64;
+                }
             }
             ClientEvent::AudioConfig { .. } | ClientEvent::AudioFrame { .. } => {}
             ClientEvent::ControlAck(ack) => {
@@ -178,6 +212,17 @@ async fn run_connect(
 
     shutdown.store(true, Ordering::Relaxed);
     let _ = client_handle.await;
+
+    if let Some(mut file) = dump_file {
+        file.flush()
+            .await
+            .context("Failed to flush H.264 dump file")?;
+        info!(
+            dumped_bytes,
+            path = %dump_h264.as_ref().unwrap().display(),
+            "H.264 stream dumped successfully (playable with `ffplay <path>`)"
+        );
+    }
 
     if is_usb {
         let _ = adb::remove_adb_forward(serial.as_deref(), port);

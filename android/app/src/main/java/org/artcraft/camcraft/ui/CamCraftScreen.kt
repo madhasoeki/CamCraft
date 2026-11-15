@@ -1,5 +1,6 @@
 package org.artcraft.camcraft.ui
 
+import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -10,6 +11,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -18,13 +21,17 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import org.artcraft.camcraft.network.CamCraftStreamService
 import org.artcraft.camcraft.network.StreamConnectionStatus
 import org.artcraft.camcraft.network.StreamServiceState
 
@@ -130,92 +137,183 @@ fun CamCraftScreen(
                 .weight(1f)
                 .fillMaxWidth()
                 .padding(vertical = 12.dp)
-                .background(ArtCraftColors.SurfaceCard, RoundedCornerShape(16.dp))
-                .padding(20.dp),
+                .clip(RoundedCornerShape(16.dp))
+                .background(ArtCraftColors.SurfaceCard),
             contentAlignment = Alignment.Center,
         ) {
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.Center,
-            ) {
-                when (state.status) {
-                    StreamConnectionStatus.CONNECTED -> {
-                        Text(
-                            text = "SYNTHETIC STREAM ACTIVE",
-                            color = ArtCraftColors.StatusEmerald,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 13.sp,
-                            letterSpacing = 1.sp,
+            if (state.status == StreamConnectionStatus.CONNECTED) {
+                AndroidView(
+                    factory = { context ->
+                        PreviewView(context).apply {
+                            scaleType = PreviewView.ScaleType.FILL_CENTER
+                            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+                            CamCraftStreamService.attachPreviewView(this)
+                        }
+                    },
+                    modifier = Modifier.fillMaxSize(),
+                )
+
+                DisposableEffect(Unit) {
+                    onDispose {
+                        CamCraftStreamService.detachPreviewView()
+                    }
+                }
+
+                // Overlay HUD
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(16.dp),
+                ) {
+                    // Top Live & Resolution Pill
+                    Row(
+                        modifier = Modifier
+                            .align(Alignment.TopStart)
+                            .background(
+                                ArtCraftColors.BgCarbon.copy(alpha = 0.75f),
+                                RoundedCornerShape(8.dp),
+                            )
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(8.dp)
+                                .background(ArtCraftColors.StatusEmerald, CircleShape),
                         )
-                        Spacer(modifier = Modifier.height(16.dp))
                         Text(
-                            text = String.format("%.1f FPS", state.currentFps),
+                            text = "LIVE • ${state.activeState.width}x${state.activeState.height}",
                             color = ArtCraftColors.TextPrimary,
-                            fontSize = 42.sp,
-                            fontWeight = FontWeight.ExtraBold,
-                            fontFamily = FontFamily.Monospace,
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text(
-                            text = "${state.framesSent} frames sent • ~12 Mbps",
-                            color = ArtCraftColors.TextMuted,
-                            fontSize = 14.sp,
-                        )
-                        Spacer(modifier = Modifier.height(16.dp))
-                        Text(
-                            text = "CameraX Viewfinder will be attached in Stage 3",
-                            color = ArtCraftColors.TextMuted.copy(alpha = 0.7f),
                             fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
                         )
                     }
-                    StreamConnectionStatus.LISTENING -> {
+
+                    // Top-Right Bitrate Pill
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .background(
+                                ArtCraftColors.BgCarbon.copy(alpha = 0.75f),
+                                RoundedCornerShape(8.dp),
+                            )
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                    ) {
                         Text(
-                            text = "READY FOR ADB USB TUNNEL",
+                            text = "${state.bitrateKbps / 1_000} Mbps",
                             color = ArtCraftColors.AccentBlue,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 13.sp,
-                            letterSpacing = 1.sp,
-                        )
-                        Spacer(modifier = Modifier.height(12.dp))
-                        Text(
-                            text = "Listening on TCP 9876",
-                            color = ArtCraftColors.TextPrimary,
-                            fontSize = 18.sp,
-                            fontWeight = FontWeight.SemiBold,
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text(
-                            text = "Run `cargo run -p camcraft-cli -- connect --usb` on your Fedora PC",
-                            color = ArtCraftColors.TextMuted,
-                            fontSize = 13.sp,
-                        )
-                    }
-                    StreamConnectionStatus.ERROR -> {
-                        Text(
-                            text = "SERVER ERROR",
-                            color = ArtCraftColors.StatusRose,
+                            fontSize = 12.sp,
                             fontWeight = FontWeight.Bold,
                         )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text(
-                            text = state.errorMessage ?: "Unknown error",
-                            color = ArtCraftColors.TextMuted,
-                            fontSize = 13.sp,
-                        )
                     }
-                    StreamConnectionStatus.STOPPED -> {
-                        Text(
-                            text = "CamCraft Stream Server",
-                            color = ArtCraftColors.TextPrimary,
-                            fontSize = 18.sp,
-                            fontWeight = FontWeight.SemiBold,
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text(
-                            text = "Tap the button below to start the background stream service",
-                            color = ArtCraftColors.TextMuted,
-                            fontSize = 13.sp,
-                        )
+
+                    // Bottom Diagnostics Banner
+                    Surface(
+                        color = ArtCraftColors.BgCarbon.copy(alpha = 0.85f),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .fillMaxWidth(),
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 10.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column {
+                                Text(
+                                    text = String.format("%.1f FPS", state.currentFps),
+                                    color = ArtCraftColors.StatusEmerald,
+                                    fontSize = 20.sp,
+                                    fontWeight = FontWeight.ExtraBold,
+                                    fontFamily = FontFamily.Monospace,
+                                )
+                                Text(
+                                    text = "Target: ${state.activeState.fps} FPS",
+                                    color = ArtCraftColors.TextMuted,
+                                    fontSize = 11.sp,
+                                )
+                            }
+
+                            Column(horizontalAlignment = Alignment.End) {
+                                Text(
+                                    text = "${state.framesSent} frames",
+                                    color = ArtCraftColors.TextPrimary,
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    fontFamily = FontFamily.Monospace,
+                                )
+                                Text(
+                                    text = "Camera ${state.activeState.cameraId}",
+                                    color = ArtCraftColors.TextMuted,
+                                    fontSize = 11.sp,
+                                )
+                            }
+                        }
+                    }
+                }
+            } else {
+                Column(
+                    modifier = Modifier.padding(20.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center,
+                ) {
+                    when (state.status) {
+                        StreamConnectionStatus.LISTENING -> {
+                            Text(
+                                text = "READY FOR ADB USB TUNNEL",
+                                color = ArtCraftColors.AccentBlue,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp,
+                                letterSpacing = 1.sp,
+                            )
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Text(
+                                text = "Listening on TCP 9876",
+                                color = ArtCraftColors.TextPrimary,
+                                fontSize = 18.sp,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = "Run `cargo run -p camcraft-cli -- connect --usb` on your Fedora PC",
+                                color = ArtCraftColors.TextMuted,
+                                fontSize = 13.sp,
+                            )
+                        }
+                        StreamConnectionStatus.ERROR -> {
+                            Text(
+                                text = "SERVER ERROR",
+                                color = ArtCraftColors.StatusRose,
+                                fontWeight = FontWeight.Bold,
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = state.errorMessage ?: "Unknown error",
+                                color = ArtCraftColors.TextMuted,
+                                fontSize = 13.sp,
+                            )
+                        }
+                        StreamConnectionStatus.STOPPED -> {
+                            Text(
+                                text = "CamCraft Stream Server",
+                                color = ArtCraftColors.TextPrimary,
+                                fontSize = 18.sp,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = "Tap the button below to start the background stream service",
+                                color = ArtCraftColors.TextMuted,
+                                fontSize = 13.sp,
+                            )
+                        }
+                        StreamConnectionStatus.CONNECTED -> {
+                            // Handled in if block above
+                        }
                     }
                 }
             }

@@ -1,9 +1,9 @@
 package org.artcraft.camcraft.encoder
 
 /**
- * Stage 0 stub for MediaCodec H.264/HEVC surface video encoding (Stage 3).
+ * MediaCodec H.264/HEVC hardware surface video encoder (Stage 3).
  */
-class HardwareVideoEncoder
+typealias HardwareVideoEncoder = H264SurfaceEncoder
 
 /**
  * Stage 0 stub for AudioRecord Opus/PCM audio capture and encoding (Stage 7).

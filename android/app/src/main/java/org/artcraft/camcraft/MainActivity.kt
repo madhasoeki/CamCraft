@@ -20,10 +20,15 @@ import org.artcraft.camcraft.ui.CamCraftTheme
 
 class MainActivity : ComponentActivity() {
 
-    private val notificationPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission(),
-    ) { granted ->
-        if (granted) {
+    private val permissionsLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { results ->
+        val cameraGranted = results[Manifest.permission.CAMERA] ?: (ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.CAMERA,
+        ) == PackageManager.PERMISSION_GRANTED)
+
+        if (cameraGranted) {
             CamCraftStreamService.start(this)
         }
     }
@@ -55,18 +60,22 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startServerWithPermissionCheck() {
+        val permissions = mutableListOf(
+            Manifest.permission.CAMERA,
+            Manifest.permission.RECORD_AUDIO,
+        )
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            val permissionStatus = ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.POST_NOTIFICATIONS,
-            )
-            if (permissionStatus == PackageManager.PERMISSION_GRANTED) {
-                CamCraftStreamService.start(this)
-            } else {
-                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-            }
-        } else {
+            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+
+        val missing = permissions.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+
+        if (missing.isEmpty()) {
             CamCraftStreamService.start(this)
+        } else {
+            permissionsLauncher.launch(missing.toTypedArray())
         }
     }
 }

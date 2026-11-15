@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use camcraft_protocol::{
     ControlAck, ControlCmd, ControlHello, Packet, PacketHeader, PacketType, ProtocolError,
 };
@@ -81,11 +81,13 @@ pub enum ClientEvent {
     VideoFrame {
         header: PacketHeader,
         payload_len: usize,
+        payload: Bytes,
     },
     /// Video codec configuration (SPS/PPS parameter sets).
     VideoConfig {
         header: PacketHeader,
         payload_len: usize,
+        payload: Bytes,
     },
     /// Audio stream configuration.
     AudioConfig {
@@ -318,6 +320,7 @@ pub async fn run_client_loop(
                             .send(ClientEvent::VideoFrame {
                                 header: packet.header,
                                 payload_len: packet.payload.len(),
+                                payload: packet.payload.clone(),
                             })
                             .await;
                     }
@@ -330,6 +333,7 @@ pub async fn run_client_loop(
                             .send(ClientEvent::VideoConfig {
                                 header: packet.header,
                                 payload_len: packet.payload.len(),
+                                payload: packet.payload.clone(),
                             })
                             .await;
                     }
