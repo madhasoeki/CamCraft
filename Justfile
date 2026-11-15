@@ -59,7 +59,11 @@ rust-test:
 run-gui:
     cd desktop && cargo run --release -p camcraft-gui
 
-# Jalankan CLI Daemon CamCraft via USB menuju /dev/video10
+# Jalankan CLI receiver via USB (Testing Stage 2)
+cli-usb:
+    cd desktop && cargo run -p camcraft-cli -- connect --usb
+
+# Jalankan CLI Daemon CamCraft via USB menuju /dev/video10 (Stage 4+)
 run-cli-usb: usb-tunnel
     cd desktop && cargo run --release -p camcraft-cli -- connect --usb --vcam /dev/video10
 

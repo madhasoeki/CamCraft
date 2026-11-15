@@ -646,8 +646,10 @@ name = "camcraft-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "camcraft-protocol",
  "crossbeam-channel",
+ "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

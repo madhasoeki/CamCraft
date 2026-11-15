@@ -8,8 +8,10 @@ description = "Core async networking, ADB tunneling, decoding, and virtual devic
 
 [dependencies]
 anyhow.workspace = true
+bytes.workspace = true
 camcraft-protocol = { path = "../camcraft-protocol" }
 crossbeam-channel.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

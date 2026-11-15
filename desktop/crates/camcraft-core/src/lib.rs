@@ -11,6 +11,12 @@ pub enum CoreError {
     #[error("protocol error: {0}")]
     Protocol(#[from] camcraft_protocol::ProtocolError),
 
+    #[error("ADB error: {0}")]
+    Adb(#[from] adb::AdbError),
+
+    #[error("client network error: {0}")]
+    Client(#[from] client::ClientError),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -48,7 +54,10 @@ pub mod net {
 }
 
 /// ADB tunnel helper (`adb forward`) (Stage 2+).
-pub mod adb {}
+pub mod adb;
+
+/// Asynchronous network client & CCFT demuxer (Stage 2+).
+pub mod client;
 
 /// Bounded video/audio frame queues and H.264/Opus decoders (Stage 4 / Stage 7).
 pub mod decoder {

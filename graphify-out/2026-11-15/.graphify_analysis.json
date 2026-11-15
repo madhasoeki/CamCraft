@@ -786,13 +786,13 @@
       "degree": 16
     },
     {
-      "id": "desktop_crates_camcraft_protocol_src_lib_protocolerror",
-      "label": "ProtocolError",
+      "id": "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_packettype",
+      "label": "PacketType",
       "degree": 15
     },
     {
-      "id": "android_app_src_main_java_org_artcraft_camcraft_protocol_ccftheader_packettype",
-      "label": "PacketType",
+      "id": "desktop_crates_camcraft_protocol_src_lib_protocolerror",
+      "label": "ProtocolError",
       "degree": 15
     },
     {
@@ -801,13 +801,13 @@
       "degree": 12
     },
     {
-      "id": "agents_skills_rust_pro_skill_capabilities",
-      "label": "Capabilities",
+      "id": "android_app_src_test_java_org_artcraft_camcraft_protocol_ccftprotocoltest_ccftprotocoltest",
+      "label": "CcftProtocolTest",
       "degree": 11
     },
     {
-      "id": "android_app_src_test_java_org_artcraft_camcraft_protocol_ccftprotocoltest_ccftprotocoltest",
-      "label": "CcftProtocolTest",
+      "id": "agents_skills_rust_pro_skill_capabilities",
+      "label": "Capabilities",
       "degree": 11
     }
   ],
@@ -868,8 +868,41 @@
       "why": "inferred connection - not explicitly stated in source; connects across different repos/directories"
     }
   ],
-  "tokens": {
-    "input": 0,
-    "output": 0
-  }
+  "questions": [
+    {
+      "type": "bridge_node",
+      "question": "Why does `CcftProtocolConstants` connect `Perfetto Trace Analysis & Profiling` to `Project Specs & Agent Workflow`?",
+      "why": "High betweenness centrality (0.020) - this node is a cross-community bridge."
+    },
+    {
+      "type": "isolated_nodes",
+      "question": "What connects `PayloadTooLarge`, `UnknownPacketType`, `UnsupportedVersion` to the rest of the system?",
+      "why": "78 weakly-connected nodes found - possible documentation gaps or missing edges."
+    },
+    {
+      "type": "low_cohesion",
+      "question": "Should `camcraft-protocol/src/lib.rs` be split into smaller, more focused modules?",
+      "why": "Cohesion score 0.05213089802130898 - nodes in this community are weakly interconnected."
+    },
+    {
+      "type": "bridge_node",
+      "question": "Why does `FrameFlags` connect `CCFT v1 Protocol & Control` to `camcraft-protocol/src/lib.rs`?",
+      "why": "High betweenness centrality (0.020) - this node is a cross-community bridge."
+    },
+    {
+      "type": "low_cohesion",
+      "question": "Should `Perfetto Trace Analysis & Profiling` be split into smaller, more focused modules?",
+      "why": "Cohesion score 0.062310949788263764 - nodes in this community are weakly interconnected."
+    },
+    {
+      "type": "bridge_node",
+      "question": "Why does `PacketType` connect `Android MVVM Data Flow` to `camcraft-protocol/src/lib.rs`?",
+      "why": "High betweenness centrality (0.010) - this node is a cross-community bridge."
+    },
+    {
+      "type": "low_cohesion",
+      "question": "Should `Rust Media Sink & Decode` be split into smaller, more focused modules?",
+      "why": "Cohesion score 0.06507936507936508 - nodes in this community are weakly interconnected."
+    }
+  ]
 }
