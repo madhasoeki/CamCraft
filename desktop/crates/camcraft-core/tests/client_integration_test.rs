@@ -108,6 +108,7 @@ async fn test_client_receiver_end_to_end_mock_stream() {
     // Run client loop
     let config = ClientConfig {
         endpoint,
+        interface: None,
         ping_interval: Duration::from_millis(50),
         read_buffer_capacity: 65536,
     };

@@ -26,8 +26,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -94,47 +99,119 @@ fun CamCraftScreen(
             shape = RoundedCornerShape(12.dp),
             modifier = Modifier.fillMaxWidth(),
         ) {
-            Row(
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 16.dp, vertical = 14.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
+                verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                Column {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column {
+                        Text(
+                            text = when (state.status) {
+                                StreamConnectionStatus.STOPPED -> "Server Inactive"
+                                StreamConnectionStatus.LISTENING -> "Waiting for PC..."
+                                StreamConnectionStatus.CONNECTED -> "PC Client Connected"
+                                StreamConnectionStatus.ERROR -> "Error Occurred"
+                            },
+                            color = when (state.status) {
+                                StreamConnectionStatus.STOPPED -> ArtCraftColors.TextMuted
+                                StreamConnectionStatus.LISTENING -> ArtCraftColors.StatusAmber
+                                StreamConnectionStatus.CONNECTED -> ArtCraftColors.StatusEmerald
+                                StreamConnectionStatus.ERROR -> ArtCraftColors.StatusRose
+                            },
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 15.sp,
+                        )
+                        Text(
+                            text = when (state.status) {
+                                StreamConnectionStatus.CONNECTED -> state.clientAddress ?: "127.0.0.1"
+                                StreamConnectionStatus.ERROR -> state.errorMessage ?: "Unknown error"
+                                else -> "Port ${state.listenPort} (USB / Wi-Fi)"
+                            },
+                            color = ArtCraftColors.TextMuted,
+                            fontSize = 12.sp,
+                        )
+                    }
+
                     Text(
-                        text = when (state.status) {
-                            StreamConnectionStatus.STOPPED -> "Server Inactive"
-                            StreamConnectionStatus.LISTENING -> "Waiting for PC..."
-                            StreamConnectionStatus.CONNECTED -> "PC Client Connected"
-                            StreamConnectionStatus.ERROR -> "Error Occurred"
-                        },
-                        color = when (state.status) {
-                            StreamConnectionStatus.STOPPED -> ArtCraftColors.TextMuted
-                            StreamConnectionStatus.LISTENING -> ArtCraftColors.StatusAmber
-                            StreamConnectionStatus.CONNECTED -> ArtCraftColors.StatusEmerald
-                            StreamConnectionStatus.ERROR -> ArtCraftColors.StatusRose
-                        },
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 15.sp,
-                    )
-                    Text(
-                        text = when (state.status) {
-                            StreamConnectionStatus.CONNECTED -> state.clientAddress ?: "127.0.0.1"
-                            StreamConnectionStatus.ERROR -> state.errorMessage ?: "Unknown error"
-                            else -> "Port 9876 (USB / Wi-Fi)"
-                        },
-                        color = ArtCraftColors.TextMuted,
-                        fontSize = 12.sp,
+                        text = "${state.activeState.width}x${state.activeState.height} • ${state.activeState.fps} FPS",
+                        color = ArtCraftColors.TextPrimary,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium,
                     )
                 }
 
-                Text(
-                    text = "${state.activeState.width}x${state.activeState.height} • ${state.activeState.fps} FPS",
-                    color = ArtCraftColors.TextPrimary,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Medium,
-                )
+                // Wi-Fi Endpoint & mDNS Status Row
+                Surface(
+                    color = ArtCraftColors.SurfaceCardHighlight,
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        val wifiEndpoint = state.wifiEndpoint
+                        if (wifiEndpoint != null) {
+                            Text(
+                                text = buildAnnotatedString {
+                                    withStyle(SpanStyle(color = ArtCraftColors.AccentBlue)) {
+                                        append("Wi-Fi: ")
+                                    }
+                                    withStyle(SpanStyle(color = ArtCraftColors.TextPrimary)) {
+                                        append(wifiEndpoint)
+                                    }
+                                },
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .padding(end = 8.dp),
+                            )
+                        } else {
+                            Text(
+                                text = "Wi-Fi: Not connected",
+                                color = ArtCraftColors.StatusAmber,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .padding(end = 8.dp),
+                            )
+                        }
+
+                        Surface(
+                            color = if (state.mdnsRegistered) {
+                                ArtCraftColors.StatusEmerald.copy(alpha = 0.16f)
+                            } else {
+                                ArtCraftColors.BgCarbon.copy(alpha = 0.6f)
+                            },
+                            shape = RoundedCornerShape(6.dp),
+                        ) {
+                            Text(
+                                text = if (state.mdnsRegistered) "mDNS ON" else "mDNS OFF",
+                                color = if (state.mdnsRegistered) {
+                                    ArtCraftColors.StatusEmerald
+                                } else {
+                                    ArtCraftColors.TextMuted
+                                },
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                            )
+                        }
+                    }
+                }
             }
         }
 
@@ -271,24 +348,50 @@ fun CamCraftScreen(
                     when (state.status) {
                         StreamConnectionStatus.LISTENING -> {
                             Text(
-                                text = "READY FOR ADB USB TUNNEL",
+                                text = "READY FOR USB OR WI-FI",
                                 color = ArtCraftColors.AccentBlue,
                                 fontWeight = FontWeight.Bold,
                                 fontSize = 13.sp,
                                 letterSpacing = 1.sp,
+                                textAlign = TextAlign.Center,
                             )
                             Spacer(modifier = Modifier.height(12.dp))
+                            Surface(
+                                color = ArtCraftColors.SurfaceCardHighlight,
+                                shape = RoundedCornerShape(10.dp),
+                            ) {
+                                val endpointText = state.wifiEndpoint
+                                    ?: "Port ${state.listenPort} (Connect Wi-Fi or USB)"
+                                Text(
+                                    text = endpointText,
+                                    color = ArtCraftColors.TextPrimary,
+                                    fontSize = if (state.wifiEndpoint != null) 20.sp else 16.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    fontFamily = if (state.wifiEndpoint != null) {
+                                        FontFamily.Monospace
+                                    } else {
+                                        FontFamily.Default
+                                    },
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                                )
+                            }
+                            if (state.mdnsRegistered) {
+                                Spacer(modifier = Modifier.height(10.dp))
+                                Text(
+                                    text = "mDNS: ${state.mdnsServiceName ?: "CamCraft Android"}",
+                                    color = ArtCraftColors.StatusEmerald,
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    textAlign = TextAlign.Center,
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(10.dp))
                             Text(
-                                text = "Listening on TCP 9876",
-                                color = ArtCraftColors.TextPrimary,
-                                fontSize = 18.sp,
-                                fontWeight = FontWeight.SemiBold,
-                            )
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Text(
-                                text = "Run `cargo run -p camcraft-cli -- connect --usb` on your Fedora PC",
+                                text = "Fedora camcraft-gui discovers this device automatically under Wi-Fi Devices, or connect via manual IP / USB ADB.",
                                 color = ArtCraftColors.TextMuted,
                                 fontSize = 13.sp,
+                                textAlign = TextAlign.Center,
                             )
                         }
                         StreamConnectionStatus.ERROR -> {
@@ -418,5 +521,21 @@ fun CamCraftScreen(
                 modifier = Modifier.padding(vertical = 8.dp),
             )
         }
+    }
+}
+
+@Preview(showBackground = true)
+@Composable
+fun CamCraftScreenListeningPreview() {
+    CamCraftTheme {
+        CamCraftScreen(
+            state = StreamServiceState(
+                status = StreamConnectionStatus.LISTENING,
+                localIpAddress = "192.168.1.42",
+                mdnsRegistered = true,
+                mdnsServiceName = "Pixel 8 Pro",
+            ),
+            onToggleServer = {},
+        )
     }
 }

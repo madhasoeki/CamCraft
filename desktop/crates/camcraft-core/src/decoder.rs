@@ -8,8 +8,9 @@
 //! - Drops stale non-keyframes on backpressure to prevent latency accumulation.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender, TrySendError};
@@ -25,6 +26,15 @@ use crate::vcam::VirtualCameraSink;
 
 /// Maximum number of unrendered frames queued before dropping non-keyframes.
 pub const DECODER_QUEUE_CAPACITY: usize = 3;
+
+/// Minimum interval between outbound keyframe recovery requests.
+pub const KEYFRAME_REQUEST_COOLDOWN: Duration = Duration::from_millis(500);
+
+/// Maximum expected inter-frame PTS gap (microseconds) before suspecting dropped packets.
+pub const MAX_INTER_FRAME_GAP_US: u64 = 500_000;
+
+/// Number of consecutive P-frames producing zero decoded pictures before requesting a keyframe.
+pub const MAX_EMPTY_P_FRAMES: u32 = 3;
 
 /// Creates a bounded crossbeam channel used to drop stale frames under backpressure (`docs/DESIGN.md` §3.1).
 #[must_use]
@@ -53,6 +63,172 @@ pub enum DecoderError {
 
     #[error("I/O error during sink output: {0}")]
     SinkIo(String),
+
+    #[error("Corrupted or incomplete video frame decoded: {0}")]
+    CorruptedFrame(String),
+}
+
+/// Reason why the decoder recovery tracker requested a fresh IDR keyframe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyframeRequestReason {
+    MissingInitialKeyframe,
+    FrameDropped,
+    PtsDiscontinuity,
+    DecodeError,
+    ConsecutiveEmptyPFrames,
+}
+
+/// Decision produced by [`KeyframeRecoveryTracker::on_before_decode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreDecodeAction {
+    Decode,
+    DecodeAndRequest(KeyframeRequestReason),
+    SkipUntilKeyframe {
+        request: Option<KeyframeRequestReason>,
+    },
+}
+
+/// Pure, time-injectable state machine governing H.264 decoder recovery and keyframe requests.
+#[derive(Debug, Clone)]
+pub struct KeyframeRecoveryTracker {
+    cooldown: Duration,
+    has_decoded_keyframe: bool,
+    awaiting_keyframe: bool,
+    awaiting_reason: KeyframeRequestReason,
+    last_pts_us: Option<u64>,
+    consecutive_empty_p_frames: u32,
+    last_request_at: Option<Instant>,
+}
+
+impl Default for KeyframeRecoveryTracker {
+    fn default() -> Self {
+        Self::new(KEYFRAME_REQUEST_COOLDOWN)
+    }
+}
+
+impl KeyframeRecoveryTracker {
+    /// Creates a new recovery tracker enforcing `cooldown` between emitted requests.
+    #[must_use]
+    pub fn new(cooldown: Duration) -> Self {
+        Self {
+            cooldown,
+            has_decoded_keyframe: false,
+            awaiting_keyframe: false,
+            awaiting_reason: KeyframeRequestReason::MissingInitialKeyframe,
+            last_pts_us: None,
+            consecutive_empty_p_frames: 0,
+            last_request_at: None,
+        }
+    }
+
+    /// Resets stream-level baseline when new SPS/PPS `VIDEO_CONFIG` parameter sets arrive.
+    pub fn on_config_received(&mut self) {
+        self.has_decoded_keyframe = false;
+        self.consecutive_empty_p_frames = 0;
+        self.last_pts_us = None;
+    }
+
+    /// Records a frame drop detected via sequence discontinuity or queue backpressure.
+    pub fn on_frame_dropped(&mut self, now: Instant) -> Option<KeyframeRequestReason> {
+        self.awaiting_keyframe = true;
+        self.awaiting_reason = KeyframeRequestReason::FrameDropped;
+        self.consecutive_empty_p_frames = 0;
+        self.try_request(KeyframeRequestReason::FrameDropped, now)
+    }
+
+    /// Evaluates whether an incoming packet should be fed to FFmpeg or skipped until an IDR arrives.
+    pub fn on_before_decode(
+        &mut self,
+        pts_us: u64,
+        is_keyframe: bool,
+        now: Instant,
+    ) -> PreDecodeAction {
+        if is_keyframe {
+            self.last_pts_us = Some(pts_us);
+            return PreDecodeAction::Decode;
+        }
+
+        if !self.has_decoded_keyframe {
+            let request = self.try_request(KeyframeRequestReason::MissingInitialKeyframe, now);
+            return PreDecodeAction::SkipUntilKeyframe { request };
+        }
+
+        if self.awaiting_keyframe {
+            let request = self.try_request(self.awaiting_reason, now);
+            return PreDecodeAction::SkipUntilKeyframe { request };
+        }
+
+        if let Some(prev_pts) = self.last_pts_us {
+            let is_discontinuous =
+                pts_us < prev_pts || pts_us.saturating_sub(prev_pts) > MAX_INTER_FRAME_GAP_US;
+            self.last_pts_us = Some(pts_us);
+            if is_discontinuous
+                && let Some(reason) = self.try_request(KeyframeRequestReason::PtsDiscontinuity, now)
+            {
+                return PreDecodeAction::DecodeAndRequest(reason);
+            }
+        } else {
+            self.last_pts_us = Some(pts_us);
+        }
+
+        PreDecodeAction::Decode
+    }
+
+    /// Updates state after FFmpeg returns `Ok(())` for a packet that yielded `decoded_count` pictures.
+    pub fn on_decode_success(
+        &mut self,
+        pts_us: u64,
+        is_keyframe: bool,
+        decoded_count: usize,
+        now: Instant,
+    ) -> Option<KeyframeRequestReason> {
+        if decoded_count > 0 {
+            self.consecutive_empty_p_frames = 0;
+            self.last_pts_us = Some(pts_us);
+            if is_keyframe {
+                self.has_decoded_keyframe = true;
+                self.awaiting_keyframe = false;
+            }
+            return None;
+        }
+
+        if is_keyframe {
+            self.awaiting_keyframe = true;
+            self.awaiting_reason = KeyframeRequestReason::DecodeError;
+            return self.try_request(KeyframeRequestReason::DecodeError, now);
+        }
+
+        self.consecutive_empty_p_frames = self.consecutive_empty_p_frames.saturating_add(1);
+        if self.consecutive_empty_p_frames >= MAX_EMPTY_P_FRAMES {
+            self.awaiting_keyframe = true;
+            self.awaiting_reason = KeyframeRequestReason::ConsecutiveEmptyPFrames;
+            return self.try_request(KeyframeRequestReason::ConsecutiveEmptyPFrames, now);
+        }
+
+        None
+    }
+
+    /// Updates state when FFmpeg fails to decode or flags a frame as corrupt.
+    pub fn on_decode_error(&mut self, now: Instant) -> Option<KeyframeRequestReason> {
+        self.awaiting_keyframe = true;
+        self.awaiting_reason = KeyframeRequestReason::DecodeError;
+        self.consecutive_empty_p_frames = 0;
+        self.try_request(KeyframeRequestReason::DecodeError, now)
+    }
+
+    fn try_request(
+        &mut self,
+        reason: KeyframeRequestReason,
+        now: Instant,
+    ) -> Option<KeyframeRequestReason> {
+        match self.last_request_at {
+            Some(last) if now.saturating_duration_since(last) < self.cooldown => None,
+            _ => {
+                self.last_request_at = Some(now);
+                Some(reason)
+            }
+        }
+    }
 }
 
 /// A decoded video frame with contiguous pixel buffers (owned variant for cross-thread preview).
@@ -116,6 +292,7 @@ pub enum DecoderCommand {
     Config { pts_us: u64, data: Bytes },
     /// Video frame containing Annex-B NAL unit(s).
     Frame {
+        seq: u64,
         pts_us: u64,
         is_keyframe: bool,
         data: Bytes,
@@ -366,6 +543,20 @@ impl H264Decoder {
         loop {
             match self.decoder.receive_frame(&mut self.raw_frame) {
                 Ok(()) => {
+                    if self.raw_frame.is_corrupt() || self.raw_frame.has_decode_errors() {
+                        warn!(
+                            pts_us,
+                            is_keyframe,
+                            corrupt = self.raw_frame.is_corrupt(),
+                            decode_error_flags = ?self.raw_frame.decode_error_flags(),
+                            "Discarding corrupted decoded H.264 frame"
+                        );
+                        return Err(DecoderError::CorruptedFrame(format!(
+                            "frame pts={pts_us} corrupt={} decode_errors={}",
+                            self.raw_frame.is_corrupt(),
+                            self.raw_frame.has_decode_errors()
+                        )));
+                    }
                     let frame_pts_us = self
                         .raw_frame
                         .pts()
@@ -447,6 +638,13 @@ impl H264Decoder {
             out_frames.push(frame.to_owned_frame());
         })?;
         Ok(out_frames)
+    }
+
+    /// Flushes decoder internal buffers after a decode error and re-arms cached SPS/PPS
+    /// config so the next incoming IDR keyframe receives clean codec parameter sets.
+    pub fn reset_after_error(&mut self) {
+        self.decoder.flush();
+        self.pending_config = !self.cached_config.is_empty();
     }
 }
 
@@ -541,6 +739,7 @@ pub fn extract_contiguous_rgba(frame: &VideoFrame, width: u32, height: u32) -> V
 pub struct DecoderSender {
     cmd_tx: Sender<DecoderCommand>,
     cmd_rx_drain: Receiver<DecoderCommand>,
+    next_seq: Arc<AtomicU64>,
 }
 
 impl DecoderSender {
@@ -551,6 +750,7 @@ impl DecoderSender {
         let sender = Self {
             cmd_tx: tx,
             cmd_rx_drain: rx.clone(),
+            next_seq: Arc::new(AtomicU64::new(0)),
         };
         (sender, rx)
     }
@@ -678,7 +878,9 @@ impl DecoderSender {
         is_keyframe: bool,
         data: Bytes,
     ) -> Result<bool, DecoderError> {
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let cmd = DecoderCommand::Frame {
+            seq,
             pts_us,
             is_keyframe,
             data,
@@ -721,66 +923,117 @@ impl DecoderSender {
     }
 }
 
+fn dispatch_decoded_frame(
+    frame: DecodedFrameRef<'_>,
+    sink: &mut Option<Box<dyn VirtualCameraSink>>,
+    frame_tx: &Option<Sender<DecodedFrame>>,
+) {
+    // 1. Write directly from borrowed YUV420P slice without extra heap copy
+    if let Some(vcam_sink) = sink
+        && let Err(e) = vcam_sink.write_frame(frame.width, frame.height, frame.yuv420p)
+    {
+        warn!(error = %e, "Failed to write frame to virtual camera sink");
+    }
+
+    // 2. Forward owned frame to GUI preview only when preview channel is attached
+    if let Some(tx) = frame_tx {
+        let _ = tx.try_send(frame.to_owned_frame());
+    }
+}
+
 /// Spawns the dedicated background worker thread (`camcraft-vdec`) for video decoding.
 pub fn spawn_decoder_worker(
+    cmd_rx: Receiver<DecoderCommand>,
+    sink: Option<Box<dyn VirtualCameraSink>>,
+    frame_tx: Option<Sender<DecodedFrame>>,
+    enable_rgba: bool,
+    running: Arc<AtomicBool>,
+) -> std::io::Result<JoinHandle<Result<(), DecoderError>>> {
+    spawn_decoder_worker_with_recovery(cmd_rx, sink, frame_tx, enable_rgba, running, None)
+}
+
+/// Spawns the dedicated background worker thread (`camcraft-vdec`) with keyframe recovery signaling.
+pub fn spawn_decoder_worker_with_recovery(
     cmd_rx: Receiver<DecoderCommand>,
     mut sink: Option<Box<dyn VirtualCameraSink>>,
     frame_tx: Option<Sender<DecodedFrame>>,
     enable_rgba: bool,
     running: Arc<AtomicBool>,
+    keyframe_req_tx: Option<Sender<KeyframeRequestReason>>,
 ) -> std::io::Result<JoinHandle<Result<(), DecoderError>>> {
     std::thread::Builder::new()
         .name("camcraft-vdec".to_string())
         .spawn(move || {
             info!("Dedicated video decoder thread started (camcraft-vdec)");
             let mut decoder = H264Decoder::new(enable_rgba)?;
+            let mut tracker = KeyframeRecoveryTracker::default();
+            let mut last_frame_seq: Option<u64> = None;
+
+            let emit_keyframe_req = |reason: Option<KeyframeRequestReason>| {
+                if let (Some(r), Some(tx)) = (reason, keyframe_req_tx.as_ref()) {
+                    let _ = tx.try_send(r);
+                }
+            };
 
             while running.load(Ordering::Relaxed) {
                 match cmd_rx.recv() {
                     Ok(DecoderCommand::Config { pts_us, data }) => {
+                        tracker.on_config_received();
                         if let Err(e) = decoder.decode_config(pts_us, &data) {
                             warn!(error = %e, "Failed to decode VIDEO_CONFIG");
                         }
                     }
                     Ok(DecoderCommand::Frame {
+                        seq,
                         pts_us,
                         is_keyframe,
                         data,
                     }) => {
-                        if let Err(e) =
-                            decoder.decode_frame_with(pts_us, is_keyframe, &data, |frame| {
-                                // 1. Write directly from borrowed YUV420P slice without extra heap copy
-                                if let Some(ref mut vcam_sink) = sink
-                                    && let Err(e) = vcam_sink.write_frame(
-                                        frame.width,
-                                        frame.height,
-                                        frame.yuv420p,
-                                    )
-                                {
-                                    warn!(error = %e, "Failed to write frame to virtual camera sink");
-                                }
-
-                                // 2. Forward owned frame to GUI preview only when preview channel is attached
-                                if let Some(ref tx) = frame_tx {
-                                    let _ = tx.try_send(frame.to_owned_frame());
-                                }
-                            })
+                        let now = Instant::now();
+                        if !is_keyframe
+                            && let Some(prev_seq) = last_frame_seq
+                            && seq != prev_seq.saturating_add(1)
                         {
-                            warn!(error = %e, "Failed to decode VIDEO_FRAME");
+                            emit_keyframe_req(tracker.on_frame_dropped(now));
+                        }
+                        last_frame_seq = Some(seq);
+
+                        match tracker.on_before_decode(pts_us, is_keyframe, now) {
+                            PreDecodeAction::SkipUntilKeyframe { request } => {
+                                emit_keyframe_req(request);
+                                continue;
+                            }
+                            PreDecodeAction::DecodeAndRequest(reason) => {
+                                emit_keyframe_req(Some(reason));
+                            }
+                            PreDecodeAction::Decode => {}
+                        }
+
+                        let mut decoded_count = 0usize;
+                        let decode_res = decoder.decode_frame_with(pts_us, is_keyframe, &data, |frame| {
+                            decoded_count += 1;
+                            dispatch_decoded_frame(frame, &mut sink, &frame_tx);
+                        });
+
+                        match decode_res {
+                            Ok(()) => {
+                                emit_keyframe_req(tracker.on_decode_success(
+                                    pts_us,
+                                    is_keyframe,
+                                    decoded_count,
+                                    now,
+                                ));
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Failed to decode VIDEO_FRAME; resetting decoder");
+                                decoder.reset_after_error();
+                                emit_keyframe_req(tracker.on_decode_error(now));
+                            }
                         }
                     }
                     Ok(DecoderCommand::Flush) => {
                         if let Err(e) = decoder.flush_with(|frame| {
-                            if let Some(ref mut vcam_sink) = sink {
-                                let _ = vcam_sink.write_frame(
-                                    frame.width,
-                                    frame.height,
-                                    frame.yuv420p,
-                                );
-                            }
-                            if let Some(ref tx) = frame_tx {
-                                let _ = tx.try_send(frame.to_owned_frame());
-                            }
+                            dispatch_decoded_frame(frame, &mut sink, &frame_tx);
                         }) {
                             warn!(error = %e, "Failed to flush video decoder");
                         }
@@ -955,5 +1208,237 @@ mod tests {
         assert!(matches!(items[0], DecoderCommand::Frame { pts_us: 2, .. }));
         assert!(matches!(items[1], DecoderCommand::Frame { pts_us: 3, .. }));
         assert!(matches!(items[2], DecoderCommand::Config { pts_us: 4, .. }));
+    }
+
+    #[test]
+    fn keyframe_tracker_normal_stream_requests_nothing() {
+        let mut tracker = KeyframeRecoveryTracker::new(KEYFRAME_REQUEST_COOLDOWN);
+        let t0 = Instant::now();
+
+        tracker.on_config_received();
+        assert_eq!(
+            tracker.on_before_decode(0, true, t0),
+            PreDecodeAction::Decode
+        );
+        assert_eq!(tracker.on_decode_success(0, true, 1, t0), None);
+
+        for i in 1..=5 {
+            let pts = i * 16_666;
+            let now = t0 + Duration::from_millis(i * 16);
+            assert_eq!(
+                tracker.on_before_decode(pts, false, now),
+                PreDecodeAction::Decode
+            );
+            assert_eq!(tracker.on_decode_success(pts, false, 1, now), None);
+        }
+    }
+
+    #[test]
+    fn keyframe_tracker_missing_initial_idr_skips_p_frames_with_cooldown() {
+        let mut tracker = KeyframeRecoveryTracker::new(Duration::from_millis(500));
+        let t0 = Instant::now();
+
+        // P-frame before any IDR is skipped and requests MissingInitialKeyframe
+        assert_eq!(
+            tracker.on_before_decode(16_666, false, t0),
+            PreDecodeAction::SkipUntilKeyframe {
+                request: Some(KeyframeRequestReason::MissingInitialKeyframe),
+            }
+        );
+
+        // Next P-frame within 500ms cooldown is skipped without re-requesting
+        assert_eq!(
+            tracker.on_before_decode(33_333, false, t0 + Duration::from_millis(200)),
+            PreDecodeAction::SkipUntilKeyframe { request: None }
+        );
+
+        // After 500ms cooldown expires, P-frame still skipped and emits another request
+        assert_eq!(
+            tracker.on_before_decode(50_000, false, t0 + Duration::from_millis(550)),
+            PreDecodeAction::SkipUntilKeyframe {
+                request: Some(KeyframeRequestReason::MissingInitialKeyframe),
+            }
+        );
+
+        // IDR arrives and heals stream
+        let t1 = t0 + Duration::from_millis(600);
+        assert_eq!(
+            tracker.on_before_decode(66_666, true, t1),
+            PreDecodeAction::Decode
+        );
+        assert_eq!(tracker.on_decode_success(66_666, true, 1, t1), None);
+        assert_eq!(
+            tracker.on_before_decode(83_333, false, t1 + Duration::from_millis(16)),
+            PreDecodeAction::Decode
+        );
+    }
+
+    #[test]
+    fn keyframe_tracker_frame_drop_and_decode_error_skip_until_idr() {
+        let mut tracker = KeyframeRecoveryTracker::new(Duration::from_millis(500));
+        let t0 = Instant::now();
+
+        assert_eq!(
+            tracker.on_before_decode(0, true, t0),
+            PreDecodeAction::Decode
+        );
+        assert_eq!(tracker.on_decode_success(0, true, 1, t0), None);
+
+        // Frame dropped triggers immediate request and enters awaiting_keyframe
+        let t1 = t0 + Duration::from_millis(30);
+        assert_eq!(
+            tracker.on_frame_dropped(t1),
+            Some(KeyframeRequestReason::FrameDropped)
+        );
+        assert_eq!(
+            tracker.on_before_decode(33_333, false, t1 + Duration::from_millis(10)),
+            PreDecodeAction::SkipUntilKeyframe { request: None }
+        );
+
+        // IDR heals, then decode error occurs
+        let t2 = t0 + Duration::from_millis(600);
+        assert_eq!(
+            tracker.on_before_decode(50_000, true, t2),
+            PreDecodeAction::Decode
+        );
+        assert_eq!(tracker.on_decode_success(50_000, true, 1, t2), None);
+
+        let t3 = t0 + Duration::from_millis(700);
+        assert_eq!(
+            tracker.on_decode_error(t3),
+            Some(KeyframeRequestReason::DecodeError)
+        );
+        assert_eq!(
+            tracker.on_before_decode(66_666, false, t3 + Duration::from_millis(16)),
+            PreDecodeAction::SkipUntilKeyframe { request: None }
+        );
+
+        // Cooldown elapsed while still awaiting IDR -> skips & emits DecodeError
+        assert_eq!(
+            tracker.on_before_decode(83_333, false, t3 + Duration::from_millis(500)),
+            PreDecodeAction::SkipUntilKeyframe {
+                request: Some(KeyframeRequestReason::DecodeError),
+            }
+        );
+
+        // Valid IDR clears error state
+        let t4 = t3 + Duration::from_millis(550);
+        assert_eq!(
+            tracker.on_before_decode(100_000, true, t4),
+            PreDecodeAction::Decode
+        );
+        assert_eq!(tracker.on_decode_success(100_000, true, 1, t4), None);
+        assert_eq!(
+            tracker.on_before_decode(116_666, false, t4 + Duration::from_millis(16)),
+            PreDecodeAction::Decode
+        );
+    }
+
+    #[test]
+    fn keyframe_tracker_detects_pts_discontinuity_and_empty_p_frames() {
+        let mut tracker = KeyframeRecoveryTracker::new(Duration::from_millis(500));
+        let t0 = Instant::now();
+
+        assert_eq!(
+            tracker.on_before_decode(100_000, true, t0),
+            PreDecodeAction::Decode
+        );
+        assert_eq!(tracker.on_decode_success(100_000, true, 1, t0), None);
+
+        // Forward gap > MAX_INTER_FRAME_GAP_US (500_000 us) on P-frame
+        let t1 = t0 + Duration::from_millis(600);
+        assert_eq!(
+            tracker.on_before_decode(700_000, false, t1),
+            PreDecodeAction::DecodeAndRequest(KeyframeRequestReason::PtsDiscontinuity)
+        );
+        assert_eq!(tracker.on_decode_success(700_000, false, 1, t1), None);
+
+        // Backward jump on P-frame after cooldown
+        let t2 = t1 + Duration::from_millis(600);
+        assert_eq!(
+            tracker.on_before_decode(650_000, false, t2),
+            PreDecodeAction::DecodeAndRequest(KeyframeRequestReason::PtsDiscontinuity)
+        );
+        assert_eq!(tracker.on_decode_success(650_000, false, 1, t2), None);
+
+        // Consecutive empty P-frames (>= MAX_EMPTY_P_FRAMES = 3)
+        let t3 = t2 + Duration::from_millis(600);
+        for offset in 0..(MAX_EMPTY_P_FRAMES - 1) {
+            let pts = 666_666 + u64::from(offset) * 16_666;
+            let now = t3 + Duration::from_millis(u64::from(offset) * 16);
+            assert_eq!(
+                tracker.on_before_decode(pts, false, now),
+                PreDecodeAction::Decode
+            );
+            assert_eq!(tracker.on_decode_success(pts, false, 0, now), None);
+        }
+        let trigger_now = t3 + Duration::from_millis(60);
+        assert_eq!(
+            tracker.on_before_decode(720_000, false, trigger_now),
+            PreDecodeAction::Decode
+        );
+        assert_eq!(
+            tracker.on_decode_success(720_000, false, 0, trigger_now),
+            Some(KeyframeRequestReason::ConsecutiveEmptyPFrames)
+        );
+    }
+
+    #[test]
+    fn decoder_worker_recovers_from_corrupted_h264_on_valid_config_and_idr() {
+        let (sender, rx) = DecoderSender::new_bounded();
+        let (frame_tx, frame_rx) = crossbeam_channel::bounded::<DecodedFrame>(4);
+        let (kf_tx, kf_rx) = crossbeam_channel::bounded::<KeyframeRequestReason>(8);
+        let running = Arc::new(AtomicBool::new(true));
+
+        let handle = spawn_decoder_worker_with_recovery(
+            rx,
+            None,
+            Some(frame_tx),
+            true,
+            running.clone(),
+            Some(kf_tx),
+        )
+        .expect("spawn decoder worker");
+
+        // 1. Send corrupted keyframe bytes -> must emit DecodeError request
+        let corrupt = Bytes::from_static(&[0x00, 0x00, 0x01, 0x65, 0xFF, 0xFF, 0xAA, 0x55, 0x00]);
+        assert!(sender.push_frame(1_000, true, corrupt).unwrap());
+
+        let req = kf_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("expected DecodeError keyframe request");
+        assert_eq!(req, KeyframeRequestReason::DecodeError);
+
+        // 2. Subsequent P-frame while awaiting recovery should be skipped without producing output
+        assert!(
+            sender
+                .push_frame(
+                    17_666,
+                    false,
+                    Bytes::from_static(&[0x00, 0x00, 0x01, 0x41, 0x01])
+                )
+                .unwrap()
+        );
+        assert!(frame_rx.try_recv().is_err());
+
+        // 3. Valid SPS/PPS + IDR frame heals decoding cleanly
+        sender
+            .push_config(33_000, Bytes::from_static(SPS_PPS_64X64))
+            .unwrap();
+        assert!(
+            sender
+                .push_frame(33_333, true, Bytes::from_static(IDR_64X64_RED))
+                .unwrap()
+        );
+
+        let healed = frame_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("decoder should heal and output 64x64 frame");
+        assert_eq!(healed.width, 64);
+        assert_eq!(healed.height, 64);
+
+        sender.stop();
+        running.store(false, Ordering::Relaxed);
+        assert!(handle.join().expect("worker join").is_ok());
     }
 }

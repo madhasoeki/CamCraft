@@ -37,6 +37,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        CamCraftStreamService.refreshLocalIp(this)
 
         if (intent?.getBooleanExtra("autostart", false) == true) {
             startServerWithPermissionCheck()
@@ -65,6 +66,11 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        CamCraftStreamService.refreshLocalIp(this)
     }
 
     override fun onNewIntent(intent: Intent) {

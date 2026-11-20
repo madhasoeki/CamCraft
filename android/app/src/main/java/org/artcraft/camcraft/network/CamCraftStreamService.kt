@@ -22,14 +22,17 @@ import java.io.OutputStream
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.getAndUpdate
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -63,13 +66,20 @@ enum class StreamConnectionStatus {
 data class StreamServiceState(
     val status: StreamConnectionStatus = StreamConnectionStatus.STOPPED,
     val clientAddress: String? = null,
+    val localIpAddress: String? = null,
+    val listenPort: Int = CcftProtocolConstants.DEFAULT_PORT,
+    val mdnsServiceName: String? = null,
+    val mdnsRegistered: Boolean = false,
     val cameras: List<CameraInfo> = emptyList(),
     val activeState: ActiveCameraState = defaultActiveCameraState(),
     val framesSent: Long = 0,
     val currentFps: Float = 0f,
     val bitrateKbps: Int = 12_000,
     val errorMessage: String? = null,
-)
+) {
+    val wifiEndpoint: String?
+        get() = formatWifiEndpoint(localIpAddress, listenPort)
+}
 
 /**
  * Default initial camera configuration matching `docs/PROTOCOL.md` §5.1.
@@ -106,7 +116,14 @@ class CamCraftStreamService : Service() {
     private var serverSocket: ServerSocket? = null
     private var serverJob: Job? = null
 
+    @Volatile
+    private var activeClientSocket: Socket? = null
+    private val isStopping = AtomicBoolean(false)
+    private val lifecycleLock = Any()
+
     private var cameraStreamManager: CameraStreamManager? = null
+    private var mdnsAdvertiser: MdnsAdvertiser? = null
+    private var wifiNetworkMonitor: WifiNetworkMonitor? = null
 
     @Volatile
     private var activeClientOutputStream: OutputStream? = null
@@ -125,6 +142,35 @@ class CamCraftStreamService : Service() {
         super.onCreate()
         createNotificationChannel()
         startInForeground()
+
+        val initialIp = LocalIpResolver.resolveLocalIpv4Address(this)
+        _serviceState.update { it.copy(localIpAddress = initialIp) }
+
+        mdnsAdvertiser = MdnsAdvertiser(this) { registered, serviceName ->
+            _serviceState.update {
+                it.copy(
+                    mdnsRegistered = registered,
+                    mdnsServiceName = serviceName,
+                )
+            }
+        }
+
+        wifiNetworkMonitor = WifiNetworkMonitor(this) { updatedIp ->
+            val previousState = _serviceState.getAndUpdate { it.copy(localIpAddress = updatedIp) }
+            val currentState = _serviceState.value
+            if (currentState.status == StreamConnectionStatus.LISTENING &&
+                updatedIp != previousState.localIpAddress
+            ) {
+                if (!updatedIp.isNullOrBlank()) {
+                    mdnsAdvertiser?.register(
+                        deviceName = resolveDeviceName(),
+                        port = currentState.listenPort,
+                        localIpAddress = updatedIp,
+                    )
+                }
+                updateNotification(buildListeningNotificationText(updatedIp, currentState.listenPort))
+            }
+        }
 
         try {
             val cameras = CameraEnumerator.enumerateCameras(this)
@@ -163,13 +209,22 @@ class CamCraftStreamService : Service() {
         super.onDestroy()
         Log.i(TAG, "Destroying CamCraft service")
         stopServer()
+        mdnsAdvertiser?.unregister()
+        mdnsAdvertiser = null
+        wifiNetworkMonitor?.stop()
+        wifiNetworkMonitor = null
         cameraStreamManager?.release()
         cameraStreamManager = null
         if (activeInstance == this) {
             activeInstance = null
         }
         serviceScope.cancel()
-        _serviceState.value = StreamServiceState(status = StreamConnectionStatus.STOPPED)
+        val preservedIp = LocalIpResolver.resolveLocalIpv4Address(this)
+            ?: _serviceState.value.localIpAddress
+        _serviceState.value = StreamServiceState(
+            status = StreamConnectionStatus.STOPPED,
+            localIpAddress = preservedIp,
+        )
     }
 
     private fun startInForeground() {
@@ -188,6 +243,7 @@ class CamCraftStreamService : Service() {
 
     private fun startServer() {
         if (serverJob?.isActive == true) return
+        isStopping.set(false)
 
         serverJob = serviceScope.launch {
             try {
@@ -197,15 +253,23 @@ class CamCraftStreamService : Service() {
                 }
                 serverSocket = socket
 
+                val currentIp = LocalIpResolver.resolveLocalIpv4Address(this@CamCraftStreamService)
                 _serviceState.update {
                     it.copy(
                         status = StreamConnectionStatus.LISTENING,
                         clientAddress = null,
+                        localIpAddress = currentIp,
+                        listenPort = port,
                         errorMessage = null,
                     )
                 }
-                updateNotification("Port $port • Waiting for PC connection...")
-                Log.i(TAG, "CamCraft TCP Server listening on port $port")
+                mdnsAdvertiser?.register(
+                    deviceName = resolveDeviceName(),
+                    port = port,
+                    localIpAddress = currentIp,
+                )
+                updateNotification(buildListeningNotificationText(currentIp, port))
+                Log.i(TAG, "CamCraft TCP Server listening on port $port (Wi-Fi IP: $currentIp)")
 
                 while (isActive && !socket.isClosed) {
                     try {
@@ -219,7 +283,12 @@ class CamCraftStreamService : Service() {
                     }
                 }
             } catch (e: Exception) {
+                if (isStopping.get()) {
+                    Log.i(TAG, "Server stopped")
+                    return@launch
+                }
                 Log.e(TAG, "Fatal server socket exception", e)
+                mdnsAdvertiser?.unregister()
                 _serviceState.update {
                     it.copy(
                         status = StreamConnectionStatus.ERROR,
@@ -259,6 +328,7 @@ class CamCraftStreamService : Service() {
 
     private fun onFrameSent(packetType: PacketType) {
         if (packetType != PacketType.VIDEO_FRAME) return
+        if (isStopping.get() || activeClientOutputStream == null) return
         totalFramesSent++
         windowFrames++
 
@@ -278,10 +348,23 @@ class CamCraftStreamService : Service() {
     }
 
     private suspend fun handleClientConnection(clientSocket: Socket) {
+        activeClientSocket = clientSocket
+        if (isStopping.get()) {
+            try {
+                clientSocket.close()
+            } catch (_: IOException) {}
+            if (activeClientSocket === clientSocket) {
+                activeClientSocket = null
+            }
+            return
+        }
+
         val clientIp = clientSocket.inetAddress?.hostAddress ?: "unknown"
         Log.i(TAG, "PC Client connected from $clientIp")
 
         clientSocket.tcpNoDelay = true
+        clientSocket.keepAlive = true
+        clientSocket.soTimeout = CLIENT_READ_TIMEOUT_MS
 
         _serviceState.update {
             it.copy(
@@ -343,6 +426,9 @@ class CamCraftStreamService : Service() {
         } finally {
             cameraStreamManager?.stopStream()
             activeClientOutputStream = null
+            if (activeClientSocket === clientSocket) {
+                activeClientSocket = null
+            }
 
             try {
                 inputStream?.close()
@@ -350,15 +436,33 @@ class CamCraftStreamService : Service() {
                 clientSocket.close()
             } catch (ignored: IOException) {}
 
-            Log.i(TAG, "Client disconnected, reverting to LISTENING state")
-            _serviceState.update {
-                it.copy(
-                    status = StreamConnectionStatus.LISTENING,
-                    clientAddress = null,
-                    currentFps = 0f,
-                )
+            val isActiveCoroutine = currentCoroutineContext().isActive
+            val revertedToListening = synchronized(lifecycleLock) {
+                val canRevertToListening = !isStopping.get() &&
+                    isActiveCoroutine &&
+                    serverSocket?.isClosed == false
+                if (canRevertToListening) {
+                    val refreshedIp = LocalIpResolver.resolveLocalIpv4Address(this)
+                    val listenPort = _serviceState.value.listenPort
+                    _serviceState.update {
+                        it.copy(
+                            status = StreamConnectionStatus.LISTENING,
+                            clientAddress = null,
+                            localIpAddress = refreshedIp,
+                            currentFps = 0f,
+                        )
+                    }
+                    updateNotification(buildListeningNotificationText(refreshedIp, listenPort))
+                    true
+                } else {
+                    false
+                }
             }
-            updateNotification("Port ${CcftProtocolConstants.DEFAULT_PORT} • Waiting for PC...")
+            if (revertedToListening) {
+                Log.i(TAG, "Client disconnected, reverting to LISTENING state")
+            } else {
+                Log.i(TAG, "Client disconnected during server stop; skipping LISTENING revert")
+            }
         }
     }
 
@@ -454,6 +558,20 @@ class CamCraftStreamService : Service() {
                     )
                 }
                 is ControlCmd.RequestKeyframe -> {
+                    cameraStreamManager?.cachedConfig?.let { spsPps ->
+                        synchronized(outputLock) {
+                            CcftPacket.writePacket(
+                                output = output,
+                                type = PacketType.VIDEO_CONFIG,
+                                flags = CcftFlags.NONE,
+                                ptsUs = System.nanoTime() / 1_000L,
+                                payload = spsPps,
+                                offset = 0,
+                                length = spsPps.size,
+                                flush = true,
+                            )
+                        }
+                    }
                     cameraStreamManager?.requestKeyFrame()
                     current
                 }
@@ -551,12 +669,28 @@ class CamCraftStreamService : Service() {
     }
 
     private fun stopServer() {
-        try {
-            serverSocket?.close()
-        } catch (ignored: IOException) {}
-        serverJob?.cancel()
-        serverJob = null
+        synchronized(lifecycleLock) {
+            isStopping.set(true)
+            mdnsAdvertiser?.unregister()
+            try {
+                activeClientSocket?.close()
+            } catch (ignored: IOException) {}
+            activeClientSocket = null
+            try {
+                serverSocket?.close()
+            } catch (ignored: IOException) {}
+            serverSocket = null
+            serverJob?.cancel()
+            serverJob = null
+        }
     }
+
+    private fun buildListeningNotificationText(ip: String?, port: Int): String =
+        if (!ip.isNullOrBlank()) {
+            "Wi-Fi $ip:$port • Waiting for PC..."
+        } else {
+            "Port $port • Waiting for PC..."
+        }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -598,6 +732,7 @@ class CamCraftStreamService : Service() {
         const val TAG = "CamCraftStreamService"
         const val CHANNEL_ID = "camcraft_stream_channel"
         const val NOTIFICATION_ID = 9876
+        private const val CLIENT_READ_TIMEOUT_MS = 10_000
 
         const val ACTION_START = "org.artcraft.camcraft.action.START"
         const val ACTION_STOP = "org.artcraft.camcraft.action.STOP"
@@ -608,6 +743,35 @@ class CamCraftStreamService : Service() {
 
         private val _serviceState = MutableStateFlow(StreamServiceState())
         val serviceState: StateFlow<StreamServiceState> = _serviceState.asStateFlow()
+
+        /**
+         * Resolves the current local Wi-Fi/LAN IPv4 address and updates [serviceState]
+         * so the UI displays the device endpoint before the server starts.
+         */
+        fun refreshLocalIp(context: Context) {
+            val resolvedIp = LocalIpResolver.resolveLocalIpv4Address(context)
+            _serviceState.update { state ->
+                if (state.localIpAddress == resolvedIp) {
+                    state
+                } else {
+                    state.copy(localIpAddress = resolvedIp)
+                }
+            }
+        }
+
+        /**
+         * Resolves a human-readable device model string for CCFT handshake and mDNS advertisement.
+         */
+        fun resolveDeviceName(): String {
+            val manufacturer = Build.MANUFACTURER?.replaceFirstChar { it.uppercase() } ?: "Android"
+            val model = Build.MODEL ?: "CamCraft Device"
+            val deviceName = if (model.startsWith(manufacturer, ignoreCase = true)) {
+                model
+            } else {
+                "$manufacturer $model".trim()
+            }
+            return deviceName.ifBlank { "Android CamCraft Device" }
+        }
 
         fun attachPreviewView(previewView: PreviewView) {
             pendingPreviewView = previewView
@@ -653,18 +817,10 @@ class CamCraftStreamService : Service() {
          * Builds device metadata matching `docs/PROTOCOL.md` §5.1.
          */
         fun createDeviceHello(activeState: ActiveCameraState, context: Context? = null): ControlHello {
-            val manufacturer = Build.MANUFACTURER?.replaceFirstChar { it.uppercase() } ?: "Android"
-            val model = Build.MODEL ?: "CamCraft Device"
-            val deviceName = if (model.startsWith(manufacturer, ignoreCase = true)) {
-                model
-            } else {
-                "$manufacturer $model".trim()
-            }
-
             val cameras = CameraEnumerator.enumerateCameras(context)
 
             return ControlHello(
-                deviceName = deviceName.ifBlank { "Android CamCraft Device" },
+                deviceName = resolveDeviceName(),
                 protocolVersion = CcftProtocolConstants.VERSION.toInt(),
                 cameras = cameras,
                 activeState = activeState,

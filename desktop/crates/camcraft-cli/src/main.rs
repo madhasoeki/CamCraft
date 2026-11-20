@@ -3,9 +3,11 @@
 //! Provides the `connect` sub-command for USB ADB and TCP Wi-Fi connections,
 //! displaying discovered device cameras, real-time FPS, bitrate, and RTT latency.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -14,10 +16,14 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use camcraft_core::adb;
-use camcraft_core::client::{self, ClientConfig, ClientEvent, StreamStats};
-use camcraft_core::decoder::{DecoderSender, spawn_decoder_worker};
+use camcraft_core::client::{self, ClientConfig, ClientEvent, ClientSender, StreamStats};
+use camcraft_core::decoder::{
+    DecoderSender, KEYFRAME_REQUEST_COOLDOWN, KeyframeRequestReason,
+    spawn_decoder_worker_with_recovery,
+};
+use camcraft_core::discovery::{DiscoveredDevice, DiscoveryEvent, MdnsScanner};
 use camcraft_core::vcam::{V4l2LoopbackSink, VirtualCameraSink, find_camcraft_v4l2_device};
-use camcraft_protocol::ControlHello;
+use camcraft_protocol::{ControlCmd, ControlHello};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -34,6 +40,13 @@ struct Cli {
 enum Command {
     /// Connect to an Android CamCraft sender over USB ADB tunnel or TCP network.
     Connect(ConnectArgs),
+
+    /// Discover CamCraft Android senders advertised on the local network via mDNS.
+    Discover {
+        /// How many seconds to scan for mDNS advertisements.
+        #[arg(long, default_value_t = 5)]
+        timeout: u64,
+    },
 
     /// Print compiled CamCraft protocol and core configuration.
     Status,
@@ -90,11 +103,14 @@ async fn main() -> Result<()> {
         Command::Connect(args) => {
             run_connect(args).await?;
         }
+        Command::Discover { timeout } => {
+            run_discover(timeout).await?;
+        }
         Command::Status => {
             info!(
                 protocol_version = camcraft_protocol::PROTOCOL_VERSION,
                 default_port = camcraft_protocol::DEFAULT_PORT,
-                "CamCraft CLI receiver ready (Stage 4: H.264 Decode & Virtual Camera)"
+                "CamCraft CLI receiver ready (Stage 6: Wi-Fi mDNS Discovery & Resilience)"
             );
         }
     }
@@ -173,12 +189,28 @@ async fn run_connect(args: ConnectArgs) -> Result<()> {
         }
     };
 
-    // Initialize H.264 decoder worker with bounded channel for smart frame dropping
+    // Initialize H.264 decoder worker with bounded channel & keyframe recovery
     let (decoder_sender, decoder_rx) = DecoderSender::new_bounded();
     let decoder_running = Arc::new(AtomicBool::new(true));
-    let decoder_handle =
-        spawn_decoder_worker(decoder_rx, sink, None, false, decoder_running.clone())
-            .context("Failed to spawn video decoder worker thread")?;
+    let (kf_tx, kf_rx) = crossbeam_channel::bounded::<KeyframeRequestReason>(4);
+    let (kf_async_tx, mut kf_async_rx) = mpsc::channel::<KeyframeRequestReason>(8);
+    let kf_bridge = std::thread::Builder::new()
+        .name("camcraft-cli-kf".to_owned())
+        .spawn(move || {
+            while let Ok(reason) = kf_rx.recv() {
+                let _ = kf_async_tx.try_send(reason);
+            }
+        })
+        .ok();
+    let decoder_handle = spawn_decoder_worker_with_recovery(
+        decoder_rx,
+        sink,
+        None,
+        false,
+        decoder_running.clone(),
+        Some(kf_tx),
+    )
+    .context("Failed to spawn video decoder worker thread")?;
 
     let config = ClientConfig::new(&endpoint);
     let (event_tx, mut event_rx) = mpsc::channel::<ClientEvent>(64);
@@ -212,56 +244,85 @@ async fn run_connect(args: ConnectArgs) -> Result<()> {
     });
 
     // Event consumption loop
-    while let Some(event) = event_rx.recv().await {
-        match event {
-            ClientEvent::Connected(_) => {}
-            ClientEvent::Hello(hello) => {
-                print_device_banner(&hello);
-            }
-            ClientEvent::Stats(stats) => {
-                print_stats(&stats);
-            }
-            ClientEvent::VideoConfig {
-                payload_len,
-                payload,
-                header,
-            } => {
-                info!(payload_len, "Received VIDEO_CONFIG SPS/PPS parameters");
-                if let Some(ref mut file) = dump_file {
-                    file.write_all(&payload)
-                        .await
-                        .context("Failed to write VIDEO_CONFIG to dump file")?;
-                    dumped_bytes += payload.len() as u64;
+    let mut active_sender: Option<ClientSender> = None;
+    let mut last_keyframe_req: Option<Instant> = None;
+
+    loop {
+        tokio::select! {
+            maybe_event = event_rx.recv() => {
+                let Some(event) = maybe_event else {
+                    break;
+                };
+                match event {
+                    ClientEvent::Connected(sender) => {
+                        active_sender = Some(sender);
+                    }
+                    ClientEvent::Hello(hello) => {
+                        print_device_banner(&hello);
+                    }
+                    ClientEvent::Stats(stats) => {
+                        print_stats(&stats);
+                    }
+                    ClientEvent::VideoConfig {
+                        payload_len,
+                        payload,
+                        header,
+                    } => {
+                        info!(payload_len, "Received VIDEO_CONFIG SPS/PPS parameters");
+                        if let Some(ref mut file) = dump_file {
+                            file.write_all(&payload)
+                                .await
+                                .context("Failed to write VIDEO_CONFIG to dump file")?;
+                            dumped_bytes += payload.len() as u64;
+                        }
+                        if let Err(e) = decoder_sender.push_config(header.pts_us, payload) {
+                            warn!(error = %e, "Failed to push VIDEO_CONFIG to decoder worker");
+                        }
+                    }
+                    ClientEvent::VideoFrame {
+                        header, payload, ..
+                    } => {
+                        if let Some(ref mut file) = dump_file {
+                            file.write_all(&payload)
+                                .await
+                                .context("Failed to write VIDEO_FRAME to dump file")?;
+                            dumped_bytes += payload.len() as u64;
+                        }
+                        let is_keyframe = header.flags.is_keyframe();
+                        match decoder_sender.push_frame(header.pts_us, is_keyframe, payload) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                maybe_request_keyframe(
+                                    active_sender.as_ref(),
+                                    &mut last_keyframe_req,
+                                    KeyframeRequestReason::FrameDropped,
+                                );
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Failed to push VIDEO_FRAME to decoder worker");
+                            }
+                        }
+                    }
+                    ClientEvent::AudioConfig { .. } | ClientEvent::AudioFrame { .. } => {}
+                    ClientEvent::ControlAck(ack) => {
+                        if ack.ok {
+                            info!("Camera control acknowledged by device");
+                        } else {
+                            warn!(error = ?ack.error, "Camera control rejected by device");
+                        }
+                    }
+                    ClientEvent::Disconnected(reason) => {
+                        warn!(reason = %reason, "Disconnected from CamCraft sender");
+                        break;
+                    }
                 }
-                if let Err(e) = decoder_sender.push_config(header.pts_us, payload) {
-                    warn!(error = %e, "Failed to push VIDEO_CONFIG to decoder worker");
-                }
             }
-            ClientEvent::VideoFrame {
-                header, payload, ..
-            } => {
-                if let Some(ref mut file) = dump_file {
-                    file.write_all(&payload)
-                        .await
-                        .context("Failed to write VIDEO_FRAME to dump file")?;
-                    dumped_bytes += payload.len() as u64;
-                }
-                let is_keyframe = header.flags.is_keyframe();
-                if let Err(e) = decoder_sender.push_frame(header.pts_us, is_keyframe, payload) {
-                    warn!(error = %e, "Failed to push VIDEO_FRAME to decoder worker");
-                }
-            }
-            ClientEvent::AudioConfig { .. } | ClientEvent::AudioFrame { .. } => {}
-            ClientEvent::ControlAck(ack) => {
-                if ack.ok {
-                    info!("Camera control acknowledged by device");
-                } else {
-                    warn!(error = ?ack.error, "Camera control rejected by device");
-                }
-            }
-            ClientEvent::Disconnected(reason) => {
-                warn!(reason = %reason, "Disconnected from CamCraft sender");
-                break;
+            Some(reason) = kf_async_rx.recv() => {
+                maybe_request_keyframe(
+                    active_sender.as_ref(),
+                    &mut last_keyframe_req,
+                    reason,
+                );
             }
         }
     }
@@ -274,6 +335,9 @@ async fn run_connect(args: ConnectArgs) -> Result<()> {
     decoder_running.store(false, Ordering::Relaxed);
     if let Err(e) = decoder_handle.join() {
         warn!("Decoder worker thread join error: {:?}", e);
+    }
+    if let Some(handle) = kf_bridge {
+        let _ = handle.join();
     }
 
     if let (Some(mut file), Some(path)) = (dump_file, args.dump_h264.as_ref()) {
@@ -292,6 +356,108 @@ async fn run_connect(args: ConnectArgs) -> Result<()> {
     }
 
     info!("CamCraft CLI connection session ended");
+    Ok(())
+}
+
+fn maybe_request_keyframe(
+    sender: Option<&ClientSender>,
+    last_req: &mut Option<Instant>,
+    reason: KeyframeRequestReason,
+) {
+    let Some(sender) = sender else {
+        return;
+    };
+    let now = Instant::now();
+    if last_req.is_some_and(|prev| now.saturating_duration_since(prev) < KEYFRAME_REQUEST_COOLDOWN)
+    {
+        return;
+    }
+    *last_req = Some(now);
+    let sender = sender.clone();
+    info!(?reason, "Requesting IDR keyframe from Android sender");
+    tokio::spawn(async move {
+        if let Err(e) = sender.send_cmd(ControlCmd::RequestKeyframe).await {
+            warn!(error = %e, "Failed to send RequestKeyframe command");
+        }
+    });
+}
+
+async fn run_discover(timeout_secs: u64) -> Result<()> {
+    println!(
+        "Scanning local network for CamCraft devices (_camcraft._tcp.local.) for {timeout_secs}s..."
+    );
+    let (ev_tx, ev_rx) = crossbeam_channel::unbounded::<DiscoveryEvent>();
+    let mut scanner = MdnsScanner::start(ev_tx).context("Failed to start mDNS scanner")?;
+
+    let (async_tx, mut async_rx) = mpsc::unbounded_channel::<DiscoveryEvent>();
+    let bridge = std::thread::Builder::new()
+        .name("camcraft-cli-mdns".to_owned())
+        .spawn(move || {
+            while let Ok(ev) = ev_rx.recv() {
+                if async_tx.send(ev).is_err() {
+                    break;
+                }
+            }
+        })
+        .ok();
+
+    let mut known: BTreeMap<String, DiscoveredDevice> = BTreeMap::new();
+    let deadline = tokio::time::sleep(Duration::from_secs(timeout_secs));
+    tokio::pin!(deadline);
+
+    loop {
+        tokio::select! {
+            _ = &mut deadline => break,
+            _ = tokio::signal::ctrl_c() => {
+                info!("mDNS discovery interrupted via Ctrl+C");
+                break;
+            }
+            maybe_ev = async_rx.recv() => {
+                let Some(ev) = maybe_ev else {
+                    break;
+                };
+                match ev {
+                    DiscoveryEvent::Found(dev) => {
+                        let ver = dev
+                            .protocol_version
+                            .map_or_else(|| "?".to_owned(), |v| format!("v{v}"));
+                        println!(
+                            "  [+] {} -> {} (host: {}, protocol: {})",
+                            dev.device_name,
+                            dev.endpoint(),
+                            dev.hostname,
+                            ver
+                        );
+                        known.insert(dev.service_fullname.clone(), dev);
+                    }
+                    DiscoveryEvent::Removed { service_fullname } => {
+                        println!("  [-] Removed: {service_fullname}");
+                        known.remove(&service_fullname);
+                    }
+                }
+            }
+        }
+    }
+
+    scanner.stop();
+    if let Some(handle) = bridge {
+        let _ = handle.join();
+    }
+
+    if known.is_empty() {
+        println!("No CamCraft devices discovered on the local network.");
+    } else {
+        println!("\nDiscovered {} CamCraft device(s):", known.len());
+        for dev in known.values() {
+            println!(
+                "  • {} — {} (connect via: camcraft-cli connect --wifi {})",
+                dev.device_name,
+                dev.endpoint(),
+                dev.endpoint()
+            );
+        }
+    }
+
     Ok(())
 }
 

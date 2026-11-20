@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use camcraft_core::client::StreamStats;
+use camcraft_core::discovery::{DiscoveredDevice, DiscoveryEvent};
 use camcraft_protocol::{ActiveCameraState, CameraInfo, ControlCmd, ControlHello, DEFAULT_PORT};
 use eframe::egui;
 use session::{ConnectionMode, GuiCommand, GuiSession, GuiUpdate};
@@ -76,6 +77,7 @@ struct CamCraftApp {
     vcam_device: String,
     vcam_active: bool,
     wifi_endpoint: String,
+    discovered_devices: Vec<DiscoveredDevice>,
 
     // Stream & camera controls (synchronized with ActiveCameraState)
     selected_camera_id: String,
@@ -116,7 +118,8 @@ impl CamCraftApp {
             cameras: Vec::new(),
             vcam_device: "/dev/video10".to_owned(),
             vcam_active: false,
-            wifi_endpoint: format!("192.168.1.100:{DEFAULT_PORT}"),
+            wifi_endpoint: String::new(),
+            discovered_devices: Vec::new(),
             selected_camera_id: "0".to_owned(),
             selected_width: 1920,
             selected_height: 1080,
@@ -166,6 +169,13 @@ impl CamCraftApp {
                 }
                 GuiUpdate::Stats(stats) => {
                     self.stats = stats;
+                }
+                GuiUpdate::Discovery(DiscoveryEvent::Found(device)) => {
+                    upsert_discovered_device(&mut self.discovered_devices, device);
+                }
+                GuiUpdate::Discovery(DiscoveryEvent::Removed { service_fullname }) => {
+                    self.discovered_devices
+                        .retain(|d| d.service_fullname != service_fullname);
                 }
                 GuiUpdate::VcamStatus {
                     path,
@@ -455,62 +465,178 @@ impl CamCraftApp {
                     .color(COLOR_TEXT_MUTED)
                     .small(),
             );
-            ui.add_enabled(
-                !self.is_busy(),
-                egui::TextEdit::singleline(&mut self.vcam_device),
-            );
-            ui.add_space(8.0);
-
-            let usb_btn = egui::Button::new(
-                egui::RichText::new("Connect via USB (ADB)").color(COLOR_TEXT_PRIMARY),
-            )
-            .fill(COLOR_ACCENT_BLUE);
-            if ui
-                .add_enabled(!self.is_busy(), usb_btn)
-                .on_hover_text("Runs adb forward tcp:9876 tcp:9876 and connects")
-                .clicked()
-            {
-                self.session.send(GuiCommand::ConnectUsb {
-                    port: DEFAULT_PORT,
-                    vcam_device: self.vcam_device.clone(),
-                });
-            }
-
-            ui.add_space(10.0);
-            ui.label(
-                egui::RichText::new("Wi-Fi IP:Port")
-                    .color(COLOR_TEXT_MUTED)
-                    .small(),
-            );
-            ui.horizontal(|ui| {
-                ui.add_enabled(
-                    !self.is_busy(),
-                    egui::TextEdit::singleline(&mut self.wifi_endpoint)
-                        .desired_width((ui.available_width() - 115.0).max(100.0)),
+            ui.add_enabled_ui(!self.is_busy(), |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.vcam_device).desired_width(f32::INFINITY),
                 );
-                let wifi_btn = egui::Button::new(
-                    egui::RichText::new("Connect Wi-Fi").color(COLOR_TEXT_PRIMARY),
+                ui.add_space(8.0);
+
+                let usb_btn = egui::Button::new(
+                    egui::RichText::new("Connect via USB (ADB)").color(COLOR_TEXT_PRIMARY),
                 )
-                .fill(COLOR_SURFACE_ELEVATED);
-                if ui.add_enabled(!self.is_busy(), wifi_btn).clicked() {
-                    self.session.send(GuiCommand::ConnectWifi {
-                        endpoint: self.wifi_endpoint.clone(),
+                .fill(COLOR_ACCENT_BLUE);
+                if ui
+                    .add_sized([ui.available_width(), 30.0], usb_btn)
+                    .on_hover_text("Runs adb forward tcp:9876 tcp:9876 and connects")
+                    .clicked()
+                {
+                    self.session.send(GuiCommand::ConnectUsb {
+                        port: DEFAULT_PORT,
                         vcam_device: self.vcam_device.clone(),
                     });
                 }
             });
 
             ui.add_space(10.0);
-            let disconnect_btn =
-                egui::Button::new(egui::RichText::new("Disconnect").color(COLOR_TEXT_PRIMARY))
-                    .fill(if self.is_busy() {
-                        COLOR_STATUS_ROSE
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Wi-Fi Devices")
+                        .color(COLOR_TEXT_MUTED)
+                        .small(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let refresh_btn = egui::Button::new(
+                        egui::RichText::new("Refresh")
+                            .color(COLOR_TEXT_PRIMARY)
+                            .small(),
+                    )
+                    .fill(COLOR_SURFACE_ELEVATED);
+                    if ui
+                        .add(refresh_btn)
+                        .on_hover_text("Send mDNS _camcraft._tcp scan query")
+                        .clicked()
+                    {
+                        self.session.send(GuiCommand::RefreshWifiDiscovery);
+                    }
+                });
+            });
+
+            let mut connect_discovered_endpoint: Option<String> = None;
+            egui::Frame::new()
+                .fill(COLOR_BG_CARBON)
+                .corner_radius(6.0)
+                .inner_margin(8.0)
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    if self.discovered_devices.is_empty() {
+                        ui.label(
+                            egui::RichText::new(
+                                "No phone detected yet.\nTap 'Start Server' on CamCraft Android (same Wi-Fi).",
+                            )
+                            .color(COLOR_TEXT_MUTED)
+                            .small(),
+                        );
                     } else {
-                        COLOR_SURFACE_ELEVATED
-                    });
-            if ui.add_enabled(self.is_busy(), disconnect_btn).clicked() {
-                self.session.send(GuiCommand::Disconnect);
+                        for (idx, device) in self.discovered_devices.iter().enumerate() {
+                            let endpoint = device.endpoint();
+                            egui::Frame::new()
+                                .fill(COLOR_SURFACE_ELEVATED)
+                                .corner_radius(6.0)
+                                .inner_margin(8.0)
+                                .show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(8.0, 8.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        ui.painter().circle_filled(
+                                            rect.center(),
+                                            3.5,
+                                            COLOR_STATUS_EMERALD,
+                                        );
+
+                                        ui.vertical(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(&device.device_name)
+                                                    .color(COLOR_TEXT_PRIMARY)
+                                                    .strong(),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(&endpoint)
+                                                    .color(COLOR_TEXT_MUTED)
+                                                    .monospace()
+                                                    .small(),
+                                            );
+                                        });
+
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                let connect_btn = egui::Button::new(
+                                                    egui::RichText::new("Connect")
+                                                        .color(COLOR_TEXT_PRIMARY),
+                                                )
+                                                .fill(COLOR_ACCENT_BLUE);
+                                                if ui
+                                                    .add_enabled(!self.is_busy(), connect_btn)
+                                                    .clicked()
+                                                {
+                                                    connect_discovered_endpoint =
+                                                        Some(endpoint.clone());
+                                                }
+                                            },
+                                        );
+                                    });
+                                });
+                            if idx + 1 < self.discovered_devices.len() {
+                                ui.add_space(4.0);
+                            }
+                        }
+                    }
+                });
+
+            if let Some(endpoint) = connect_discovered_endpoint {
+                self.wifi_endpoint = endpoint.clone();
+                self.session.send(GuiCommand::ConnectWifi {
+                    endpoint,
+                    vcam_device: self.vcam_device.clone(),
+                });
             }
+
+            ui.add_space(10.0);
+            ui.label(
+                egui::RichText::new("Manual Phone IP:Port")
+                    .color(COLOR_TEXT_MUTED)
+                    .small(),
+            );
+            let can_connect_wifi = !self.is_busy() && !self.wifi_endpoint.trim().is_empty();
+            ui.add_enabled_ui(!self.is_busy(), |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let wifi_btn = egui::Button::new(
+                        egui::RichText::new("Connect Wi-Fi").color(COLOR_TEXT_PRIMARY),
+                    )
+                    .fill(COLOR_SURFACE_ELEVATED);
+                    if ui.add_enabled(can_connect_wifi, wifi_btn).clicked() {
+                        self.session.send(GuiCommand::ConnectWifi {
+                            endpoint: self.wifi_endpoint.clone(),
+                            vcam_device: self.vcam_device.clone(),
+                        });
+                    }
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.wifi_endpoint)
+                            .hint_text("e.g. 192.168.1.7:9876")
+                            .desired_width(ui.available_width()),
+                    );
+                });
+            });
+
+            ui.add_space(10.0);
+            ui.add_enabled_ui(self.is_busy(), |ui| {
+                let disconnect_btn =
+                    egui::Button::new(egui::RichText::new("Disconnect").color(COLOR_TEXT_PRIMARY))
+                        .fill(if self.is_busy() {
+                            COLOR_STATUS_ROSE
+                        } else {
+                            COLOR_SURFACE_ELEVATED
+                        });
+                if ui
+                    .add_sized([ui.available_width(), 28.0], disconnect_btn)
+                    .clicked()
+                {
+                    self.session.send(GuiCommand::Disconnect);
+                }
+            });
         });
     }
 
@@ -523,6 +649,7 @@ impl CamCraftApp {
             ui.add_space(8.0);
 
             ui.add_enabled_ui(connected, |ui| {
+                ui.spacing_mut().slider_width = (ui.available_width() - 95.0).max(120.0);
                 // Camera selector
                 ui.label(
                     egui::RichText::new("Camera Lens")
@@ -640,6 +767,7 @@ impl CamCraftApp {
             ui.add_space(8.0);
 
             ui.add_enabled_ui(connected, |ui| {
+                ui.spacing_mut().slider_width = (ui.available_width() - 95.0).max(120.0);
                 // Zoom slider
                 ui.label(
                     egui::RichText::new(format!("Zoom: {:.2}x", self.zoom_ratio))
@@ -735,35 +863,40 @@ impl eframe::App for CamCraftApp {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
 
-        egui::CentralPanel::default()
-            .frame(egui::Frame::central_panel(ui.style()).fill(COLOR_BG_CARBON))
+        egui::Panel::right("inspector_panel")
+            .resizable(true)
+            .default_size(360.0)
+            .min_size(300.0)
+            .max_size(520.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(COLOR_BG_CARBON)
+                    .inner_margin(egui::Margin::symmetric(12, 10)),
+            )
             .show(ui, |ui| {
-                let total_avail = ui.available_size();
-                let left_width = (total_avail.x * 0.67).max(420.0);
-
-                ui.horizontal_top(|ui| {
-                    // Left Panel: Telemetry Status Bar + Live Video Preview
-                    ui.vertical(|ui| {
-                        ui.set_width(left_width);
-                        self.render_telemetry_bar(ui);
+                egui::ScrollArea::vertical()
+                    .id_salt("inspector_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.render_connection_card(ui);
                         ui.add_space(10.0);
-                        let preview_h = (ui.available_height() - 4.0).max(240.0);
-                        self.render_preview_canvas(ui, egui::vec2(left_width, preview_h));
+                        self.render_stream_preset_card(ui);
+                        ui.add_space(10.0);
+                        self.render_live_adjustments_card(ui);
                     });
+            });
 
-                    ui.add_space(12.0);
-
-                    // Right Panel: Inspector & Two-Way Camera Controls
-                    egui::ScrollArea::vertical()
-                        .id_salt("inspector_scroll")
-                        .show(ui, |ui| {
-                            self.render_connection_card(ui);
-                            ui.add_space(10.0);
-                            self.render_stream_preset_card(ui);
-                            ui.add_space(10.0);
-                            self.render_live_adjustments_card(ui);
-                        });
-                });
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::central_panel(ui.style())
+                    .fill(COLOR_BG_CARBON)
+                    .inner_margin(egui::Margin::symmetric(12, 10)),
+            )
+            .show(ui, |ui| {
+                self.render_telemetry_bar(ui);
+                ui.add_space(10.0);
+                let preview_size = ui.available_size();
+                self.render_preview_canvas(ui, preview_size);
             });
     }
 }
@@ -817,4 +950,76 @@ fn apply_artcraft_dark_theme(ctx: &egui::Context) {
     visuals.widgets.active.corner_radius = egui::CornerRadius::same(8);
     visuals.selection.bg_fill = COLOR_ACCENT_BLUE;
     ctx.set_visuals(visuals);
+}
+
+fn upsert_discovered_device(list: &mut Vec<DiscoveredDevice>, device: DiscoveredDevice) {
+    if let Some(existing) = list
+        .iter_mut()
+        .find(|d| d.service_fullname == device.service_fullname)
+    {
+        *existing = device;
+    } else {
+        list.push(device);
+    }
+    list.sort_by(|a, b| {
+        a.device_name
+            .cmp(&b.device_name)
+            .then_with(|| a.endpoint().cmp(&b.endpoint()))
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use super::*;
+
+    fn make_dev(fullname: &str, name: &str, ip: [u8; 4], port: u16) -> DiscoveredDevice {
+        DiscoveredDevice {
+            service_fullname: fullname.to_owned(),
+            device_name: name.to_owned(),
+            ip: Ipv4Addr::from(ip),
+            port,
+            hostname: "android.local.".to_owned(),
+            protocol_version: Some(1),
+        }
+    }
+
+    #[test]
+    fn upsert_discovered_device_updates_in_place_and_sorts_stably() {
+        let mut devices = Vec::new();
+        upsert_discovered_device(
+            &mut devices,
+            make_dev(
+                "z._camcraft._tcp.local.",
+                "Zeta Phone",
+                [192, 168, 1, 20],
+                9876,
+            ),
+        );
+        upsert_discovered_device(
+            &mut devices,
+            make_dev(
+                "a._camcraft._tcp.local.",
+                "Alpha Phone",
+                [192, 168, 1, 10],
+                9876,
+            ),
+        );
+        assert_eq!(devices[0].device_name, "Alpha Phone");
+        assert_eq!(devices[1].device_name, "Zeta Phone");
+
+        // Update existing device IP by service_fullname without duplicating
+        upsert_discovered_device(
+            &mut devices,
+            make_dev(
+                "a._camcraft._tcp.local.",
+                "Alpha Phone",
+                [192, 168, 1, 99],
+                9876,
+            ),
+        );
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].endpoint(), "192.168.1.99:9876");
+    }
 }

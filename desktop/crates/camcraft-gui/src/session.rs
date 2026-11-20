@@ -5,10 +5,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use camcraft_core::adb;
-use camcraft_core::client::{self, ClientConfig, ClientEvent, ClientSender, StreamStats};
-use camcraft_core::decoder::{DecodedFrame, DecoderSender, spawn_decoder_worker};
+use camcraft_core::client::{
+    self, ClientConfig, ClientError, ClientEvent, ClientSender, StreamStats,
+};
+use camcraft_core::decoder::{
+    DecodedFrame, DecoderSender, KEYFRAME_REQUEST_COOLDOWN, KeyframeRequestReason,
+    spawn_decoder_worker_with_recovery,
+};
+use camcraft_core::discovery::{DiscoveryEvent, MdnsScanner};
 use camcraft_core::vcam::{V4l2LoopbackSink, VirtualCameraSink, find_camcraft_v4l2_device};
 use camcraft_protocol::{ControlAck, ControlCmd, ControlHello, DEFAULT_PORT};
 use crossbeam_channel::{Receiver, Sender};
@@ -44,6 +51,7 @@ pub enum GuiCommand {
         endpoint: String,
         vcam_device: String,
     },
+    RefreshWifiDiscovery,
     Disconnect,
     SendControlCmd(ControlCmd),
 }
@@ -59,6 +67,7 @@ pub enum GuiUpdate {
     Hello(ControlHello),
     ControlAck(ControlAck),
     Stats(StreamStats),
+    Discovery(DiscoveryEvent),
     VcamStatus {
         path: String,
         active: bool,
@@ -152,8 +161,10 @@ struct ActiveConnection {
     decoder_running: Arc<AtomicBool>,
     decoder_tx: DecoderSender,
     decoder_thread: Option<JoinHandle<Result<(), camcraft_core::decoder::DecoderError>>>,
+    kf_bridge_thread: Option<JoinHandle<()>>,
     client_task: tokio::task::JoinHandle<()>,
     sender: Option<ClientSender>,
+    last_keyframe_req: Option<Instant>,
 }
 
 impl ActiveConnection {
@@ -163,6 +174,9 @@ impl ActiveConnection {
         self.decoder_tx.stop();
         self.client_task.abort();
         if let Some(handle) = self.decoder_thread.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.kf_bridge_thread.take() {
             let _ = handle.join();
         }
     }
@@ -177,9 +191,35 @@ async fn run_session_supervisor(
     let mut active: Option<ActiveConnection> = None;
     let (internal_tx, mut internal_rx) = mpsc::channel::<InternalEvent>(64);
 
+    let (mdns_tx, mdns_rx) = crossbeam_channel::unbounded::<DiscoveryEvent>();
+    let mut scanner = match MdnsScanner::start(mdns_tx) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            warn!(error = %e, "Failed to start mDNS Wi-Fi discovery scanner");
+            None
+        }
+    };
+    let mdns_bridge = if scanner.is_some() {
+        let update_tx_mdns = update_tx.clone();
+        let ctx_mdns = ctx.clone();
+        std::thread::Builder::new()
+            .name("camcraft-gui-mdns".to_owned())
+            .spawn(move || {
+                while let Ok(ev) = mdns_rx.recv() {
+                    emit(&update_tx_mdns, &ctx_mdns, GuiUpdate::Discovery(ev));
+                }
+            })
+            .ok()
+    } else {
+        None
+    };
+
     loop {
         tokio::select! {
-            Some(cmd) = cmd_rx.recv() => {
+            maybe_cmd = cmd_rx.recv() => {
+                let Some(cmd) = maybe_cmd else {
+                    break;
+                };
                 match cmd {
                     GuiCommand::ConnectUsb { port, vcam_device } => {
                         if let Some(conn) = active.take() {
@@ -235,6 +275,11 @@ async fn run_session_supervisor(
                             &ctx,
                         );
                     }
+                    GuiCommand::RefreshWifiDiscovery => {
+                        if let Some(ref s) = scanner {
+                            s.trigger_scan();
+                        }
+                    }
                     GuiCommand::Disconnect => {
                         if let Some(conn) = active.take() {
                             conn.stop();
@@ -271,6 +316,26 @@ async fn run_session_supervisor(
                             conn.sender = Some(sender);
                         }
                     }
+                    InternalEvent::RequestKeyframe(reason) => {
+                        if let Some(ref mut conn) = active
+                            && let Some(ref sender) = conn.sender
+                        {
+                            let now = Instant::now();
+                            let cooldown_elapsed = conn.last_keyframe_req.is_none_or(|prev| {
+                                now.saturating_duration_since(prev) >= KEYFRAME_REQUEST_COOLDOWN
+                            });
+                            if cooldown_elapsed {
+                                conn.last_keyframe_req = Some(now);
+                                let sender = sender.clone();
+                                info!(?reason, "Requesting IDR keyframe from Android sender");
+                                tokio::spawn(async move {
+                                    if let Err(e) = sender.send_cmd(ControlCmd::RequestKeyframe).await {
+                                        warn!(error = %e, "Failed to send RequestKeyframe command");
+                                    }
+                                });
+                            }
+                        }
+                    }
                     InternalEvent::SessionEnded => {
                         if let Some(conn) = active.take() {
                             conn.stop();
@@ -278,17 +343,23 @@ async fn run_session_supervisor(
                     }
                 }
             }
-            else => break,
         }
     }
 
     if let Some(conn) = active.take() {
         conn.stop();
     }
+    if let Some(mut s) = scanner.take() {
+        s.stop();
+    }
+    if let Some(handle) = mdns_bridge {
+        let _ = handle.join();
+    }
 }
 
 enum InternalEvent {
     SenderReady(ClientSender),
+    RequestKeyframe(KeyframeRequestReason),
     SessionEnded,
 }
 
@@ -345,15 +416,30 @@ fn start_connection(
         }
     };
 
-    let decoder_thread = match spawn_decoder_worker(
+    let (kf_tx, kf_rx) = crossbeam_channel::bounded::<KeyframeRequestReason>(4);
+    let internal_tx_kf = internal_tx.clone();
+    let kf_bridge_thread = std::thread::Builder::new()
+        .name("camcraft-gui-kf".to_owned())
+        .spawn(move || {
+            while let Ok(reason) = kf_rx.recv() {
+                let _ = internal_tx_kf.try_send(InternalEvent::RequestKeyframe(reason));
+            }
+        })
+        .ok();
+
+    let decoder_thread = match spawn_decoder_worker_with_recovery(
         decoder_rx,
         sink,
         Some(frame_tx.clone()),
         true,
         decoder_running.clone(),
+        Some(kf_tx),
     ) {
         Ok(handle) => Some(handle),
         Err(e) => {
+            if let Some(handle) = kf_bridge_thread {
+                let _ = handle.join();
+            }
             emit(
                 update_tx,
                 ctx,
@@ -405,16 +491,30 @@ fn start_connection(
                 ClientEvent::VideoFrame {
                     header, payload, ..
                 } => {
-                    if let Err(e) =
-                        decoder_tx_c.push_frame(header.pts_us, header.flags.is_keyframe(), payload)
-                    {
-                        warn!(error = %e, "Failed to queue VIDEO_FRAME");
+                    match decoder_tx_c.push_frame(
+                        header.pts_us,
+                        header.flags.is_keyframe(),
+                        payload,
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            let _ = internal_tx_c.try_send(InternalEvent::RequestKeyframe(
+                                KeyframeRequestReason::FrameDropped,
+                            ));
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to queue VIDEO_FRAME");
+                        }
                     }
                 }
                 ClientEvent::AudioConfig { .. } | ClientEvent::AudioFrame { .. } => {}
                 ClientEvent::Disconnected(reason) => {
                     disconnected_emitted = true;
-                    emit(&update_tx_c, &ctx_c, GuiUpdate::Disconnected(reason));
+                    emit(
+                        &update_tx_c,
+                        &ctx_c,
+                        GuiUpdate::Disconnected(format_disconnect_reason(&reason)),
+                    );
                     break;
                 }
             }
@@ -428,7 +528,7 @@ fn start_connection(
                     emit(
                         &update_tx_c,
                         &ctx_c,
-                        GuiUpdate::Error(format!("Connection failed: {e}")),
+                        GuiUpdate::Error(format_client_error(&e)),
                     );
                 }
             }
@@ -451,8 +551,10 @@ fn start_connection(
         decoder_running,
         decoder_tx,
         decoder_thread,
+        kf_bridge_thread,
         client_task,
         sender: None,
+        last_keyframe_req: None,
     })
 }
 
@@ -467,6 +569,31 @@ fn normalize_endpoint(raw: &str) -> String {
     }
 }
 
+fn format_client_error(err: &ClientError) -> String {
+    if let ClientError::Io(io_err) = err {
+        if io_err.kind() == std::io::ErrorKind::ConnectionRefused {
+            return "Phone reached, but CamCraft Server is not running (tap 'Start Server' on Android)".to_owned();
+        }
+        if io_err.raw_os_error() == Some(113) {
+            return "No route to phone — check phone Wi-Fi IP, same SSID, or router AP Isolation"
+                .to_owned();
+        }
+    }
+    format!("Connection failed: {err}")
+}
+
+fn format_disconnect_reason(reason: &str) -> String {
+    let lower = reason.to_ascii_lowercase();
+    if lower.contains("connection refused") || lower.contains("os error 111") {
+        "Phone reached, but CamCraft Server is not running (tap 'Start Server' on Android)"
+            .to_owned()
+    } else if lower.contains("no route to host") || lower.contains("os error 113") {
+        "No route to phone — check phone Wi-Fi IP, same SSID, or router AP Isolation".to_owned()
+    } else {
+        reason.to_owned()
+    }
+}
+
 fn emit(tx: &Sender<GuiUpdate>, ctx: &egui::Context, update: GuiUpdate) {
     let _ = tx.send(update);
     ctx.request_repaint();
@@ -475,6 +602,7 @@ fn emit(tx: &Sender<GuiUpdate>, ctx: &egui::Context, update: GuiUpdate) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use camcraft_core::decoder::spawn_decoder_worker;
 
     #[test]
     fn normalize_endpoint_handles_defaults_and_ports() {

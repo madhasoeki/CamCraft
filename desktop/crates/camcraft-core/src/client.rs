@@ -4,6 +4,7 @@
 //! decodes CCFT v1 packet frames, sends periodic heartbeat pings, measures RTT latency,
 //! and tracks real-time video frame rate and network bitrate metrics.
 
+use std::net::{SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,9 +15,11 @@ use camcraft_protocol::{
 };
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Errors encountered in client networking and packet processing.
 #[derive(Debug, Error)]
@@ -123,6 +126,8 @@ pub fn current_time_us() -> u64 {
 pub struct ClientConfig {
     /// Remote address (e.g. `127.0.0.1:9876` or `192.168.1.100:9876`).
     pub endpoint: String,
+    /// Optional network interface name (e.g. `"wlp2s0"`) to bind outbound TCP connection.
+    pub interface: Option<String>,
     /// Heartbeat ping interval (defaults to 1 second).
     pub ping_interval: Duration,
     /// Initial read buffer capacity in bytes (defaults to 64 KB).
@@ -135,6 +140,7 @@ impl ClientConfig {
     pub fn usb_default() -> Self {
         Self {
             endpoint: format!("127.0.0.1:{}", camcraft_protocol::DEFAULT_PORT),
+            interface: None,
             ping_interval: Duration::from_secs(1),
             read_buffer_capacity: 65536,
         }
@@ -145,9 +151,22 @@ impl ClientConfig {
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
+            interface: None,
             ping_interval: Duration::from_secs(1),
             read_buffer_capacity: 65536,
         }
+    }
+
+    /// Pins outbound TCP connection attempts to a specific OS network interface (`SO_BINDTODEVICE`).
+    #[must_use]
+    pub fn with_interface(mut self, iface: impl Into<String>) -> Self {
+        let trimmed = iface.into().trim().to_owned();
+        self.interface = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        };
+        self
     }
 }
 
@@ -184,8 +203,17 @@ pub async fn run_client_loop(
     event_tx: mpsc::Sender<ClientEvent>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), ClientError> {
-    info!(endpoint = %config.endpoint, "Connecting to CamCraft Android sender");
-    let stream = TcpStream::connect(&config.endpoint).await?;
+    info!(
+        endpoint = %config.endpoint,
+        interface = ?config.interface,
+        "Connecting to CamCraft Android sender"
+    );
+    let stream = connect_tcp(
+        &config.endpoint,
+        config.interface.as_deref(),
+        CONNECT_TIMEOUT,
+    )
+    .await?;
     stream.set_nodelay(true)?;
     info!(endpoint = %config.endpoint, "TCP connection established (TCP_NODELAY enabled)");
 
@@ -392,6 +420,195 @@ pub async fn run_client_loop(
     loop_result
 }
 
+async fn connect_plain(endpoint: &str, timeout: Duration) -> Result<TcpStream, ClientError> {
+    tokio::time::timeout(timeout, TcpStream::connect(endpoint))
+        .await
+        .map_err(|_| {
+            ClientError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "Connection to {endpoint} timed out after {}s",
+                    timeout.as_secs()
+                ),
+            ))
+        })?
+        .map_err(ClientError::from)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+async fn connect_via_device(
+    dest: SocketAddrV4,
+    iface_name: &str,
+    timeout: Duration,
+) -> Result<TcpStream, std::io::Error> {
+    let socket = TcpSocket::new_v4()?;
+    socket.bind_device(Some(iface_name.as_bytes()))?;
+    tokio::time::timeout(timeout, socket.connect(SocketAddr::V4(dest)))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("Connection to {dest} on {iface_name} timed out"),
+            )
+        })?
+}
+
+async fn connect_tcp(
+    endpoint: &str,
+    preferred_interface: Option<&str>,
+    connect_timeout: Duration,
+) -> Result<TcpStream, ClientError> {
+    let addrs: Vec<SocketAddr> =
+        tokio::time::timeout(connect_timeout, tokio::net::lookup_host(endpoint))
+            .await
+            .map_err(|_| {
+                ClientError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("DNS lookup for {endpoint} timed out"),
+                ))
+            })??
+            .collect();
+
+    if addrs.is_empty() {
+        return Err(ClientError::Io(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            format!("No addresses resolved for {endpoint}"),
+        )));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Some(SocketAddr::V4(dest_v4)) = addrs.iter().copied().find(|addr| match addr {
+        SocketAddr::V4(v4) => !v4.ip().is_loopback() && !v4.ip().is_unspecified(),
+        SocketAddr::V6(_) => false,
+    }) {
+        if let Some(iface) = preferred_interface.map(str::trim).filter(|s| !s.is_empty()) {
+            match connect_via_device(dest_v4, iface, connect_timeout).await {
+                Ok(stream) => {
+                    info!(endpoint = %endpoint, interface = %iface, "TCP connected via pinned interface");
+                    return Ok(stream);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                    warn!(
+                        interface = %iface,
+                        error = %err,
+                        "SO_BINDTODEVICE denied; falling back to default OS routing"
+                    );
+                    return connect_plain(endpoint, connect_timeout).await;
+                }
+                Err(err) => return Err(ClientError::Io(err)),
+            }
+        }
+
+        let matching = crate::net::matching_interfaces_for_target(
+            &crate::net::list_active_ipv4_interfaces(),
+            *dest_v4.ip(),
+        );
+        if matching.len() >= 2 {
+            let iface_names: Vec<&str> = matching.iter().map(|i| i.name.as_str()).collect();
+            debug!(
+                endpoint = %endpoint,
+                interfaces = ?iface_names,
+                "Multiple local interfaces match target subnet; racing outbound TCP connections"
+            );
+
+            let mut join_set = tokio::task::JoinSet::new();
+            for iface in matching {
+                let name = iface.name;
+                join_set.spawn(async move {
+                    let res = connect_via_device(dest_v4, &name, connect_timeout).await;
+                    (name, res)
+                });
+            }
+
+            let mut errors = Vec::new();
+            while let Some(joined) = join_set.join_next().await {
+                match joined {
+                    Ok((iface_name, Ok(stream))) => {
+                        info!(
+                            endpoint = %endpoint,
+                            interface = %iface_name,
+                            "TCP connected via interface (dual-NIC auto-routing)"
+                        );
+                        join_set.abort_all();
+                        return Ok(stream);
+                    }
+                    Ok((iface_name, Err(err))) => {
+                        debug!(
+                            endpoint = %endpoint,
+                            interface = %iface_name,
+                            error = %err,
+                            "Interface connect attempt failed"
+                        );
+                        errors.push(err);
+                    }
+                    Err(join_err) => {
+                        debug!(error = %join_err, "Dual-NIC connect task failed");
+                    }
+                }
+            }
+
+            if !errors.is_empty() {
+                if errors
+                    .iter()
+                    .all(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
+                {
+                    warn!(
+                        "SO_BINDTODEVICE denied on all matching interfaces; falling back to default OS routing"
+                    );
+                    return connect_plain(endpoint, connect_timeout).await;
+                }
+                return Err(ClientError::Io(pick_most_informative_connect_error(errors)));
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = (preferred_interface, SocketAddrV4::new);
+
+    connect_plain(endpoint, connect_timeout).await
+}
+
+fn error_informativeness_rank(err: &std::io::Error) -> u8 {
+    let is_unreachable = matches!(
+        err.kind(),
+        std::io::ErrorKind::HostUnreachable | std::io::ErrorKind::NetworkUnreachable
+    ) || {
+        #[cfg(unix)]
+        {
+            matches!(
+                err.raw_os_error(),
+                Some(libc::EHOSTUNREACH | libc::ENETUNREACH)
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    };
+
+    if err.kind() == std::io::ErrorKind::ConnectionRefused {
+        3
+    } else if err.kind() == std::io::ErrorKind::TimedOut {
+        2
+    } else if is_unreachable {
+        0
+    } else {
+        1
+    }
+}
+
+fn pick_most_informative_connect_error(errors: Vec<std::io::Error>) -> std::io::Error {
+    errors
+        .into_iter()
+        .max_by_key(error_informativeness_rank)
+        .unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "Failed to connect on all matching interfaces",
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,5 +626,29 @@ mod tests {
         assert_eq!(stats.bitrate_mbps, 0.0);
         assert_eq!(stats.rtt_ms, 0.0);
         assert_eq!(stats.total_frames, 0);
+    }
+
+    #[test]
+    fn pick_most_informative_connect_error_prefers_refused_over_unreachable_and_timeout() {
+        #[cfg(unix)]
+        let unreachable = std::io::Error::from_raw_os_error(libc::EHOSTUNREACH);
+        #[cfg(not(unix))]
+        let unreachable = std::io::Error::new(std::io::ErrorKind::HostUnreachable, "no route");
+
+        let timed_out = std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out");
+        let refused = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+
+        let chosen = pick_most_informative_connect_error(vec![unreachable, timed_out, refused]);
+        assert_eq!(chosen.kind(), std::io::ErrorKind::ConnectionRefused);
+
+        #[cfg(unix)]
+        let unreachable_only = std::io::Error::from_raw_os_error(libc::EHOSTUNREACH);
+        #[cfg(not(unix))]
+        let unreachable_only = std::io::Error::new(std::io::ErrorKind::HostUnreachable, "no route");
+
+        let timed_out_2 = std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out");
+        let chosen_timeout =
+            pick_most_informative_connect_error(vec![unreachable_only, timed_out_2]);
+        assert_eq!(chosen_timeout.kind(), std::io::ErrorKind::TimedOut);
     }
 }
