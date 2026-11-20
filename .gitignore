@@ -20,9 +20,8 @@ android/local.properties
 *.hprof
 captures/
 
-# Graphify temporary working files (keep GRAPH_REPORT.md, graph.json, graph.html)
-graphify-out/.graphify_*
-graphify-out/cache/
+# Graphify generated knowledge graph outputs
+graphify-out/
 
 # OS / Editor temporary artifacts
 .DS_Store
