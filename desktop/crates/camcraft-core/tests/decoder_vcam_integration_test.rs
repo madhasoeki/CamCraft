@@ -5,10 +5,12 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use camcraft_core::decoder::{
-    DecodedFrame, DecoderSender, LIVE_DECODER_QUEUE_CAPACITY, PreviewFrame, spawn_decoder_worker,
-    spawn_decoder_worker_low_latency,
+    DecodedFrame, DecoderOptions, DecoderSender, KeyframeRequestReason,
+    LIVE_DECODER_QUEUE_CAPACITY, LowLatencyWorkerOptions, PreviewFrame, PreviewRuntimeControl,
+    spawn_decoder_worker, spawn_decoder_worker_low_latency, spawn_decoder_worker_optimized,
 };
 use camcraft_core::vcam::{VcamError, VirtualCameraSink, generate_standby_frame};
+use camcraft_protocol::FrameFlags;
 
 const SPS_PPS_64X64: &[u8] = &[
     0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xc0, 0x0a, 0xda, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03,
@@ -397,6 +399,122 @@ fn test_low_latency_worker_skips_preview_when_disabled_and_caps_preview_size() {
     assert_eq!((preview.preview_width, preview.preview_height), (32, 32));
     assert_eq!(preview.rgba.len(), 32 * 32 * 4);
     assert_eq!(frame_count.load(Ordering::SeqCst), 2);
+
+    decoder_sender.stop();
+    running.store(false, Ordering::Relaxed);
+    assert!(handle.join().expect("Worker thread should join").is_ok());
+}
+
+#[test]
+fn test_optimized_worker_recycles_preview_buffers_and_handles_flags_and_callbacks() {
+    let frame_count = Arc::new(AtomicUsize::new(0));
+    let last_dimensions = Arc::new(Mutex::new((0, 0)));
+    let recorded_dimensions = Arc::new(Mutex::new(Vec::new()));
+
+    let mut mock_sink = MockCameraSink::new(
+        frame_count.clone(),
+        last_dimensions.clone(),
+        recorded_dimensions,
+    );
+    mock_sink.open().unwrap();
+
+    let (decoder_sender, decoder_rx) =
+        DecoderSender::new_with_capacity(LIVE_DECODER_QUEUE_CAPACITY);
+    let (preview_tx, preview_rx) = crossbeam_channel::bounded::<PreviewFrame>(1);
+    let (recycle_tx, recycle_rx) = crossbeam_channel::bounded::<Vec<u8>>(2);
+    let preview_pushed_count = Arc::new(AtomicUsize::new(0));
+    let preview_pushed_c = preview_pushed_count.clone();
+    let kf_reasons = Arc::new(Mutex::new(Vec::<KeyframeRequestReason>::new()));
+    let kf_reasons_c = kf_reasons.clone();
+
+    let preview_ctrl = PreviewRuntimeControl::new(true, 32, 0);
+    let running = Arc::new(AtomicBool::new(true));
+
+    let handle = spawn_decoder_worker_optimized(
+        decoder_rx,
+        Some(Box::new(mock_sink)),
+        LowLatencyWorkerOptions {
+            preview_tx: Some(preview_tx),
+            preview_recycle_rx: Some(recycle_rx),
+            preview_ctrl: preview_ctrl.clone(),
+            on_preview_pushed: Some(Arc::new(move || {
+                preview_pushed_c.fetch_add(1, Ordering::SeqCst);
+            })),
+            on_keyframe_request: Some(Arc::new(move |reason| {
+                kf_reasons_c.lock().unwrap().push(reason);
+            })),
+            decoder_options: DecoderOptions::default(),
+        },
+        running.clone(),
+    )
+    .expect("Optimized worker should spawn");
+
+    // 1. Trigger a corrupted frame to verify on_keyframe_request callback runs without a bridge thread
+    assert!(
+        decoder_sender
+            .push_frame_with_flags(
+                500,
+                FrameFlags::KEYFRAME,
+                Bytes::from_static(&[0x00, 0x00, 0x01, 0x65, 0xFF, 0xFF, 0xAA, 0x55]),
+            )
+            .unwrap()
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while kf_reasons.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        *kf_reasons.lock().unwrap(),
+        vec![KeyframeRequestReason::DecodeError]
+    );
+
+    // 2. Decode valid frame with MIRROR_H | ROTATE_90 flags and verify preview buffer creation
+    decoder_sender
+        .push_config(1_000, Bytes::from_static(SPS_PPS_64X64))
+        .unwrap();
+    assert!(
+        decoder_sender
+            .push_frame_with_flags(
+                1_000,
+                FrameFlags::KEYFRAME | FrameFlags::MIRROR_H | FrameFlags::ROTATE_90,
+                Bytes::from_static(IDR_64X64_RED),
+            )
+            .unwrap()
+    );
+
+    let preview_1 = preview_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("Should emit first PreviewFrame");
+    assert_eq!((preview_1.source_width, preview_1.source_height), (64, 64));
+    assert_eq!(
+        (preview_1.preview_width, preview_1.preview_height),
+        (32, 32)
+    );
+    let recycled_ptr = preview_1.rgba.as_ptr();
+    assert!(recycle_tx.try_send(preview_1.rgba).is_ok());
+
+    // 3. Push a second frame and verify the exact Vec<u8> buffer pointer is reused without realloc
+    assert!(
+        decoder_sender
+            .push_frame_with_flags(
+                2_000,
+                FrameFlags::KEYFRAME | FrameFlags::ROTATE_180,
+                Bytes::from_static(IDR_64X64_RED),
+            )
+            .unwrap()
+    );
+
+    let preview_2 = preview_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("Should emit second PreviewFrame reusing recycled buffer");
+    assert_eq!(
+        preview_2.rgba.as_ptr(),
+        recycled_ptr,
+        "PreviewFrame RGBA Vec<u8> should reuse recycled allocation without reallocating"
+    );
+    assert_eq!(preview_pushed_count.load(Ordering::SeqCst), 2);
+    assert_eq!(frame_count.load(Ordering::SeqCst), 2);
+    assert_eq!(*last_dimensions.lock().unwrap(), (64, 64));
 
     decoder_sender.stop();
     running.store(false, Ordering::Relaxed);

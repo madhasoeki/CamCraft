@@ -21,8 +21,9 @@ use camcraft_core::client::{
     self, ClientConfig, ClientEvent, ClientSender, ReconnectConfig, StreamStats,
 };
 use camcraft_core::decoder::{
-    DecoderSender, KEYFRAME_REQUEST_COOLDOWN, KeyframeRequestReason, LIVE_DECODER_QUEUE_CAPACITY,
-    spawn_decoder_worker_with_recovery,
+    DecoderOptions, DecoderSender, KEYFRAME_REQUEST_COOLDOWN, KeyframeRequestReason,
+    LIVE_DECODER_QUEUE_CAPACITY, LowLatencyWorkerOptions, PreviewRuntimeControl,
+    spawn_decoder_worker_optimized,
 };
 use camcraft_core::discovery::{DiscoveredDevice, DiscoveryEvent, MdnsScanner};
 use camcraft_core::vcam::{V4l2LoopbackSink, VirtualCameraSink, find_camcraft_v4l2_device};
@@ -207,27 +208,25 @@ async fn run_connect(args: ConnectArgs) -> Result<()> {
         }
     };
 
-    // Initialize H.264 decoder worker with bounded channel & keyframe recovery
+    // Initialize H.264 decoder worker with bounded channel & direct keyframe recovery callback
     let (decoder_sender, decoder_rx) =
         DecoderSender::new_with_capacity(LIVE_DECODER_QUEUE_CAPACITY);
     let decoder_running = Arc::new(AtomicBool::new(true));
-    let (kf_tx, kf_rx) = crossbeam_channel::bounded::<KeyframeRequestReason>(4);
     let (kf_async_tx, mut kf_async_rx) = mpsc::channel::<KeyframeRequestReason>(8);
-    let kf_bridge = std::thread::Builder::new()
-        .name("camcraft-cli-kf".to_owned())
-        .spawn(move || {
-            while let Ok(reason) = kf_rx.recv() {
-                let _ = kf_async_tx.try_send(reason);
-            }
-        })
-        .ok();
-    let decoder_handle = spawn_decoder_worker_with_recovery(
+    let decoder_handle = spawn_decoder_worker_optimized(
         decoder_rx,
         sink,
-        None,
-        false,
+        LowLatencyWorkerOptions {
+            preview_tx: None,
+            preview_recycle_rx: None,
+            preview_ctrl: PreviewRuntimeControl::new(false, 0, 0),
+            on_preview_pushed: None,
+            on_keyframe_request: Some(Arc::new(move |reason| {
+                let _ = kf_async_tx.try_send(reason);
+            })),
+            decoder_options: DecoderOptions::default(),
+        },
         decoder_running.clone(),
-        Some(kf_tx),
     )
     .context("Failed to spawn video decoder worker thread")?;
 
@@ -398,8 +397,11 @@ async fn run_connect(args: ConnectArgs) -> Result<()> {
                                 .context("Failed to write VIDEO_FRAME to dump file")?;
                             dumped_bytes += payload.len() as u64;
                         }
-                        let is_keyframe = header.flags.is_keyframe();
-                        match decoder_sender.push_frame(header.pts_us, is_keyframe, payload) {
+                        match decoder_sender.push_frame_with_flags(
+                            header.pts_us,
+                            header.flags,
+                            payload,
+                        ) {
                             Ok(true) => {}
                             Ok(false) => {
                                 maybe_request_keyframe(
@@ -481,9 +483,6 @@ async fn run_connect(args: ConnectArgs) -> Result<()> {
     if let Err(e) = audio_handle.join() {
         warn!("Audio worker thread join error: {:?}", e);
     }
-    if let Some(handle) = kf_bridge {
-        let _ = handle.join();
-    }
 
     if let (Some(mut file), Some(path)) = (dump_file, args.dump_h264.as_ref()) {
         file.flush()
@@ -531,20 +530,11 @@ async fn run_discover(timeout_secs: u64) -> Result<()> {
     println!(
         "Scanning local network for CamCraft devices (_camcraft._tcp.local.) for {timeout_secs}s..."
     );
-    let (ev_tx, ev_rx) = crossbeam_channel::unbounded::<DiscoveryEvent>();
-    let mut scanner = MdnsScanner::start(ev_tx).context("Failed to start mDNS scanner")?;
-
     let (async_tx, mut async_rx) = mpsc::unbounded_channel::<DiscoveryEvent>();
-    let bridge = std::thread::Builder::new()
-        .name("camcraft-cli-mdns".to_owned())
-        .spawn(move || {
-            while let Ok(ev) = ev_rx.recv() {
-                if async_tx.send(ev).is_err() {
-                    break;
-                }
-            }
-        })
-        .ok();
+    let mut scanner = MdnsScanner::start_with_handler(move |ev| {
+        let _ = async_tx.send(ev);
+    })
+    .context("Failed to start mDNS scanner")?;
 
     let mut known: BTreeMap<String, DiscoveredDevice> = BTreeMap::new();
     let deadline = tokio::time::sleep(Duration::from_secs(timeout_secs));
@@ -585,9 +575,6 @@ async fn run_discover(timeout_secs: u64) -> Result<()> {
     }
 
     scanner.stop();
-    if let Some(handle) = bridge {
-        let _ = handle.join();
-    }
 
     if known.is_empty() {
         println!("No CamCraft devices discovered on the local network.");

@@ -15,16 +15,48 @@ import org.artcraft.camcraft.protocol.PacketType
  * Hardware-accelerated H.264/AVC video encoder fed directly by GPU [Surface].
  *
  * Configures [MediaCodec] in low-latency surface-input mode, drains Annex-B
- * NAL units on a dedicated worker thread, extracts SPS/PPS parameter sets,
- * and emits CCFT [PacketType.VIDEO_CONFIG] and [PacketType.VIDEO_FRAME] packets.
+ * NAL units on a dedicated worker thread using a reusable scratch buffer,
+ * extracts SPS/PPS parameter sets, and emits CCFT [PacketType.VIDEO_CONFIG]
+ * and [PacketType.VIDEO_FRAME] slices without per-frame heap allocations.
  */
 class H264SurfaceEncoder(
     val width: Int,
     val height: Int,
     val fps: Int,
-    val bitrateKbps: Int,
-    private val onVideoPacket: (packetType: PacketType, flags: Int, ptsUs: Long, payload: ByteArray) -> Unit,
+    bitrateKbps: Int,
+    private val onVideoPacketSlice: (
+        packetType: PacketType,
+        flags: Int,
+        ptsUs: Long,
+        payload: ByteArray,
+        offset: Int,
+        length: Int,
+    ) -> Unit,
 ) {
+    constructor(
+        width: Int,
+        height: Int,
+        fps: Int,
+        bitrateKbps: Int,
+        onVideoPacket: (packetType: PacketType, flags: Int, ptsUs: Long, payload: ByteArray) -> Unit,
+    ) : this(
+        width = width,
+        height = height,
+        fps = fps,
+        bitrateKbps = bitrateKbps,
+        onVideoPacketSlice = { packetType, flags, ptsUs, payload, offset, length ->
+            val standalone = if (offset == 0 && length == payload.size) {
+                payload
+            } else {
+                payload.copyOfRange(offset, offset + length)
+            }
+            onVideoPacket(packetType, flags, ptsUs, standalone)
+        },
+    )
+
+    @Volatile
+    var bitrateKbps: Int = bitrateKbps
+        private set
 
     private val lifecycleLock = Any()
     private var codec: MediaCodec? = null
@@ -45,42 +77,66 @@ class H264SurfaceEncoder(
         initCodec()
     }
 
-    private fun initCodec() {
+    private fun buildMediaFormat(includeLowLatencyAndProfile: Boolean): MediaFormat {
         val mime = MediaFormat.MIMETYPE_VIDEO_AVC
-        val mediaCodec = MediaCodec.createEncoderByType(mime)
-        var createdSurface: Surface? = null
+        return MediaFormat.createVideoFormat(mime, width, height).apply {
+            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+            setInteger(MediaFormat.KEY_BIT_RATE, bitrateKbps * 1_000)
+            setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
 
-        try {
-            val format = MediaFormat.createVideoFormat(mime, width, height).apply {
-                setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-                setInteger(MediaFormat.KEY_BIT_RATE, bitrateKbps * 1_000)
-                setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            // Low-latency and chipset-tolerant optimizations
+            try {
+                setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
+            } catch (_: Exception) {}
 
-                // Low-latency and chipset-tolerant optimizations
-                try {
-                    setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
-                } catch (ignored: Exception) {}
+            try {
+                setInteger(MediaFormat.KEY_PRIORITY, 0)
+            } catch (_: Exception) {}
 
+            try {
+                setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+            } catch (_: Exception) {}
+
+            if (includeLowLatencyAndProfile) {
                 try {
                     setInteger(MediaFormat.KEY_LATENCY, 1)
-                } catch (ignored: Exception) {}
+                } catch (_: Exception) {}
 
                 try {
-                    setInteger(MediaFormat.KEY_PRIORITY, 0)
-                } catch (ignored: Exception) {}
-
-                try {
-                    setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
-                } catch (ignored: Exception) {}
+                    setInteger(MediaFormat.KEY_OPERATING_RATE, fps)
+                } catch (_: Exception) {}
 
                 try {
                     setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
-                    setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel41)
-                } catch (ignored: Exception) {}
+                    setInteger(MediaFormat.KEY_LEVEL, selectAvcLevel(width, height, fps))
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
+    private fun initCodec() {
+        val mime = MediaFormat.MIMETYPE_VIDEO_AVC
+        var mediaCodec = MediaCodec.createEncoderByType(mime)
+        var createdSurface: Surface? = null
+
+        try {
+            val primaryFormat = buildMediaFormat(includeLowLatencyAndProfile = true)
+            try {
+                mediaCodec.configure(primaryFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            } catch (primaryError: Exception) {
+                Log.w(
+                    TAG,
+                    "Primary H.264 MediaCodec configure failed (${primaryError.message}); retrying without profile/level/latency",
+                )
+                try {
+                    mediaCodec.release()
+                } catch (_: Exception) {}
+                mediaCodec = MediaCodec.createEncoderByType(mime)
+                val fallbackFormat = buildMediaFormat(includeLowLatencyAndProfile = false)
+                mediaCodec.configure(fallbackFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             }
 
-            mediaCodec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             createdSurface = mediaCodec.createInputSurface()
             synchronized(lifecycleLock) {
                 inputSurface = createdSurface
@@ -128,10 +184,11 @@ class H264SurfaceEncoder(
     }
 
     /**
-     * Polling drain loop processing encoder output buffers.
+     * Polling drain loop processing encoder output buffers with a reusable scratch array.
      */
     private fun drainEncoderLoop(activeCodec: MediaCodec) {
         val bufferInfo = MediaCodec.BufferInfo()
+        var scratchBuffer = ByteArray(INITIAL_SCRATCH_BUFFER_BYTES)
 
         while (isRunning.get()) {
             try {
@@ -143,25 +200,31 @@ class H264SurfaceEncoder(
                     MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                         val newFormat = activeCodec.outputFormat
                         Log.i(TAG, "Encoder output format changed: $newFormat")
-                        val csd0 = try { newFormat.getByteBuffer("csd-0") } catch (e: Exception) { null }
-                        val csd1 = try { newFormat.getByteBuffer("csd-1") } catch (e: Exception) { null }
+                        val csd0 = try { newFormat.getByteBuffer("csd-0") } catch (_: Exception) { null }
+                        val csd1 = try { newFormat.getByteBuffer("csd-1") } catch (_: Exception) { null }
                         val config = combineSpsPps(csd0, csd1)
                         if (config.isNotEmpty()) {
                             cachedConfig = config
                             val ptsUs = System.nanoTime() / 1_000L
-                            onVideoPacket(PacketType.VIDEO_CONFIG, CcftFlags.NONE, ptsUs, config)
+                            onVideoPacketSlice(PacketType.VIDEO_CONFIG, CcftFlags.NONE, ptsUs, config, 0, config.size)
                             Log.i(TAG, "Dispatched VIDEO_CONFIG SPS/PPS (${config.size} bytes)")
                         }
                     }
                     else -> {
                         if (outputIndex >= 0) {
                             val outputBuffer = activeCodec.getOutputBuffer(outputIndex)
-                            if (outputBuffer != null && bufferInfo.size > 0) {
-                                outputBuffer.position(bufferInfo.offset)
-                                outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
-                                val payload = ByteArray(bufferInfo.size)
-                                outputBuffer.get(payload)
+                            val size = bufferInfo.size
+                            if (outputBuffer != null && size > 0) {
+                                val requiredCapacity = size + ANNEX_B_PREFIX_HEADROOM
+                                if (requiredCapacity > scratchBuffer.size) {
+                                    scratchBuffer = ByteArray(maxOf(scratchBuffer.size * 2, requiredCapacity))
+                                }
 
+                                outputBuffer.position(bufferInfo.offset)
+                                outputBuffer.limit(bufferInfo.offset + size)
+                                outputBuffer.get(scratchBuffer, ANNEX_B_PREFIX_HEADROOM, size)
+
+                                val slice = formatAnnexBInPlace(scratchBuffer, size)
                                 val ptsUs = if (bufferInfo.presentationTimeUs > 0) {
                                     bufferInfo.presentationTimeUs
                                 } else {
@@ -169,21 +232,34 @@ class H264SurfaceEncoder(
                                 }
 
                                 if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
-                                    val annexB = ensureAnnexB(payload)
-                                    cachedConfig = annexB
-                                    onVideoPacket(PacketType.VIDEO_CONFIG, CcftFlags.NONE, ptsUs, annexB)
+                                    val configCopy = scratchBuffer.copyOfRange(slice.offset, slice.offset + slice.length)
+                                    cachedConfig = configCopy
+                                    onVideoPacketSlice(
+                                        PacketType.VIDEO_CONFIG,
+                                        CcftFlags.NONE,
+                                        ptsUs,
+                                        configCopy,
+                                        0,
+                                        configCopy.size,
+                                    )
                                 } else {
                                     val isKeyframe = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
                                     val flags = if (isKeyframe) CcftFlags.KEYFRAME else CcftFlags.NONE
-                                    val annexB = ensureAnnexB(payload)
-                                    onVideoPacket(PacketType.VIDEO_FRAME, flags, ptsUs, annexB)
+                                    onVideoPacketSlice(
+                                        PacketType.VIDEO_FRAME,
+                                        flags,
+                                        ptsUs,
+                                        scratchBuffer,
+                                        slice.offset,
+                                        slice.length,
+                                    )
                                 }
                             }
                             activeCodec.releaseOutputBuffer(outputIndex, false)
                         }
                     }
                 }
-            } catch (e: IllegalStateException) {
+            } catch (_: IllegalStateException) {
                 // Codec was stopped or released
                 break
             } catch (e: Exception) {
@@ -191,6 +267,28 @@ class H264SurfaceEncoder(
                     Log.e(TAG, "Exception during drainEncoderLoop: ${e.message}", e)
                 }
             }
+        }
+    }
+
+    /**
+     * Dynamically adjusts target video bitrate on the active [MediaCodec] without restarting the pipeline.
+     */
+    fun updateBitrate(bitrateKbps: Int) {
+        val clampedKbps = bitrateKbps.coerceAtLeast(100)
+        val activeCodec = synchronized(lifecycleLock) {
+            this.bitrateKbps = clampedKbps
+            if (!isRunning.get() || !hasStarted) return
+            codec
+        } ?: return
+
+        try {
+            val params = Bundle().apply {
+                putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, clampedKbps * 1_000)
+            }
+            activeCodec.setParameters(params)
+            Log.i(TAG, "Updated H.264 bitrate dynamically to $clampedKbps kbps")
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to update bitrate dynamically: ${e.message}")
         }
     }
 
@@ -269,8 +367,82 @@ class H264SurfaceEncoder(
         Log.i(TAG, "H264SurfaceEncoder released")
     }
 
+    /**
+     * Zero-allocation slice pointer packed into a single primitive 64-bit integer.
+     */
+    @JvmInline
+    value class AnnexBSlice(private val packed: Long) {
+        constructor(offset: Int, length: Int) : this(
+            (offset.toLong() shl 32) or (length.toLong() and 0xFFFFFFFFL),
+        )
+
+        val offset: Int
+            get() = (packed ushr 32).toInt()
+
+        val length: Int
+            get() = packed.toInt()
+    }
+
     companion object {
         private const val TAG = "H264SurfaceEncoder"
+        private const val INITIAL_SCRATCH_BUFFER_BYTES = 256 * 1024
+        const val ANNEX_B_PREFIX_HEADROOM = 4
+
+        /**
+         * Selects an appropriate H.264 AVC level constant for the configured resolution and FPS.
+         */
+        fun selectAvcLevel(width: Int, height: Int, fps: Int): Int {
+            val pixels = width.toLong() * height.toLong()
+            val effectiveFps = fps.coerceAtLeast(1).toLong()
+            val pixelRate = pixels * effectiveFps
+
+            return when {
+                pixels <= 1280L * 720L && effectiveFps <= 30L ->
+                    MediaCodecInfo.CodecProfileLevel.AVCLevel31
+                pixels <= 1920L * 1080L && pixelRate <= 1920L * 1080L * 30L ->
+                    MediaCodecInfo.CodecProfileLevel.AVCLevel4
+                pixels <= 1920L * 1080L && pixelRate <= 1920L * 1080L * 60L ->
+                    MediaCodecInfo.CodecProfileLevel.AVCLevel42
+                pixels <= 3840L * 2160L && pixelRate <= 3840L * 2160L * 30L ->
+                    MediaCodecInfo.CodecProfileLevel.AVCLevel51
+                else ->
+                    MediaCodecInfo.CodecProfileLevel.AVCLevel52
+            }
+        }
+
+        /**
+         * Formats NAL unit bytes previously copied into [buffer] starting at index 4
+         * (`[4 .. 4 + payloadSize)`) into a 4-byte Annex-B slice without heap allocations.
+         */
+        fun formatAnnexBInPlace(buffer: ByteArray, payloadSize: Int): AnnexBSlice {
+            require(payloadSize >= 0 && buffer.size >= payloadSize + ANNEX_B_PREFIX_HEADROOM) {
+                "Buffer too small: size=${buffer.size}, required=${payloadSize + ANNEX_B_PREFIX_HEADROOM}"
+            }
+
+            if (payloadSize >= 4 &&
+                buffer[4] == 0.toByte() &&
+                buffer[5] == 0.toByte() &&
+                buffer[6] == 0.toByte() &&
+                buffer[7] == 1.toByte()
+            ) {
+                return AnnexBSlice(offset = 4, length = payloadSize)
+            }
+
+            if (payloadSize >= 3 &&
+                buffer[4] == 0.toByte() &&
+                buffer[5] == 0.toByte() &&
+                buffer[6] == 1.toByte()
+            ) {
+                buffer[3] = 0
+                return AnnexBSlice(offset = 3, length = payloadSize + 1)
+            }
+
+            buffer[0] = 0
+            buffer[1] = 0
+            buffer[2] = 0
+            buffer[3] = 1
+            return AnnexBSlice(offset = 0, length = payloadSize + ANNEX_B_PREFIX_HEADROOM)
+        }
 
         /**
          * Ensures a byte array has a 4-byte Annex-B start code `00 00 00 01`.

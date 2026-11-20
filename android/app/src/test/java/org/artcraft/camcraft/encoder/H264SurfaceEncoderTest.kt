@@ -1,5 +1,6 @@
 package org.artcraft.camcraft.encoder
 
+import android.media.MediaCodecInfo
 import java.nio.ByteBuffer
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -42,5 +43,82 @@ class H264SurfaceEncoderTest {
             0, 0, 0, 1, 0x68, 0xCE.toByte(),
         )
         assertArrayEquals(expected, combined)
+    }
+
+    @Test
+    fun selectAvcLevelMatchesResolutionAndFpsBounds() {
+        assertEquals(
+            MediaCodecInfo.CodecProfileLevel.AVCLevel31,
+            H264SurfaceEncoder.selectAvcLevel(1280, 720, 30),
+        )
+        assertEquals(
+            MediaCodecInfo.CodecProfileLevel.AVCLevel4,
+            H264SurfaceEncoder.selectAvcLevel(1920, 1080, 30),
+        )
+        assertEquals(
+            MediaCodecInfo.CodecProfileLevel.AVCLevel4,
+            H264SurfaceEncoder.selectAvcLevel(1280, 720, 60),
+        )
+        assertEquals(
+            MediaCodecInfo.CodecProfileLevel.AVCLevel42,
+            H264SurfaceEncoder.selectAvcLevel(1920, 1080, 60),
+        )
+        assertEquals(
+            MediaCodecInfo.CodecProfileLevel.AVCLevel42,
+            H264SurfaceEncoder.selectAvcLevel(1080, 1920, 60),
+        )
+        assertEquals(
+            MediaCodecInfo.CodecProfileLevel.AVCLevel51,
+            H264SurfaceEncoder.selectAvcLevel(3840, 2160, 30),
+        )
+        assertEquals(
+            MediaCodecInfo.CodecProfileLevel.AVCLevel52,
+            H264SurfaceEncoder.selectAvcLevel(3840, 2160, 60),
+        )
+    }
+
+    @Test
+    fun formatAnnexBInPlaceKeepsFourByteStartCodeAtOffsetFour() {
+        val scratch = ByteArray(16)
+        val payload = byteArrayOf(0, 0, 0, 1, 0x65, 0x88.toByte(), 0x84.toByte())
+        System.arraycopy(payload, 0, scratch, 4, payload.size)
+
+        val slice = H264SurfaceEncoder.formatAnnexBInPlace(scratch, payload.size)
+
+        assertEquals(4, slice.offset)
+        assertEquals(payload.size, slice.length)
+        assertArrayEquals(payload, scratch.copyOfRange(slice.offset, slice.offset + slice.length))
+    }
+
+    @Test
+    fun formatAnnexBInPlaceNormalizesThreeByteStartCodeAtOffsetThree() {
+        val scratch = ByteArray(16)
+        val payload = byteArrayOf(0, 0, 1, 0x68, 0xCE.toByte())
+        System.arraycopy(payload, 0, scratch, 4, payload.size)
+
+        val slice = H264SurfaceEncoder.formatAnnexBInPlace(scratch, payload.size)
+
+        assertEquals(3, slice.offset)
+        assertEquals(payload.size + 1, slice.length)
+        assertArrayEquals(
+            byteArrayOf(0, 0, 0, 1, 0x68, 0xCE.toByte()),
+            scratch.copyOfRange(slice.offset, slice.offset + slice.length),
+        )
+    }
+
+    @Test
+    fun formatAnnexBInPlacePrependsFourByteStartCodeAtOffsetZero() {
+        val scratch = ByteArray(16)
+        val payload = byteArrayOf(0x65, 0x88.toByte(), 0x84.toByte())
+        System.arraycopy(payload, 0, scratch, 4, payload.size)
+
+        val slice = H264SurfaceEncoder.formatAnnexBInPlace(scratch, payload.size)
+
+        assertEquals(0, slice.offset)
+        assertEquals(payload.size + 4, slice.length)
+        assertArrayEquals(
+            byteArrayOf(0, 0, 0, 1, 0x65, 0x88.toByte(), 0x84.toByte()),
+            scratch.copyOfRange(slice.offset, slice.offset + slice.length),
+        )
     }
 }

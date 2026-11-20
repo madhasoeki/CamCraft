@@ -1,6 +1,6 @@
 package org.artcraft.camcraft.network
 
-import org.artcraft.camcraft.protocol.ActiveCameraState
+import org.artcraft.camcraft.protocol.CcftFlags
 import org.artcraft.camcraft.protocol.CcftProtocolConstants
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -57,5 +57,36 @@ class CamCraftStreamServiceTest {
         assertEquals(StreamConnectionStatus.STOPPED, initial.status)
         assertEquals(0L, initial.framesSent)
         assertEquals(0f, initial.currentFps, 0.001f)
+    }
+
+    @Test
+    fun computeTransformFlagsCombinesRotationAndMirror() {
+        assertEquals(CcftFlags.NONE, CamCraftStreamService.computeTransformFlags(false, 0))
+        assertEquals(CcftFlags.MIRROR_H, CamCraftStreamService.computeTransformFlags(true, 0))
+        assertEquals(CcftFlags.ROTATE_90, CamCraftStreamService.computeTransformFlags(false, 90))
+        assertEquals(
+            CcftFlags.ROTATE_180 or CcftFlags.MIRROR_H,
+            CamCraftStreamService.computeTransformFlags(true, 180),
+        )
+        assertEquals(
+            CcftFlags.ROTATE_270 or CcftFlags.MIRROR_H,
+            CamCraftStreamService.computeTransformFlags(true, 270),
+        )
+        assertEquals(CcftFlags.NONE, CamCraftStreamService.computeTransformFlags(false, 360))
+    }
+
+    @Test
+    fun buildConnectedNotificationTextReflectsActiveResolutionAndFps() {
+        val defaultState = defaultActiveCameraState()
+        assertEquals(
+            "Connected (192.168.1.42) • 1920x1080 @ 60 FPS",
+            CamCraftStreamService.buildConnectedNotificationText("192.168.1.42", defaultState),
+        )
+
+        val uhd30State = defaultState.copy(width = 3840, height = 2160, fps = 30)
+        assertEquals(
+            "Connected (127.0.0.1) • 3840x2160 @ 30 FPS",
+            CamCraftStreamService.buildConnectedNotificationText("127.0.0.1", uhd30State),
+        )
     }
 }

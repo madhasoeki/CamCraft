@@ -1,6 +1,7 @@
 package org.artcraft.camcraft.camera
 
 import android.content.Context
+import androidx.camera.core.MeteringPoint
 import org.artcraft.camcraft.protocol.PacketType
 
 /**
@@ -9,9 +10,31 @@ import org.artcraft.camcraft.protocol.PacketType
  */
 class CameraController(
     context: Context,
-    onVideoPacket: (packetType: PacketType, flags: Int, ptsUs: Long, payload: ByteArray) -> Unit,
+    onVideoPacketSlice: (
+        packetType: PacketType,
+        flags: Int,
+        ptsUs: Long,
+        payload: ByteArray,
+        offset: Int,
+        length: Int,
+    ) -> Unit,
 ) {
-    val streamManager = CameraStreamManager(context, onVideoPacket)
+    constructor(
+        context: Context,
+        onVideoPacket: (packetType: PacketType, flags: Int, ptsUs: Long, payload: ByteArray) -> Unit,
+    ) : this(
+        context = context,
+        onVideoPacketSlice = { packetType, flags, ptsUs, payload, offset, length ->
+            val standalone = if (offset == 0 && length == payload.size) {
+                payload
+            } else {
+                payload.copyOfRange(offset, offset + length)
+            }
+            onVideoPacket(packetType, flags, ptsUs, standalone)
+        },
+    )
+
+    val streamManager = CameraStreamManager(context, onVideoPacketSlice)
 
     fun startStream(cameraId: String, width: Int, height: Int, fps: Int, bitrateKbps: Int) {
         streamManager.startStream(cameraId, width, height, fps, bitrateKbps)
@@ -35,6 +58,10 @@ class CameraController(
 
     fun setAutoFocus(autofocus: Boolean) {
         streamManager.setAutoFocus(autofocus)
+    }
+
+    fun focusAtPoint(point: MeteringPoint) {
+        streamManager.focusAtPoint(point)
     }
 
     fun requestKeyFrame() {

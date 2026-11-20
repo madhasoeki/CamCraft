@@ -13,6 +13,7 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
+import androidx.camera.core.MeteringPoint
 import androidx.camera.view.PreviewView
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -41,6 +42,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.artcraft.camcraft.MainActivity
+import org.artcraft.camcraft.R
 import org.artcraft.camcraft.camera.CameraEnumerator
 import org.artcraft.camcraft.camera.CameraStreamManager
 import org.artcraft.camcraft.encoder.AudioStreamEngine
@@ -136,6 +138,9 @@ class CamCraftStreamService : Service() {
     private val clientOutputLock = Any()
 
     @Volatile
+    private var activeTransformFlags: Int = CcftFlags.NONE
+
+    @Volatile
     private var totalFramesSent: Long = 0
     @Volatile
     private var windowFrames: Long = 0
@@ -182,8 +187,8 @@ class CamCraftStreamService : Service() {
             val appContext = applicationContext ?: this
             val cameras = CameraEnumerator.enumerateCameras(appContext)
             _serviceState.update { it.copy(cameras = cameras) }
-            val manager = CameraStreamManager(appContext) { packetType, flags, ptsUs, payload ->
-                handleVideoPacketFromEncoder(packetType, flags, ptsUs, payload)
+            val manager = CameraStreamManager(appContext) { packetType, flags, ptsUs, payload, offset, length ->
+                handleVideoPacketFromEncoder(packetType, flags, ptsUs, payload, offset, length)
             }
             cameraStreamManager = manager
             audioStreamEngine = AudioStreamEngine(appContext) { packetType, ptsUs, payload, length ->
@@ -219,6 +224,7 @@ class CamCraftStreamService : Service() {
         super.onDestroy()
         Log.i(TAG, "Destroying CamCraft service")
         stopServer()
+        activeTransformFlags = CcftFlags.NONE
         mdnsAdvertiser?.unregister()
         mdnsAdvertiser = null
         wifiNetworkMonitor?.stop()
@@ -337,6 +343,7 @@ class CamCraftStreamService : Service() {
         flags: Int,
         ptsUs: Long,
         payload: ByteArray,
+        offset: Int,
         length: Int,
         tagLabel: String,
     ): Boolean {
@@ -349,7 +356,7 @@ class CamCraftStreamService : Service() {
                     flags = flags,
                     ptsUs = ptsUs,
                     payload = payload,
-                    offset = 0,
+                    offset = offset,
                     length = length,
                     flush = true,
                 )
@@ -372,8 +379,15 @@ class CamCraftStreamService : Service() {
         flags: Int,
         ptsUs: Long,
         payload: ByteArray,
+        offset: Int,
+        length: Int,
     ) {
-        if (sendStreamPacket(packetType, flags, ptsUs, payload, payload.size, "video")) {
+        val outboundFlags = if (packetType == PacketType.VIDEO_FRAME) {
+            flags or activeTransformFlags
+        } else {
+            flags
+        }
+        if (sendStreamPacket(packetType, outboundFlags, ptsUs, payload, offset, length, "video")) {
             onFrameSent(packetType)
         }
     }
@@ -384,7 +398,7 @@ class CamCraftStreamService : Service() {
         payload: ByteArray,
         length: Int,
     ) {
-        sendStreamPacket(packetType, CcftFlags.NONE, ptsUs, payload, length, "audio")
+        sendStreamPacket(packetType, CcftFlags.NONE, ptsUs, payload, 0, length, "audio")
     }
 
     private fun onFrameSent(packetType: PacketType) {
@@ -427,13 +441,19 @@ class CamCraftStreamService : Service() {
         clientSocket.keepAlive = true
         clientSocket.soTimeout = CLIENT_READ_TIMEOUT_MS
 
+        val initialActiveState = _serviceState.value.activeState
+        activeTransformFlags = computeTransformFlags(
+            mirrorHorizontal = initialActiveState.mirrorHorizontal,
+            rotationDeg = initialActiveState.rotationDeg,
+        )
+
         _serviceState.update {
             it.copy(
                 status = StreamConnectionStatus.CONNECTED,
                 clientAddress = clientIp,
             )
         }
-        updateNotification("Connected to PC ($clientIp) • 60 FPS")
+        updateNotification(buildConnectedNotificationText(clientIp, initialActiveState))
 
         var inputStream: DataInputStream? = null
         var outputStream: OutputStream? = null
@@ -607,13 +627,19 @@ class CamCraftStreamService : Service() {
                         fps = cmd.fps,
                         bitrateKbps = cmd.bitrateKbps,
                     )
-                    current.copy(
+                    val nextState = current.copy(
                         cameraId = cmd.cameraId,
                         width = cmd.width,
                         height = cmd.height,
                         fps = cmd.fps,
                         bitrateKbps = cmd.bitrateKbps,
                     )
+                    val clientIp = activeClientSocket?.inetAddress?.hostAddress
+                        ?: _serviceState.value.clientAddress
+                    if (!clientIp.isNullOrBlank()) {
+                        updateNotification(buildConnectedNotificationText(clientIp, nextState))
+                    }
+                    nextState
                 }
                 is ControlCmd.SetCameraParams -> {
                     cmd.zoomRatio?.let { cameraStreamManager?.setZoomRatio(it) }
@@ -621,7 +647,7 @@ class CamCraftStreamService : Service() {
                     cmd.torchOn?.let { cameraStreamManager?.setTorch(it) }
                     cmd.autofocus?.let { cameraStreamManager?.setAutoFocus(it) }
 
-                    current.copy(
+                    val nextState = current.copy(
                         zoomRatio = cmd.zoomRatio ?: current.zoomRatio,
                         exposureEv = cmd.exposureEv ?: current.exposureEv,
                         autofocus = cmd.autofocus ?: current.autofocus,
@@ -629,6 +655,11 @@ class CamCraftStreamService : Service() {
                         mirrorHorizontal = cmd.mirrorHorizontal ?: current.mirrorHorizontal,
                         rotationDeg = cmd.rotationDeg ?: current.rotationDeg,
                     )
+                    activeTransformFlags = computeTransformFlags(
+                        mirrorHorizontal = nextState.mirrorHorizontal,
+                        rotationDeg = nextState.rotationDeg,
+                    )
+                    nextState
                 }
                 is ControlCmd.SetAudioState -> {
                     if (cmd.enabled) {
@@ -827,7 +858,7 @@ class CamCraftStreamService : Service() {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("CamCraft Active")
             .setContentText(contentText)
-            .setSmallIcon(android.R.drawable.ic_menu_camera)
+            .setSmallIcon(R.drawable.ic_stat_camcraft)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
             .build()
@@ -892,6 +923,28 @@ class CamCraftStreamService : Service() {
             pendingPreviewView = null
             activeInstance?.cameraStreamManager?.detachPreviewView()
         }
+
+        fun focusAtPoint(point: MeteringPoint) {
+            activeInstance?.cameraStreamManager?.focusAtPoint(point)
+        }
+
+        /**
+         * Computes CCFT `VIDEO_FRAME` header transform flags matching `docs/PROTOCOL.md` §4.
+         */
+        fun computeTransformFlags(mirrorHorizontal: Boolean, rotationDeg: Int): Int {
+            val rotationFlag = CcftFlags.flagsForRotation(rotationDeg)
+            val mirrorFlag = if (mirrorHorizontal) CcftFlags.MIRROR_H else CcftFlags.NONE
+            return rotationFlag or mirrorFlag
+        }
+
+        /**
+         * Builds the foreground notification text when connected to a PC client.
+         */
+        fun buildConnectedNotificationText(
+            clientIp: String,
+            activeState: ActiveCameraState,
+        ): String =
+            "Connected ($clientIp) • ${activeState.width}x${activeState.height} @ ${activeState.fps} FPS"
 
         fun switchCamera() {
             activeInstance?.switchCameraFromUi()

@@ -31,3 +31,6 @@ Thumbs.db
 *.tmp
 *.bak
 *~
+
+# Kotlin compiler session data
+android/.kotlin/

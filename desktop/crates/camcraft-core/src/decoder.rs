@@ -8,11 +8,12 @@
 //! - Drops stale non-keyframes on backpressure to prevent latency accumulation.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use camcraft_protocol::FrameFlags;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 use ffmpeg_next::codec::flag::Flags as CodecFlags;
 use ffmpeg_next::format::Pixel;
@@ -327,6 +328,123 @@ impl DecodedFrameRef<'_> {
     }
 }
 
+/// Configuration options for [`H264Decoder`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecoderOptions {
+    /// Whether legacy [`H264Decoder::decode_frame`] / [`H264Decoder::decode_frame_with`]
+    /// should also convert every decoded frame to full-resolution RGBA.
+    pub enable_rgba: bool,
+    /// Number of FFmpeg slice decoding threads (clamped to `1..=4`).
+    pub thread_count: usize,
+    /// Enables `AV_CODEC_FLAG2_FAST` on the FFmpeg codec context to skip non-essential
+    /// post-processing on low-power hosts.
+    pub fast_decode: bool,
+}
+
+impl Default for DecoderOptions {
+    fn default() -> Self {
+        Self {
+            enable_rgba: false,
+            thread_count: 2,
+            fast_decode: true,
+        }
+    }
+}
+
+/// Geometric mirror and clockwise rotation transform applied to decoded YUV420P frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VideoTransform {
+    /// Mirror pixels horizontally before applying rotation (matches GUI UV transform order).
+    pub mirror_horizontal: bool,
+    /// Clockwise rotation in degrees (`0`, `90`, `180`, or `270`).
+    pub rotation_deg: u16,
+}
+
+impl VideoTransform {
+    /// Returns `true` if neither horizontal mirroring nor non-zero rotation is requested.
+    #[inline]
+    #[must_use]
+    pub const fn is_identity(self) -> bool {
+        !self.mirror_horizontal && self.rotation_deg.is_multiple_of(360)
+    }
+
+    /// Extracts [`VideoTransform`] from CCFT [`FrameFlags`].
+    #[inline]
+    #[must_use]
+    pub const fn from_flags(flags: FrameFlags) -> Self {
+        Self {
+            mirror_horizontal: flags.is_mirrored_h(),
+            rotation_deg: flags.rotation_degrees(),
+        }
+    }
+}
+
+/// Runtime-adjustable controls for lazy GUI preview generation.
+#[derive(Debug, Clone)]
+pub struct PreviewRuntimeControl {
+    /// Whether preview RGBA generation is currently active.
+    pub enabled: Arc<AtomicBool>,
+    /// Maximum width in pixels for downscaled preview frames (`0` keeps full width).
+    pub max_width: Arc<AtomicU32>,
+    /// Minimum interval between queued preview frames in milliseconds.
+    pub min_interval_ms: Arc<AtomicU32>,
+}
+
+impl PreviewRuntimeControl {
+    /// Creates a new [`PreviewRuntimeControl`] backed by shared atomic values.
+    #[must_use]
+    pub fn new(enabled: bool, max_width: u32, min_interval_ms: u32) -> Self {
+        Self {
+            enabled: Arc::new(AtomicBool::new(enabled)),
+            max_width: Arc::new(AtomicU32::new(max_width)),
+            min_interval_ms: Arc::new(AtomicU32::new(min_interval_ms)),
+        }
+    }
+}
+
+impl Default for PreviewRuntimeControl {
+    fn default() -> Self {
+        Self::new(
+            true,
+            DEFAULT_PREVIEW_MAX_WIDTH,
+            PREVIEW_MIN_INTERVAL.as_millis() as u32,
+        )
+    }
+}
+
+/// Configuration options for [`spawn_decoder_worker_optimized`].
+#[derive(Clone, Default)]
+pub struct LowLatencyWorkerOptions {
+    /// Bounded channel for delivering downscaled RGBA [`PreviewFrame`]s to the GUI.
+    pub preview_tx: Option<Sender<PreviewFrame>>,
+    /// Optional return channel yielding spent RGBA buffers from the GUI for zero-allocation reuse.
+    pub preview_recycle_rx: Option<Receiver<Vec<u8>>>,
+    /// Shared runtime atomics controlling preview enablement, resolution cap, and cadence.
+    pub preview_ctrl: PreviewRuntimeControl,
+    /// Optional notification callback invoked right after a [`PreviewFrame`] is queued.
+    pub on_preview_pushed: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Optional callback invoked when the decoder recovery tracker requests an IDR keyframe.
+    pub on_keyframe_request: Option<Arc<dyn Fn(KeyframeRequestReason) + Send + Sync>>,
+    /// FFmpeg H.264 decoder tuning options.
+    pub decoder_options: DecoderOptions,
+}
+
+impl std::fmt::Debug for LowLatencyWorkerOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LowLatencyWorkerOptions")
+            .field("has_preview_tx", &self.preview_tx.is_some())
+            .field("has_preview_recycle_rx", &self.preview_recycle_rx.is_some())
+            .field("preview_ctrl", &self.preview_ctrl)
+            .field("has_on_preview_pushed", &self.on_preview_pushed.is_some())
+            .field(
+                "has_on_keyframe_request",
+                &self.on_keyframe_request.is_some(),
+            )
+            .field("decoder_options", &self.decoder_options)
+            .finish()
+    }
+}
+
 /// Commands dispatched to the dedicated video decoder worker thread.
 #[derive(Debug)]
 pub enum DecoderCommand {
@@ -337,6 +455,7 @@ pub enum DecoderCommand {
         seq: u64,
         pts_us: u64,
         is_keyframe: bool,
+        flags: FrameFlags,
         data: Bytes,
     },
     /// Flush decoder buffers.
@@ -378,6 +497,14 @@ impl FrameConverter {
     }
 
     fn extract_yuv420p(&mut self, raw: &VideoFrame) -> Result<(u32, u32, &[u8]), DecoderError> {
+        self.extract_yuv420p_transformed(raw, VideoTransform::default())
+    }
+
+    fn extract_yuv420p_transformed(
+        &mut self,
+        raw: &VideoFrame,
+        transform: VideoTransform,
+    ) -> Result<(u32, u32, &[u8]), DecoderError> {
         let width = raw.width();
         let height = raw.height();
         let format = raw.format();
@@ -389,8 +516,8 @@ impl FrameConverter {
         }
 
         // YUV420P and YUVJ420P share identical planar 4:2:0 memory layout; avoid libswscale copy.
-        if matches!(format, Pixel::YUV420P | Pixel::YUVJ420P) {
-            copy_contiguous_yuv420p(raw, width, height, &mut self.yuv_scratch);
+        let (out_w, out_h) = if matches!(format, Pixel::YUV420P | Pixel::YUVJ420P) {
+            copy_transformed_yuv420p(raw, width, height, transform, &mut self.yuv_scratch)
         } else {
             let (scaler, _rebuilt) = get_or_init_scaler(
                 &mut self.yuv_scaler,
@@ -405,17 +532,24 @@ impl FrameConverter {
                 .ctx
                 .run(raw, &mut scaler.dst_frame)
                 .map_err(DecoderError::Ffmpeg)?;
-            copy_contiguous_yuv420p(&scaler.dst_frame, width, height, &mut self.yuv_scratch);
-        }
+            copy_transformed_yuv420p(
+                &scaler.dst_frame,
+                width,
+                height,
+                transform,
+                &mut self.yuv_scratch,
+            )
+        };
 
-        Ok((width, height, self.yuv_scratch.as_slice()))
+        Ok((out_w, out_h, self.yuv_scratch.as_slice()))
     }
 
-    fn convert_preview_rgba(
+    fn convert_preview_rgba_into(
         &mut self,
         raw: &VideoFrame,
         max_width: u32,
-    ) -> Result<(u32, u32, &[u8]), DecoderError> {
+        dst: &mut Vec<u8>,
+    ) -> Result<(u32, u32), DecoderError> {
         let width = raw.width();
         let height = raw.height();
         let format = raw.format();
@@ -441,7 +575,19 @@ impl FrameConverter {
             .ctx
             .run(raw, &mut scaler.dst_frame)
             .map_err(DecoderError::Ffmpeg)?;
-        copy_contiguous_rgba(&scaler.dst_frame, dst_w, dst_h, &mut self.rgba_scratch);
+        copy_contiguous_rgba(&scaler.dst_frame, dst_w, dst_h, dst);
+        Ok((dst_w, dst_h))
+    }
+
+    fn convert_preview_rgba(
+        &mut self,
+        raw: &VideoFrame,
+        max_width: u32,
+    ) -> Result<(u32, u32, &[u8]), DecoderError> {
+        let mut scratch = std::mem::take(&mut self.rgba_scratch);
+        let res = self.convert_preview_rgba_into(raw, max_width, &mut scratch);
+        self.rgba_scratch = scratch;
+        let (dst_w, dst_h) = res?;
         Ok((dst_w, dst_h, self.rgba_scratch.as_slice()))
     }
 
@@ -543,8 +689,17 @@ pub struct H264Decoder {
 }
 
 impl H264Decoder {
-    /// Creates and configures a new low-delay H.264 video decoder.
+    /// Creates and configures a new low-delay H.264 video decoder with default
+    /// thread count (`2`) and fast decode flags.
     pub fn new(enable_rgba: bool) -> Result<Self, DecoderError> {
+        Self::with_options(DecoderOptions {
+            enable_rgba,
+            ..DecoderOptions::default()
+        })
+    }
+
+    /// Creates and configures a new low-delay H.264 video decoder with explicit [`DecoderOptions`].
+    pub fn with_options(opts: DecoderOptions) -> Result<Self, DecoderError> {
         ffmpeg_next::init().map_err(DecoderError::Ffmpeg)?;
 
         let codec = ffmpeg_next::codec::decoder::find(ffmpeg_next::codec::Id::H264)
@@ -554,10 +709,21 @@ impl H264Decoder {
         // Set low-delay flag to disable frame reordering buffering for real-time streaming
         context.set_flags(CodecFlags::LOW_DELAY);
 
-        // Configure slice threading for parallel slice decoding without introducing frame latency
+        if opts.fast_decode {
+            // SAFETY: `context` wraps an initialized `AVCodecContext` created by
+            // `new_with_codec` before opening the decoder; mutating `flags2` in place is valid.
+            unsafe {
+                let ptr = context.as_mut_ptr();
+                if !ptr.is_null() {
+                    (*ptr).flags2 |= ffmpeg_next::ffi::AV_CODEC_FLAG2_FAST;
+                }
+            }
+        }
+
+        // Configure bounded slice threading for parallel slice decoding without introducing frame latency
         context.set_threading(ffmpeg_next::codec::threading::Config {
             kind: ffmpeg_next::codec::threading::Type::Slice,
-            count: 0, // Auto-detect CPU core count
+            count: opts.thread_count.clamp(1, 4),
         });
 
         let decoder = context.decoder().video().map_err(DecoderError::Ffmpeg)?;
@@ -566,7 +732,7 @@ impl H264Decoder {
 
         Ok(Self {
             decoder,
-            converter: FrameConverter::new(enable_rgba),
+            converter: FrameConverter::new(opts.enable_rgba),
             raw_frame: VideoFrame::empty(),
             cached_config: Vec::new(),
             pending_config: false,
@@ -704,12 +870,44 @@ impl H264Decoder {
         pts_us: u64,
         is_keyframe: bool,
         data: &[u8],
+        on_yuv: FYuv,
+        preview_max_width: impl FnMut() -> Option<u32>,
+        on_preview: FPreview,
+    ) -> Result<(), DecoderError>
+    where
+        FYuv: FnMut(u32, u32, &[u8], f32),
+        FPreview: FnMut(PreviewFrame),
+    {
+        self.decode_yuv_transformed_and_optional_preview(
+            pts_us,
+            is_keyframe,
+            VideoTransform::default(),
+            data,
+            on_yuv,
+            preview_max_width,
+            Vec::new,
+            on_preview,
+        )
+    }
+
+    /// Decodes a `VIDEO_FRAME`, applies `transform` when packing contiguous `YUV420P` for V4L2,
+    /// and builds a raw downscaled RGBA [`PreviewFrame`] using a buffer supplied by `take_preview_buf`
+    /// only when `preview_max_width()` returns `Some(max_width)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_yuv_transformed_and_optional_preview<FYuv, FBuf, FPreview>(
+        &mut self,
+        pts_us: u64,
+        is_keyframe: bool,
+        transform: VideoTransform,
+        data: &[u8],
         mut on_yuv: FYuv,
         mut preview_max_width: impl FnMut() -> Option<u32>,
+        mut take_preview_buf: FBuf,
         mut on_preview: FPreview,
     ) -> Result<(), DecoderError>
     where
         FYuv: FnMut(u32, u32, &[u8], f32),
+        FBuf: FnMut() -> Vec<u8>,
         FPreview: FnMut(PreviewFrame),
     {
         if data.is_empty() {
@@ -724,21 +922,25 @@ impl H264Decoder {
                 Ok(()) => {
                     self.validate_decoded_raw_frame(pts_us, is_keyframe)?;
                     let decode_time_ms = decode_start.elapsed().as_secs_f32() * 1000.0;
-                    let (width, height, yuv_slice) =
-                        self.converter.extract_yuv420p(&self.raw_frame)?;
-                    on_yuv(width, height, yuv_slice, decode_time_ms);
+                    let (out_w, out_h, yuv_slice) = self
+                        .converter
+                        .extract_yuv420p_transformed(&self.raw_frame, transform)?;
+                    on_yuv(out_w, out_h, yuv_slice, decode_time_ms);
 
                     if let Some(max_width) = preview_max_width() {
-                        let (preview_width, preview_height, rgba_slice) = self
+                        let source_width = self.raw_frame.width();
+                        let source_height = self.raw_frame.height();
+                        let mut rgba_buf = take_preview_buf();
+                        let (preview_width, preview_height) = self
                             .converter
-                            .convert_preview_rgba(&self.raw_frame, max_width)?;
+                            .convert_preview_rgba_into(&self.raw_frame, max_width, &mut rgba_buf)?;
                         on_preview(PreviewFrame {
-                            source_width: width,
-                            source_height: height,
+                            source_width,
+                            source_height,
                             preview_width,
                             preview_height,
                             decode_time_ms,
-                            rgba: rgba_slice.to_vec(),
+                            rgba: rgba_buf,
                         });
                     }
                 }
@@ -826,6 +1028,22 @@ impl H264Decoder {
     }
 }
 
+#[inline]
+fn copy_plane_contiguous(src: &[u8], stride: usize, row_bytes: usize, rows: usize, dst: &mut [u8]) {
+    if row_bytes == 0 || rows == 0 {
+        return;
+    }
+    if stride == row_bytes {
+        let total = row_bytes * rows;
+        dst[..total].copy_from_slice(&src[..total]);
+    } else {
+        for (row, dst_row) in dst.chunks_exact_mut(row_bytes).take(rows).enumerate() {
+            let start = row * stride;
+            dst_row.copy_from_slice(&src[start..start + row_bytes]);
+        }
+    }
+}
+
 /// Copies plane data line-by-line into `dst` to ensure contiguous YUV420P memory layout
 /// without alignment padding, reusing `dst`'s allocation across frames.
 pub fn copy_contiguous_yuv420p(frame: &VideoFrame, width: u32, height: u32, dst: &mut Vec<u8>) {
@@ -833,46 +1051,156 @@ pub fn copy_contiguous_yuv420p(frame: &VideoFrame, width: u32, height: u32, dst:
     let h = height as usize;
     let half_w = w / 2;
     let half_h = h / 2;
-    let total_bytes = w * h + 2 * (half_w * half_h);
+    let y_len = w * h;
+    let uv_len = half_w * half_h;
+    let total_bytes = y_len + 2 * uv_len;
 
-    dst.clear();
-    dst.reserve(total_bytes);
-
-    // Plane 0: Y
-    let y_data = frame.data(0);
-    let y_stride = frame.stride(0);
-    if y_stride == w {
-        dst.extend_from_slice(&y_data[..w * h]);
-    } else {
-        for row in 0..h {
-            let start = row * y_stride;
-            dst.extend_from_slice(&y_data[start..start + w]);
-        }
+    dst.resize(total_bytes, 0);
+    if total_bytes == 0 {
+        return;
     }
 
-    // Plane 1: U (Cb)
-    let u_data = frame.data(1);
-    let u_stride = frame.stride(1);
-    if u_stride == half_w {
-        dst.extend_from_slice(&u_data[..half_w * half_h]);
-    } else {
-        for row in 0..half_h {
-            let start = row * u_stride;
-            dst.extend_from_slice(&u_data[start..start + half_w]);
-        }
+    let (dst_y, dst_uv) = dst.split_at_mut(y_len);
+    let (dst_u, dst_v) = dst_uv.split_at_mut(uv_len);
+
+    copy_plane_contiguous(frame.data(0), frame.stride(0), w, h, dst_y);
+    copy_plane_contiguous(frame.data(1), frame.stride(1), half_w, half_h, dst_u);
+    copy_plane_contiguous(frame.data(2), frame.stride(2), half_w, half_h, dst_v);
+}
+
+#[inline]
+fn transform_plane_bytes(
+    src: &[u8],
+    stride: usize,
+    w: usize,
+    h: usize,
+    mirror_horizontal: bool,
+    rotation_deg: u16,
+    dst: &mut [u8],
+) {
+    if w == 0 || h == 0 {
+        return;
     }
 
-    // Plane 2: V (Cr)
-    let v_data = frame.data(2);
-    let v_stride = frame.stride(2);
-    if v_stride == half_w {
-        dst.extend_from_slice(&v_data[..half_w * half_h]);
-    } else {
-        for row in 0..half_h {
-            let start = row * v_stride;
-            dst.extend_from_slice(&v_data[start..start + half_w]);
+    match rotation_deg % 360 {
+        90 => {
+            for dy in 0..w {
+                let sx = if mirror_horizontal { w - 1 - dy } else { dy };
+                let dst_row = &mut dst[dy * h..(dy + 1) * h];
+                for (dx, px) in dst_row.iter_mut().enumerate() {
+                    let sy = h - 1 - dx;
+                    *px = src[sy * stride + sx];
+                }
+            }
+        }
+        180 => {
+            for row in 0..h {
+                let src_row = &src[row * stride..row * stride + w];
+                let dst_y = h - 1 - row;
+                let dst_row = &mut dst[dst_y * w..(dst_y + 1) * w];
+                dst_row.copy_from_slice(src_row);
+                if !mirror_horizontal {
+                    dst_row.reverse();
+                }
+            }
+        }
+        270 => {
+            for dy in 0..w {
+                let sx = if mirror_horizontal { dy } else { w - 1 - dy };
+                let dst_row = &mut dst[dy * h..(dy + 1) * h];
+                for (dx, px) in dst_row.iter_mut().enumerate() {
+                    *px = src[dx * stride + sx];
+                }
+            }
+        }
+        _ => {
+            // 0 deg (with mirror_horizontal == true; identity fast-paths before here)
+            for row in 0..h {
+                let src_row = &src[row * stride..row * stride + w];
+                let dst_row = &mut dst[row * w..(row + 1) * w];
+                dst_row.copy_from_slice(src_row);
+                if mirror_horizontal {
+                    dst_row.reverse();
+                }
+            }
         }
     }
+}
+
+/// Copies and transforms a planar YUV420P [`VideoFrame`] into contiguous `YU12` layout in `dst`,
+/// applying `mirror_horizontal` before clockwise rotation (`0°`/`90°`/`180°`/`270°`) to match
+/// the desktop GPU preview 1:1. Returns the transformed `(out_width, out_height)`.
+pub fn copy_transformed_yuv420p(
+    frame: &VideoFrame,
+    width: u32,
+    height: u32,
+    transform: VideoTransform,
+    dst: &mut Vec<u8>,
+) -> (u32, u32) {
+    if transform.is_identity() {
+        copy_contiguous_yuv420p(frame, width, height, dst);
+        return (width, height);
+    }
+
+    let rot = transform.rotation_deg % 360;
+    let swapped = rot == 90 || rot == 270;
+    let (out_w_u32, out_h_u32) = if swapped {
+        (height, width)
+    } else {
+        (width, height)
+    };
+
+    let w = width as usize;
+    let h = height as usize;
+    let half_w = w / 2;
+    let half_h = h / 2;
+
+    let out_w = out_w_u32 as usize;
+    let out_h = out_h_u32 as usize;
+    let half_out_w = out_w / 2;
+    let half_out_h = out_h / 2;
+
+    let y_len = out_w * out_h;
+    let uv_len = half_out_w * half_out_h;
+    let total_bytes = y_len + 2 * uv_len;
+
+    dst.resize(total_bytes, 0);
+    if total_bytes == 0 {
+        return (out_w_u32, out_h_u32);
+    }
+
+    let (dst_y, dst_uv) = dst.split_at_mut(y_len);
+    let (dst_u, dst_v) = dst_uv.split_at_mut(uv_len);
+
+    transform_plane_bytes(
+        frame.data(0),
+        frame.stride(0),
+        w,
+        h,
+        transform.mirror_horizontal,
+        rot,
+        dst_y,
+    );
+    transform_plane_bytes(
+        frame.data(1),
+        frame.stride(1),
+        half_w,
+        half_h,
+        transform.mirror_horizontal,
+        rot,
+        dst_u,
+    );
+    transform_plane_bytes(
+        frame.data(2),
+        frame.stride(2),
+        half_w,
+        half_h,
+        transform.mirror_horizontal,
+        rot,
+        dst_v,
+    );
+
+    (out_w_u32, out_h_u32)
 }
 
 /// Copies plane data line-by-line to ensure contiguous YUV420P memory layout without alignment padding.
@@ -890,19 +1218,12 @@ pub fn copy_contiguous_rgba(frame: &VideoFrame, width: u32, height: u32, dst: &m
     let bytes_per_line = w * 4;
     let total_bytes = bytes_per_line * h;
 
-    dst.clear();
-    dst.reserve(total_bytes);
-
-    let data = frame.data(0);
-    let stride = frame.stride(0);
-    if stride == bytes_per_line {
-        dst.extend_from_slice(&data[..total_bytes]);
-    } else {
-        for row in 0..h {
-            let start = row * stride;
-            dst.extend_from_slice(&data[start..start + bytes_per_line]);
-        }
+    dst.resize(total_bytes, 0);
+    if total_bytes == 0 {
+        return;
     }
+
+    copy_plane_contiguous(frame.data(0), frame.stride(0), bytes_per_line, h, dst);
 }
 
 /// Copies RGBA data line-by-line to ensure contiguous memory layout.
@@ -1053,11 +1374,25 @@ impl DecoderSender {
         is_keyframe: bool,
         data: Bytes,
     ) -> Result<bool, DecoderError> {
+        let flags = FrameFlags::empty().with_keyframe(is_keyframe);
+        self.push_frame_with_flags(pts_us, flags, data)
+    }
+
+    /// Pushes a `VIDEO_FRAME` packet carrying full CCFT [`FrameFlags`] (including keyframe,
+    /// mirror, and rotation metadata) with smart backpressure handling.
+    pub fn push_frame_with_flags(
+        &self,
+        pts_us: u64,
+        flags: FrameFlags,
+        data: Bytes,
+    ) -> Result<bool, DecoderError> {
+        let is_keyframe = flags.is_keyframe();
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let cmd = DecoderCommand::Frame {
             seq,
             pts_us,
             is_keyframe,
+            flags,
             data,
         };
 
@@ -1166,10 +1501,9 @@ enum WorkerOutputMode {
         enable_rgba: bool,
     },
     LowLatency {
-        preview_tx: Option<Sender<PreviewFrame>>,
-        preview_enabled: Arc<AtomicBool>,
-        preview_max_width: u32,
+        opts: LowLatencyWorkerOptions,
         last_preview_sent: Option<Instant>,
+        local_spare_buf: Option<Vec<u8>>,
     },
 }
 
@@ -1182,6 +1516,11 @@ pub fn spawn_decoder_worker_with_recovery(
     running: Arc<AtomicBool>,
     keyframe_req_tx: Option<Sender<KeyframeRequestReason>>,
 ) -> std::io::Result<JoinHandle<Result<(), DecoderError>>> {
+    let on_keyframe_request = keyframe_req_tx.map(|tx| {
+        Arc::new(move |reason| {
+            let _ = tx.try_send(reason);
+        }) as Arc<dyn Fn(KeyframeRequestReason) + Send + Sync>
+    });
     spawn_decoder_worker_inner(
         cmd_rx,
         sink,
@@ -1190,7 +1529,7 @@ pub fn spawn_decoder_worker_with_recovery(
             enable_rgba,
         },
         running,
-        keyframe_req_tx,
+        on_keyframe_request,
     )
 }
 
@@ -1205,17 +1544,51 @@ pub fn spawn_decoder_worker_low_latency(
     running: Arc<AtomicBool>,
     keyframe_req_tx: Option<Sender<KeyframeRequestReason>>,
 ) -> std::io::Result<JoinHandle<Result<(), DecoderError>>> {
+    let on_keyframe_request = keyframe_req_tx.map(|tx| {
+        Arc::new(move |reason| {
+            let _ = tx.try_send(reason);
+        }) as Arc<dyn Fn(KeyframeRequestReason) + Send + Sync>
+    });
+    let preview_ctrl = PreviewRuntimeControl {
+        enabled: preview_enabled,
+        max_width: Arc::new(AtomicU32::new(preview_max_width)),
+        min_interval_ms: Arc::new(AtomicU32::new(PREVIEW_MIN_INTERVAL.as_millis() as u32)),
+    };
+    spawn_decoder_worker_optimized(
+        cmd_rx,
+        sink,
+        LowLatencyWorkerOptions {
+            preview_tx,
+            preview_recycle_rx: None,
+            preview_ctrl,
+            on_preview_pushed: None,
+            on_keyframe_request,
+            decoder_options: DecoderOptions::default(),
+        },
+        running,
+    )
+}
+
+/// Spawns an optimized V4L2-first low-latency decoder worker (`camcraft-vdec`) with support for
+/// runtime preview throttling, zero-allocation RGBA buffer recycling, direct callbacks,
+/// in-pipeline YUV420P mirror/rotation transforms, and FFmpeg tuning via [`LowLatencyWorkerOptions`].
+pub fn spawn_decoder_worker_optimized(
+    cmd_rx: Receiver<DecoderCommand>,
+    sink: Option<Box<dyn VirtualCameraSink>>,
+    mut opts: LowLatencyWorkerOptions,
+    running: Arc<AtomicBool>,
+) -> std::io::Result<JoinHandle<Result<(), DecoderError>>> {
+    let on_keyframe_request = opts.on_keyframe_request.take();
     spawn_decoder_worker_inner(
         cmd_rx,
         sink,
         WorkerOutputMode::LowLatency {
-            preview_tx,
-            preview_enabled,
-            preview_max_width,
+            opts,
             last_preview_sent: None,
+            local_spare_buf: None,
         },
         running,
-        keyframe_req_tx,
+        on_keyframe_request,
     )
 }
 
@@ -1224,20 +1597,20 @@ fn spawn_decoder_worker_inner(
     mut sink: Option<Box<dyn VirtualCameraSink>>,
     mut output_mode: WorkerOutputMode,
     running: Arc<AtomicBool>,
-    keyframe_req_tx: Option<Sender<KeyframeRequestReason>>,
+    on_keyframe_request: Option<Arc<dyn Fn(KeyframeRequestReason) + Send + Sync>>,
 ) -> std::io::Result<JoinHandle<Result<(), DecoderError>>> {
     std::thread::Builder::new()
         .name("camcraft-vdec".to_string())
         .spawn(move || {
             info!("Dedicated video decoder thread started (camcraft-vdec)");
-            let init_rgba = matches!(
-                output_mode,
-                WorkerOutputMode::Legacy {
-                    enable_rgba: true,
-                    ..
-                }
-            );
-            let mut decoder = H264Decoder::new(init_rgba)?;
+            let decoder_opts = match &output_mode {
+                WorkerOutputMode::Legacy { enable_rgba, .. } => DecoderOptions {
+                    enable_rgba: *enable_rgba,
+                    ..DecoderOptions::default()
+                },
+                WorkerOutputMode::LowLatency { opts, .. } => opts.decoder_options,
+            };
+            let mut decoder = H264Decoder::with_options(decoder_opts)?;
             let mut tracker = KeyframeRecoveryTracker::default();
             let mut last_frame_seq: Option<u64> = None;
             let mut in_standby = false;
@@ -1249,8 +1622,8 @@ fn spawn_decoder_worker_inner(
             let mut standby_buf_dims: (u32, u32) = (0, 0);
 
             let emit_keyframe_req = |reason: Option<KeyframeRequestReason>| {
-                if let (Some(r), Some(tx)) = (reason, keyframe_req_tx.as_ref()) {
-                    let _ = tx.try_send(r);
+                if let (Some(r), Some(cb)) = (reason, on_keyframe_request.as_ref()) {
+                    cb(r);
                 }
             };
 
@@ -1293,6 +1666,7 @@ fn spawn_decoder_worker_inner(
                         seq,
                         pts_us,
                         is_keyframe,
+                        flags,
                         data,
                     } => {
                         let now = Instant::now();
@@ -1326,25 +1700,33 @@ fn spawn_decoder_worker_inner(
                                 })
                             }
                             WorkerOutputMode::LowLatency {
-                                preview_tx,
-                                preview_enabled,
-                                preview_max_width,
+                                opts,
                                 last_preview_sent,
+                                local_spare_buf,
                             } => {
-                                let has_vcam = sink.is_some();
                                 let preview_channel_ready =
-                                    preview_enabled.load(Ordering::Relaxed)
-                                        && preview_tx.as_ref().is_some_and(|tx| !tx.is_full());
-                                let interval_elapsed = !has_vcam
+                                    opts.preview_ctrl.enabled.load(Ordering::Relaxed)
+                                        && opts.preview_tx.as_ref().is_some_and(|tx| !tx.is_full());
+                                let min_interval = Duration::from_millis(u64::from(
+                                    opts.preview_ctrl.min_interval_ms.load(Ordering::Relaxed),
+                                ));
+                                let interval_elapsed = min_interval.is_zero()
                                     || last_preview_sent
-                                        .is_none_or(|t| t.elapsed() >= PREVIEW_MIN_INTERVAL);
+                                        .is_none_or(|t| t.elapsed() >= min_interval);
                                 let want_preview = preview_channel_ready && interval_elapsed;
 
-                                let preview_limit = want_preview.then_some(*preview_max_width);
+                                let preview_limit = want_preview
+                                    .then(|| opts.preview_ctrl.max_width.load(Ordering::Relaxed));
+                                let transform = VideoTransform::from_flags(flags);
+                                let recycle_rx = opts.preview_recycle_rx.as_ref();
+                                let preview_tx = opts.preview_tx.as_ref();
+                                let on_preview_pushed = opts.on_preview_pushed.as_ref();
+                                let spare_cell = std::cell::Cell::new(local_spare_buf.take());
 
-                                decoder.decode_yuv_and_optional_preview(
+                                let res = decoder.decode_yuv_transformed_and_optional_preview(
                                     pts_us,
                                     is_keyframe,
+                                    transform,
                                     &data,
                                     |width, height, yuv420p, _decode_time_ms| {
                                         decoded_count += 1;
@@ -1361,13 +1743,31 @@ fn spawn_decoder_worker_inner(
                                         }
                                     },
                                     || preview_limit,
+                                    || {
+                                        recycle_rx
+                                            .and_then(|rx| rx.try_recv().ok())
+                                            .or_else(|| spare_cell.take())
+                                            .unwrap_or_default()
+                                    },
                                     |preview| {
-                                        *last_preview_sent = Some(Instant::now());
-                                        if let Some(tx) = preview_tx.as_ref() {
-                                            let _ = tx.try_send(preview);
+                                        if let Some(tx) = preview_tx {
+                                            match tx.try_send(preview) {
+                                                Ok(()) => {
+                                                    *last_preview_sent = Some(Instant::now());
+                                                    if let Some(cb) = on_preview_pushed {
+                                                        cb();
+                                                    }
+                                                }
+                                                Err(TrySendError::Full(rejected)) => {
+                                                    spare_cell.set(Some(rejected.rgba));
+                                                }
+                                                Err(TrySendError::Disconnected(_)) => {}
+                                            }
                                         }
                                     },
-                                )
+                                );
+                                *local_spare_buf = spare_cell.into_inner();
+                                res
                             }
                         };
 
@@ -1859,5 +2259,219 @@ mod tests {
             dec.converter.yuv_scaler.is_none(),
             "YUV420P/YUVJ420P should pack directly without libswscale YUV conversion"
         );
+    }
+
+    #[test]
+    fn video_transform_from_flags_and_identity() {
+        assert!(VideoTransform::default().is_identity());
+        assert!(VideoTransform::from_flags(FrameFlags::NONE).is_identity());
+        assert!(VideoTransform::from_flags(FrameFlags::KEYFRAME).is_identity());
+
+        let t_mirror = VideoTransform::from_flags(FrameFlags::KEYFRAME | FrameFlags::MIRROR_H);
+        assert_eq!(
+            t_mirror,
+            VideoTransform {
+                mirror_horizontal: true,
+                rotation_deg: 0,
+            }
+        );
+        assert!(!t_mirror.is_identity());
+
+        let t_rot90 = VideoTransform::from_flags(FrameFlags::ROTATE_90);
+        assert_eq!(
+            t_rot90,
+            VideoTransform {
+                mirror_horizontal: false,
+                rotation_deg: 90,
+            }
+        );
+        assert!(!t_rot90.is_identity());
+
+        let t_both = VideoTransform::from_flags(FrameFlags::MIRROR_H | FrameFlags::ROTATE_270);
+        assert_eq!(
+            t_both,
+            VideoTransform {
+                mirror_horizontal: true,
+                rotation_deg: 270,
+            }
+        );
+        assert!(!t_both.is_identity());
+    }
+
+    #[test]
+    fn h264_decoder_with_options_clamps_threads_and_decodes_fast() {
+        for (thread_count, fast_decode) in [(0, true), (2, true), (16, false)] {
+            let mut dec = H264Decoder::with_options(DecoderOptions {
+                enable_rgba: false,
+                thread_count,
+                fast_decode,
+            })
+            .expect("H264Decoder::with_options should init");
+            dec.decode_config(0, SPS_PPS_64X64).unwrap();
+            let frames = dec.decode_frame(1_000, true, IDR_64X64_RED).unwrap();
+            assert_eq!(frames.len(), 1);
+            assert_eq!((frames[0].width, frames[0].height), (64, 64));
+        }
+    }
+
+    #[test]
+    fn copy_transformed_yuv420p_exact_pixels_for_all_transforms() {
+        let mut frame = VideoFrame::new(Pixel::YUV420P, 8, 4);
+
+        let y_stride = frame.stride(0);
+        for row in 0..4 {
+            let dst_row = &mut frame.data_mut(0)[row * y_stride..row * y_stride + 8];
+            for (col, px) in dst_row.iter_mut().enumerate() {
+                *px = (row * 8 + col + 1) as u8;
+            }
+        }
+        let u_stride = frame.stride(1);
+        for row in 0..2 {
+            let dst_row = &mut frame.data_mut(1)[row * u_stride..row * u_stride + 4];
+            for (col, px) in dst_row.iter_mut().enumerate() {
+                *px = (101 + row * 4 + col) as u8;
+            }
+        }
+        let v_stride = frame.stride(2);
+        for row in 0..2 {
+            let dst_row = &mut frame.data_mut(2)[row * v_stride..row * v_stride + 4];
+            for (col, px) in dst_row.iter_mut().enumerate() {
+                *px = (201 + row * 4 + col) as u8;
+            }
+        }
+
+        let mut dst = Vec::new();
+
+        // 1. Identity
+        let dims_id = copy_transformed_yuv420p(&frame, 8, 4, VideoTransform::default(), &mut dst);
+        assert_eq!(dims_id, (8, 4));
+        let expected_id: Vec<u8> = (1..=32).chain(101..=108).chain(201..=208).collect();
+        assert_eq!(dst, expected_id);
+
+        // 2. Mirror horizontal
+        let dims_mh = copy_transformed_yuv420p(
+            &frame,
+            8,
+            4,
+            VideoTransform {
+                mirror_horizontal: true,
+                rotation_deg: 0,
+            },
+            &mut dst,
+        );
+        assert_eq!(dims_mh, (8, 4));
+        let expected_mh: Vec<u8> = [
+            8, 7, 6, 5, 4, 3, 2, 1, 16, 15, 14, 13, 12, 11, 10, 9, 24, 23, 22, 21, 20, 19, 18, 17,
+            32, 31, 30, 29, 28, 27, 26, 25, // Y (8x4)
+            104, 103, 102, 101, 108, 107, 106, 105, // U (4x2)
+            204, 203, 202, 201, 208, 207, 206, 205, // V (4x2)
+        ]
+        .to_vec();
+        assert_eq!(dst, expected_mh);
+
+        // 3. Rotate 90 clockwise
+        let dims_r90 = copy_transformed_yuv420p(
+            &frame,
+            8,
+            4,
+            VideoTransform {
+                mirror_horizontal: false,
+                rotation_deg: 90,
+            },
+            &mut dst,
+        );
+        assert_eq!(dims_r90, (4, 8));
+        let expected_r90: Vec<u8> = [
+            25, 17, 9, 1, 26, 18, 10, 2, 27, 19, 11, 3, 28, 20, 12, 4, 29, 21, 13, 5, 30, 22, 14,
+            6, 31, 23, 15, 7, 32, 24, 16, 8, // Y (4x8)
+            105, 101, 106, 102, 107, 103, 108, 104, // U (2x4)
+            205, 201, 206, 202, 207, 203, 208, 204, // V (2x4)
+        ]
+        .to_vec();
+        assert_eq!(dst, expected_r90);
+
+        // 4. Rotate 180
+        let dims_r180 = copy_transformed_yuv420p(
+            &frame,
+            8,
+            4,
+            VideoTransform {
+                mirror_horizontal: false,
+                rotation_deg: 180,
+            },
+            &mut dst,
+        );
+        assert_eq!(dims_r180, (8, 4));
+        let expected_r180: Vec<u8> = (1..=32)
+            .rev()
+            .chain((101..=108).rev())
+            .chain((201..=208).rev())
+            .collect();
+        assert_eq!(dst, expected_r180);
+
+        // 5. Rotate 270 clockwise
+        let dims_r270 = copy_transformed_yuv420p(
+            &frame,
+            8,
+            4,
+            VideoTransform {
+                mirror_horizontal: false,
+                rotation_deg: 270,
+            },
+            &mut dst,
+        );
+        assert_eq!(dims_r270, (4, 8));
+        let expected_r270: Vec<u8> = [
+            8, 16, 24, 32, 7, 15, 23, 31, 6, 14, 22, 30, 5, 13, 21, 29, 4, 12, 20, 28, 3, 11, 19,
+            27, 2, 10, 18, 26, 1, 9, 17, 25, // Y (4x8)
+            104, 108, 103, 107, 102, 106, 101, 105, // U (2x4)
+            204, 208, 203, 207, 202, 206, 201, 205, // V (2x4)
+        ]
+        .to_vec();
+        assert_eq!(dst, expected_r270);
+
+        // 6. Mirror horizontal + Rotate 90 clockwise (mirror applied first)
+        let dims_mh_r90 = copy_transformed_yuv420p(
+            &frame,
+            8,
+            4,
+            VideoTransform {
+                mirror_horizontal: true,
+                rotation_deg: 90,
+            },
+            &mut dst,
+        );
+        assert_eq!(dims_mh_r90, (4, 8));
+        let expected_mh_r90: Vec<u8> = [
+            32, 24, 16, 8, 31, 23, 15, 7, 30, 22, 14, 6, 29, 21, 13, 5, 28, 20, 12, 4, 27, 19, 11,
+            3, 26, 18, 10, 2, 25, 17, 9, 1, // Y (4x8)
+            108, 104, 107, 103, 106, 102, 105, 101, // U (2x4)
+            208, 204, 207, 203, 206, 202, 205, 201, // V (2x4)
+        ]
+        .to_vec();
+        assert_eq!(dst, expected_mh_r90);
+
+        // 7. Mirror horizontal + Rotate 180 (vertical flip)
+        let dims_mh_r180 = copy_transformed_yuv420p(
+            &frame,
+            8,
+            4,
+            VideoTransform {
+                mirror_horizontal: true,
+                rotation_deg: 180,
+            },
+            &mut dst,
+        );
+        assert_eq!(dims_mh_r180, (8, 4));
+        let expected_mh_r180: Vec<u8> = (25..=32)
+            .chain(17..=24)
+            .chain(9..=16)
+            .chain(1..=8)
+            .chain(105..=108)
+            .chain(101..=104)
+            .chain(205..=208)
+            .chain(201..=204)
+            .collect();
+        assert_eq!(dst, expected_mh_r180);
     }
 }

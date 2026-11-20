@@ -113,13 +113,27 @@ pub struct DnsRecord {
 pub struct MdnsScanner {
     stop_flag: Arc<AtomicBool>,
     trigger_flag: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl MdnsScanner {
     /// Opens an mDNS UDP socket, joins multicast groups on active IPv4 interfaces,
-    /// and starts the `camcraft-mdns` background scanner thread.
+    /// and starts the `camcraft-mdns` background scanner thread, forwarding events
+    /// to `event_tx`.
     pub fn start(event_tx: Sender<DiscoveryEvent>) -> Result<Self, DiscoveryError> {
+        Self::start_with_handler(move |ev| {
+            let _ = event_tx.send(ev);
+        })
+    }
+
+    /// Opens an mDNS UDP socket, joins multicast groups on active IPv4 interfaces,
+    /// and starts the `camcraft-mdns` background scanner thread, invoking `on_event`
+    /// directly on the scanner thread for each [`DiscoveryEvent`].
+    pub fn start_with_handler<F>(on_event: F) -> Result<Self, DiscoveryError>
+    where
+        F: FnMut(DiscoveryEvent) + Send + 'static,
+    {
         let (socket, bound_to_mdns_port) = open_mdns_socket()?;
         let qu_socket = if bound_to_mdns_port {
             open_qu_socket()
@@ -128,9 +142,11 @@ impl MdnsScanner {
         };
         let stop_flag = Arc::new(AtomicBool::new(false));
         let trigger_flag = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
 
         let stop_c = stop_flag.clone();
         let trigger_c = trigger_flag.clone();
+        let paused_c = paused.clone();
 
         let handle = std::thread::Builder::new()
             .name("camcraft-mdns".to_owned())
@@ -139,17 +155,33 @@ impl MdnsScanner {
                     socket,
                     qu_socket,
                     bound_to_mdns_port,
-                    event_tx,
+                    on_event,
                     stop_c,
                     trigger_c,
+                    paused_c,
                 );
             })?;
 
         Ok(Self {
             stop_flag,
             trigger_flag,
+            paused,
             handle: Some(handle),
         })
+    }
+
+    /// Pauses or resumes periodic active mDNS multicast queries and interface membership syncs.
+    ///
+    /// Explicit [`Self::trigger_scan`] bursts, TTL eviction checks, and passive mDNS listening
+    /// continue operating while paused.
+    pub fn set_active_queries_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Release);
+    }
+
+    /// Returns `true` if periodic active mDNS queries are currently paused.
+    #[must_use]
+    pub fn is_active_queries_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
     }
 
     /// Schedules an immediate active mDNS scan burst.
@@ -308,14 +340,16 @@ impl ScannerSockets<'_> {
     }
 }
 
-fn process_incoming_packet(
+fn process_incoming_packet<F>(
     packet: &[u8],
     src_addr: SocketAddr,
     cache: &mut DiscoveryCache,
-    event_tx: &Sender<DiscoveryEvent>,
+    on_event: &mut F,
     sockets: &ScannerSockets<'_>,
     active_ifaces: &[Ipv4Addr],
-) -> bool {
+) where
+    F: FnMut(DiscoveryEvent),
+{
     let src_ip = match src_addr {
         SocketAddr::V4(v4) => Some(*v4.ip()),
         SocketAddr::V6(_) => None,
@@ -324,9 +358,7 @@ fn process_incoming_packet(
         Ok(records) if !records.is_empty() => {
             let outcome = cache.ingest(&records, src_ip, Instant::now());
             for ev in outcome.events {
-                if event_tx.send(ev).is_err() {
-                    return false;
-                }
+                on_event(ev);
             }
             for (qname, qtype) in outcome.follow_up_queries {
                 sockets.send_query(active_ifaces, &qname, qtype, sockets.qu.is_some());
@@ -337,17 +369,19 @@ fn process_incoming_packet(
             trace!(error = %e, bytes = packet.len(), "Ignoring malformed mDNS packet");
         }
     }
-    true
 }
 
-fn run_scanner_loop(
+fn run_scanner_loop<F>(
     socket: UdpSocket,
     qu_socket: Option<UdpSocket>,
     bound_to_mdns_port: bool,
-    event_tx: Sender<DiscoveryEvent>,
+    mut on_event: F,
     stop_flag: Arc<AtomicBool>,
     trigger_flag: Arc<AtomicBool>,
-) {
+    paused_flag: Arc<AtomicBool>,
+) where
+    F: FnMut(DiscoveryEvent),
+{
     let sockets = ScannerSockets {
         primary: &socket,
         qu: qu_socket.as_ref(),
@@ -372,18 +406,18 @@ fn run_scanner_loop(
             sockets.send_query(&active_ifaces, MDNS_SERVICE_TYPE, QTYPE_PTR, true);
             next_query_at = now + PERIODIC_QUERY_INTERVAL;
             initial_stage = 3;
-        } else if now >= next_query_at {
+        } else if !paused_flag.load(Ordering::Acquire) && now >= next_query_at {
             active_ifaces = sync_multicast_memberships(&socket, &mut joined_ifaces);
             let is_initial = initial_stage < 3;
             sockets.send_query(&active_ifaces, MDNS_SERVICE_TYPE, QTYPE_PTR, is_initial);
             match initial_stage {
                 0 => {
                     initial_stage = 1;
-                    next_query_at = start + Duration::from_secs(1);
+                    next_query_at = now + Duration::from_secs(1);
                 }
                 1 => {
                     initial_stage = 2;
-                    next_query_at = start + Duration::from_secs(3);
+                    next_query_at = now + Duration::from_secs(2);
                 }
                 _ => {
                     initial_stage = 3;
@@ -395,9 +429,7 @@ fn run_scanner_loop(
         if now.saturating_duration_since(last_evict_check) >= EVICTION_CHECK_INTERVAL {
             last_evict_check = now;
             for ev in cache.evict_expired(now) {
-                if event_tx.send(ev).is_err() {
-                    return;
-                }
+                on_event(ev);
             }
         }
 
@@ -405,16 +437,14 @@ fn run_scanner_loop(
             loop {
                 match qu.recv_from(&mut buf) {
                     Ok((len, src_addr)) => {
-                        if !process_incoming_packet(
+                        process_incoming_packet(
                             &buf[..len],
                             src_addr,
                             &mut cache,
-                            &event_tx,
+                            &mut on_event,
                             &sockets,
                             &active_ifaces,
-                        ) {
-                            return;
-                        }
+                        );
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(e) => {
@@ -427,16 +457,14 @@ fn run_scanner_loop(
 
         match socket.recv_from(&mut buf) {
             Ok((len, src_addr)) => {
-                if !process_incoming_packet(
+                process_incoming_packet(
                     &buf[..len],
                     src_addr,
                     &mut cache,
-                    &event_tx,
+                    &mut on_event,
                     &sockets,
                     &active_ifaces,
-                ) {
-                    return;
-                }
+                );
             }
             Err(e)
                 if matches!(
@@ -1216,13 +1244,10 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn parse_mdns_response_parses_full_ptr_srv_txt_a_with_cache_flush_bit() {
+    fn build_sample_announcement_packet(instance_name: &str, host_name: &str) -> Vec<u8> {
         let mut pkt = build_response_header(0, 1, 0, 3);
-        let instance_name = "Pixel 8 Pro._camcraft._tcp.local.";
-        let host_name = "pixel-8-pro.local.";
 
-        // Answer: PTR _camcraft._tcp.local. -> Pixel 8 Pro._camcraft._tcp.local.
+        // Answer: PTR _camcraft._tcp.local. -> <instance_name>
         let service_offset = pkt.len();
         encode_dns_name_raw(MDNS_SERVICE_TYPE, &mut pkt);
         let mut ptr_rdata = Vec::new();
@@ -1231,8 +1256,11 @@ mod tests {
 
         // Additional 1: SRV with cache-flush bit (0x8001) & compression pointer to service type
         let instance_offset = pkt.len();
-        pkt.push(11);
-        pkt.extend_from_slice(b"Pixel 8 Pro");
+        let label = instance_name
+            .strip_suffix("._camcraft._tcp.local.")
+            .unwrap_or("Pixel 8 Pro");
+        pkt.push(label.len() as u8);
+        pkt.extend_from_slice(label.as_bytes());
         pkt.extend_from_slice(&(0xC000u16 | service_offset as u16).to_be_bytes());
         let mut srv_rdata = Vec::new();
         srv_rdata.extend_from_slice(&0u16.to_be_bytes());
@@ -1258,6 +1286,15 @@ mod tests {
         // Additional 3: A record
         encode_dns_name_raw(host_name, &mut pkt);
         push_rr_header(&mut pkt, QTYPE_A, 0x8001, 120, &[192, 168, 1, 42]);
+
+        pkt
+    }
+
+    #[test]
+    fn parse_mdns_response_parses_full_ptr_srv_txt_a_with_cache_flush_bit() {
+        let instance_name = "Pixel 8 Pro._camcraft._tcp.local.";
+        let host_name = "pixel-8-pro.local.";
+        let pkt = build_sample_announcement_packet(instance_name, host_name);
 
         let records = parse_mdns_response(&pkt).expect("parse response");
         assert_eq!(records.len(), 4);
@@ -1581,5 +1618,79 @@ mod tests {
             }
             Err(e) => panic!("unexpected discovery error: {e}"),
         }
+    }
+
+    #[test]
+    fn mdns_scanner_set_active_queries_paused_toggles_state() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        match MdnsScanner::start_with_handler(move |ev| {
+            let _ = tx.send(ev);
+        }) {
+            Ok(mut scanner) => {
+                assert!(!scanner.is_active_queries_paused());
+                scanner.set_active_queries_paused(true);
+                assert!(scanner.is_active_queries_paused());
+                scanner.trigger_scan();
+                std::thread::sleep(Duration::from_millis(30));
+                scanner.set_active_queries_paused(false);
+                assert!(!scanner.is_active_queries_paused());
+                scanner.stop();
+            }
+            Err(DiscoveryError::Io(_)) => {}
+            Err(e) => panic!("unexpected discovery error: {e}"),
+        }
+    }
+
+    #[test]
+    fn mdns_scanner_start_with_handler_delivers_passive_packets_while_paused() {
+        let Ok(socket) = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)) else {
+            return;
+        };
+        socket
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let target_addr = socket.local_addr().unwrap();
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let trigger_flag = Arc::new(AtomicBool::new(false));
+        let paused_flag = Arc::new(AtomicBool::new(true));
+
+        let (ev_tx, ev_rx) = crossbeam_channel::unbounded();
+        let stop_c = stop_flag.clone();
+        let trigger_c = trigger_flag.clone();
+        let paused_c = paused_flag.clone();
+
+        let handle = std::thread::spawn(move || {
+            run_scanner_loop(
+                socket,
+                None,
+                false,
+                move |ev| {
+                    let _ = ev_tx.send(ev);
+                },
+                stop_c,
+                trigger_c,
+                paused_c,
+            );
+        });
+
+        let pkt = build_sample_announcement_packet(
+            "Pixel 8 Pro._camcraft._tcp.local.",
+            "pixel-8-pro.local.",
+        );
+        let sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        sender.send_to(&pkt, target_addr).unwrap();
+
+        let ev = ev_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("passive mDNS packet should still invoke on_event while paused");
+        assert!(matches!(
+            ev,
+            DiscoveryEvent::Found(ref dev)
+                if dev.device_name == "Pixel 8 Pro" && dev.port == 9876
+        ));
+
+        stop_flag.store(true, Ordering::Release);
+        handle.join().unwrap();
     }
 }

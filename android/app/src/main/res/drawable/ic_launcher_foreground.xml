@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Outer machined camera housing ring -->
+    <path
+        android:fillColor="#161A22"
+        android:pathData="M54,54m-28,0a28,28 0,1 1,56 0a28,28 0,1 1,-56 0"
+        android:strokeWidth="3"
+        android:strokeColor="#F8FAFC" />
+
+    <!-- Precision electric blue optical ring -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M54,54m-20,0a20,20 0,1 1,40 0a20,20 0,1 1,-40 0"
+        android:strokeWidth="2.5"
+        android:strokeColor="#3B82F6" />
+
+    <!-- Minimalist 6-blade aperture facets -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M54,34 L63,46 M71,44 L63,59 M71,64 L54,64 M54,74 L45,62 M37,64 L45,49 M37,44 L54,44"
+        android:strokeWidth="2"
+        android:strokeColor="#3B82F6"
+        android:strokeLineCap="round" />
+
+    <!-- Inner glass iris core -->
+    <path
+        android:fillColor="#3B82F6"
+        android:pathData="M54,54m-7.5,0a7.5,7.5 0,1 1,15 0a7.5,7.5 0,1 1,-15 0" />
+    <path
+        android:fillColor="#F8FAFC"
+        android:pathData="M51,51m-2.2,0a2.2,2.2 0,1 1,4.4 0a2.2,2.2 0,1 1,-4.4 0" />
+
+    <!-- Studio LIVE tally dot -->
+    <path
+        android:fillColor="#10B981"
+        android:pathData="M71.5,36.5m-3.2,0a3.2,3.2 0,1 1,6.4 0a3.2,3.2 0,1 1,-6.4 0" />
+</vector>

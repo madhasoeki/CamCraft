@@ -3,9 +3,11 @@ package org.artcraft.camcraft.ui
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
+import android.provider.Settings
 import android.view.WindowManager
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -47,6 +49,9 @@ import java.util.Locale
 import kotlinx.coroutines.delay
 import org.artcraft.camcraft.network.StreamConnectionStatus
 import org.artcraft.camcraft.network.StreamServiceState
+import org.artcraft.camcraft.ui.theme.ArtCraftColors
+import org.artcraft.camcraft.ui.theme.CamCraftTheme
+import org.artcraft.camcraft.ui.theme.TabularMonoStyle
 
 /**
  * Pure JVM helper encapsulating anti-burn-in waypoint motion, brightness target,
@@ -102,6 +107,15 @@ object OledSaverMotion {
         StreamConnectionStatus.STOPPED,
         -> "Double-tap anywhere to wake"
     }
+
+    fun formatDetailLine(state: StreamServiceState, batterySummary: String?): String {
+        val base = formatDetailLine(state)
+        return if (batterySummary.isNullOrBlank()) {
+            base
+        } else {
+            "$base • $batterySummary"
+        }
+    }
 }
 
 private tailrec fun Context.findActivity(): Activity? = when (this) {
@@ -115,19 +129,30 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
  *
  * Drops window `screenBrightness` to [OledSaverMotion.OLED_SAVER_BRIGHTNESS] (`0.01f`),
  * hides system bars to avoid static icon burn-in, shifts a minimal low-luminance status
- * indicator every 30 seconds across the display, and exits on any double-tap or Back press.
+ * indicator every 30 seconds across the display (snapping immediately when reduced motion
+ * is enabled), and exits on any double-tap or Back press.
  */
 @Composable
 fun OledSaverOverlay(
     state: StreamServiceState,
     onExit: () -> Unit,
     modifier: Modifier = Modifier,
+    telemetry: DeviceTelemetry? = null,
 ) {
     BackHandler(onBack = onExit)
 
     val context = LocalContext.current
     val view = LocalView.current
     val activity = remember(context) { context.findActivity() }
+    val reduceMotion = remember(context) {
+        runCatching {
+            Settings.Global.getFloat(
+                context.contentResolver,
+                Settings.Global.ANIMATOR_DURATION_SCALE,
+                1f,
+            ) == 0f
+        }.getOrDefault(false)
+    }
 
     DisposableEffect(activity, view) {
         val window = activity?.window
@@ -175,17 +200,18 @@ fun OledSaverOverlay(
     val (targetBiasX, targetBiasY) = OledSaverMotion.biasForStep(positionStep)
     val animatedBiasX by animateFloatAsState(
         targetValue = targetBiasX,
-        animationSpec = tween(durationMillis = 1_400),
+        animationSpec = if (reduceMotion) snap() else tween(durationMillis = 1_400),
         label = "oledBiasX",
     )
     val animatedBiasY by animateFloatAsState(
         targetValue = targetBiasY,
-        animationSpec = tween(durationMillis = 1_400),
+        animationSpec = if (reduceMotion) snap() else tween(durationMillis = 1_400),
         label = "oledBiasY",
     )
 
+    val batterySummary = remember(telemetry) { telemetry?.let(::formatBatterySummary) }
     val statusLine = OledSaverMotion.formatStatusLine(state)
-    val detailLine = OledSaverMotion.formatDetailLine(state)
+    val detailLine = OledSaverMotion.formatDetailLine(state, batterySummary)
     val dotColor = when (state.status) {
         StreamConnectionStatus.CONNECTED -> ArtCraftColors.StatusEmerald.copy(alpha = 0.35f)
         StreamConnectionStatus.LISTENING -> ArtCraftColors.StatusAmber.copy(alpha = 0.35f)
@@ -205,7 +231,7 @@ fun OledSaverOverlay(
             }
             .semantics(mergeDescendants = true) {
                 contentDescription =
-                    "OLED Battery Saver active. $statusLine. Double-tap anywhere to wake."
+                    "OLED Battery Saver active. $statusLine. $detailLine."
             },
     ) {
         Box(
@@ -233,7 +259,7 @@ fun OledSaverOverlay(
                         color = Color.White.copy(alpha = 0.28f),
                         fontWeight = FontWeight.Light,
                         fontSize = 13.sp,
-                        fontFamily = FontFamily.Monospace,
+                        style = TabularMonoStyle,
                     )
                 }
                 Text(
@@ -241,6 +267,7 @@ fun OledSaverOverlay(
                     color = Color.White.copy(alpha = 0.16f),
                     fontWeight = FontWeight.Light,
                     fontSize = 11.sp,
+                    fontFamily = FontFamily.SansSerif,
                 )
             }
         }
@@ -258,6 +285,11 @@ fun OledSaverOverlayPreview() {
                 localIpAddress = "192.168.1.42",
             ),
             onExit = {},
+            telemetry = DeviceTelemetry(
+                batteryPct = 84,
+                temperatureC = 34.0f,
+                isCharging = true,
+            ),
         )
     }
 }

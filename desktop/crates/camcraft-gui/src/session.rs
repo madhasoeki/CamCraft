@@ -1,11 +1,11 @@
-//! Background networking, ADB forwarding, H.264 decoding, and V4L2 session manager
-//! for `camcraft-gui`.
+//! Lean background networking, ADB forwarding, H.264 decoding, and V4L2/PipeWire
+//! session supervisor for `camcraft-gui`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use camcraft_core::AudioOutputSink;
 use camcraft_core::adb;
@@ -13,8 +13,9 @@ use camcraft_core::client::{
     self, ClientConfig, ClientError, ClientEvent, ClientSender, ReconnectConfig, StreamStats,
 };
 use camcraft_core::decoder::{
-    DEFAULT_PREVIEW_MAX_WIDTH, DecoderSender, KEYFRAME_REQUEST_COOLDOWN, KeyframeRequestReason,
-    LIVE_DECODER_QUEUE_CAPACITY, PreviewFrame, spawn_decoder_worker_low_latency,
+    DecoderOptions, DecoderSender, KEYFRAME_REQUEST_COOLDOWN, KeyframeRequestReason,
+    LIVE_DECODER_QUEUE_CAPACITY, LowLatencyWorkerOptions, PreviewFrame, PreviewRuntimeControl,
+    spawn_decoder_worker_optimized,
 };
 use camcraft_core::discovery::{DiscoveryEvent, MdnsScanner};
 use camcraft_core::vcam::{V4l2LoopbackSink, VirtualCameraSink, find_camcraft_v4l2_device};
@@ -27,6 +28,8 @@ use crossbeam_channel::{Receiver, Sender};
 use eframe::egui;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
+
+const AUDIO_METER_REPAINT_MIN_INTERVAL: Duration = Duration::from_millis(66);
 
 /// Transport mode used for the current or pending connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +44,57 @@ impl ConnectionMode {
         match self {
             Self::Usb => "USB",
             Self::Wifi => "Wi-Fi",
+        }
+    }
+}
+
+/// Laptop CPU/GPU preview scaling & cadence preset (does not affect `/dev/video*` output).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PerformanceProfile {
+    Eco,
+    #[default]
+    Balanced,
+    Crisp,
+}
+
+impl PerformanceProfile {
+    /// Short UI label for the profile.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Eco => "Eco",
+            Self::Balanced => "Balanced",
+            Self::Crisp => "Crisp",
+        }
+    }
+
+    /// Preview maximum width in pixels.
+    #[must_use]
+    pub const fn max_width(self) -> u32 {
+        match self {
+            Self::Eco => 480,
+            Self::Balanced => 640,
+            Self::Crisp => 960,
+        }
+    }
+
+    /// Minimum interval between preview frame uploads in milliseconds.
+    #[must_use]
+    pub const fn min_interval_ms(self) -> u32 {
+        match self {
+            Self::Eco => 66,
+            Self::Balanced => 42,
+            Self::Crisp => 33,
+        }
+    }
+
+    /// Concise human-readable description for tooltips and inspector hints.
+    #[must_use]
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Eco => "480p • ~15 FPS preview (lowest CPU/GPU)",
+            Self::Balanced => "640p • ~24 FPS preview (balanced)",
+            Self::Crisp => "960p • ~30 FPS preview (sharpest)",
         }
     }
 }
@@ -106,28 +160,40 @@ pub struct GuiSession {
     cmd_tx: mpsc::UnboundedSender<GuiCommand>,
     update_rx: Receiver<GuiUpdate>,
     frame_rx: Receiver<PreviewFrame>,
+    preview_recycle_tx: Sender<Vec<u8>>,
     audio_level_rx: Receiver<AudioLevelMetrics>,
-    preview_enabled: Arc<AtomicBool>,
+    preview_ctrl: PreviewRuntimeControl,
+    user_preview_enabled: AtomicBool,
+    window_hidden: AtomicBool,
+    audio_meter_active: Arc<AtomicBool>,
     _runtime_thread: Option<JoinHandle<()>>,
 }
 
 impl GuiSession {
-    /// Spawns the background Tokio runtime thread and initializes communication channels.
+    /// Spawns the single-threaded background Tokio runtime and initializes communication channels.
     #[must_use]
     pub fn start(ctx: egui::Context) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<GuiCommand>();
         let (update_tx, update_rx) = crossbeam_channel::unbounded::<GuiUpdate>();
         let (frame_tx, frame_rx) = crossbeam_channel::bounded::<PreviewFrame>(1);
+        let (preview_recycle_tx, preview_recycle_rx) = crossbeam_channel::bounded::<Vec<u8>>(2);
         let (audio_level_tx, audio_level_rx) = crossbeam_channel::bounded::<AudioLevelMetrics>(4);
-        let preview_enabled = Arc::new(AtomicBool::new(true));
-        let preview_enabled_rt = preview_enabled.clone();
+
+        let default_profile = PerformanceProfile::default();
+        let preview_ctrl = PreviewRuntimeControl::new(
+            true,
+            default_profile.max_width(),
+            default_profile.min_interval_ms(),
+        );
+        let preview_ctrl_rt = preview_ctrl.clone();
+        let audio_meter_active = Arc::new(AtomicBool::new(false));
+        let audio_meter_active_rt = audio_meter_active.clone();
 
         let runtime_thread = std::thread::Builder::new()
             .name("camcraft-gui-rt".to_owned())
             .spawn(move || {
-                let rt = match tokio::runtime::Builder::new_multi_thread()
+                let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
-                    .worker_threads(2)
                     .build()
                 {
                     Ok(rt) => rt,
@@ -144,8 +210,10 @@ impl GuiSession {
                     cmd_rx,
                     update_tx,
                     frame_tx,
-                    preview_enabled_rt,
+                    preview_recycle_rx,
+                    preview_ctrl_rt,
                     audio_level_tx,
+                    audio_meter_active_rt,
                     ctx,
                 ));
             })
@@ -155,17 +223,78 @@ impl GuiSession {
             cmd_tx,
             update_rx,
             frame_rx,
+            preview_recycle_tx,
             audio_level_rx,
-            preview_enabled,
+            preview_ctrl,
+            user_preview_enabled: AtomicBool::new(true),
+            window_hidden: AtomicBool::new(false),
+            audio_meter_active,
             _runtime_thread: runtime_thread,
         }
     }
 
+    /// Updates the live preview scaling width and upload cadence without restarting the decoder.
+    pub fn set_performance_profile(&self, profile: PerformanceProfile) {
+        self.preview_ctrl
+            .max_width
+            .store(profile.max_width(), Ordering::Relaxed);
+        self.preview_ctrl
+            .min_interval_ms
+            .store(profile.min_interval_ms(), Ordering::Relaxed);
+    }
+
     /// Enables or pauses downscaled RGBA GUI preview generation without affecting `/dev/video*`.
     pub fn set_preview_enabled(&self, enabled: bool) {
-        self.preview_enabled.store(enabled, Ordering::Relaxed);
-        if !enabled {
-            while self.frame_rx.try_recv().is_ok() {}
+        self.user_preview_enabled.store(enabled, Ordering::Relaxed);
+        self.sync_effective_preview();
+    }
+
+    /// Temporarily suppresses decoder preview output while the window is minimized without
+    /// altering the user's explicit preview preference, restoring it when un-minimized.
+    pub fn set_window_hidden(&self, hidden: bool) {
+        let prev = self.window_hidden.swap(hidden, Ordering::Relaxed);
+        if prev != hidden {
+            self.sync_effective_preview();
+        }
+    }
+
+    /// Returns whether decoder preview output is currently active.
+    #[cfg(test)]
+    #[must_use]
+    pub fn is_effective_preview_enabled(&self) -> bool {
+        self.preview_ctrl.enabled.load(Ordering::Relaxed)
+    }
+
+    /// Returns the user's explicit preview toggle preference (unaffected by minimization).
+    #[cfg(test)]
+    #[must_use]
+    pub fn is_user_preview_enabled(&self) -> bool {
+        self.user_preview_enabled.load(Ordering::Relaxed)
+    }
+
+    fn sync_effective_preview(&self) {
+        let effective = self.user_preview_enabled.load(Ordering::Relaxed)
+            && !self.window_hidden.load(Ordering::Relaxed);
+        self.preview_ctrl
+            .enabled
+            .store(effective, Ordering::Relaxed);
+        if !effective {
+            while let Ok(frame) = self.frame_rx.try_recv() {
+                self.recycle_frame_buffer(frame.rgba);
+            }
+        }
+    }
+
+    /// Marks whether the Audio VU meter is currently visible and unmuted on screen.
+    pub fn set_audio_meter_active(&self, active: bool) {
+        self.audio_meter_active.store(active, Ordering::Relaxed);
+    }
+
+    /// Returns a spent preview RGBA buffer to the decoder worker for zero-allocation reuse.
+    pub fn recycle_frame_buffer(&self, mut buf: Vec<u8>) {
+        if buf.capacity() > 0 {
+            buf.clear();
+            let _ = self.preview_recycle_tx.try_send(buf);
         }
     }
 
@@ -185,12 +314,15 @@ impl GuiSession {
         updates
     }
 
-    /// Drains the preview frame channel and returns only the newest downscaled preview frame.
+    /// Drains the preview frame channel and returns only the newest downscaled preview frame,
+    /// recycling any superseded frames immediately.
     #[must_use]
     pub fn take_latest_frame(&self) -> Option<PreviewFrame> {
-        let mut latest = None;
+        let mut latest: Option<PreviewFrame> = None;
         while let Ok(frame) = self.frame_rx.try_recv() {
-            latest = Some(frame);
+            if let Some(superseded) = latest.replace(frame) {
+                self.recycle_frame_buffer(superseded.rgba);
+            }
         }
         latest
     }
@@ -220,7 +352,6 @@ struct ActiveConnection {
     audio_running: Arc<AtomicBool>,
     audio_tx: AudioWorkerSender,
     audio_thread: Option<JoinHandle<()>>,
-    kf_bridge_thread: Option<JoinHandle<()>>,
     client_task: tokio::task::JoinHandle<()>,
     sender: Option<ClientSender>,
     last_keyframe_req: Option<Instant>,
@@ -240,44 +371,33 @@ impl ActiveConnection {
         if let Some(handle) = self.audio_thread.take() {
             let _ = handle.join();
         }
-        if let Some(handle) = self.kf_bridge_thread.take() {
-            let _ = handle.join();
-        }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_session_supervisor(
     mut cmd_rx: mpsc::UnboundedReceiver<GuiCommand>,
     update_tx: Sender<GuiUpdate>,
     frame_tx: Sender<PreviewFrame>,
-    preview_enabled: Arc<AtomicBool>,
+    preview_recycle_rx: Receiver<Vec<u8>>,
+    preview_ctrl: PreviewRuntimeControl,
     audio_level_tx: Sender<AudioLevelMetrics>,
+    audio_meter_active: Arc<AtomicBool>,
     ctx: egui::Context,
 ) {
     let mut active: Option<ActiveConnection> = None;
     let (internal_tx, mut internal_rx) = mpsc::channel::<InternalEvent>(64);
 
-    let (mdns_tx, mdns_rx) = crossbeam_channel::unbounded::<DiscoveryEvent>();
-    let mut scanner = match MdnsScanner::start(mdns_tx) {
+    let update_tx_mdns = update_tx.clone();
+    let ctx_mdns = ctx.clone();
+    let mut scanner = match MdnsScanner::start_with_handler(move |ev| {
+        emit(&update_tx_mdns, &ctx_mdns, GuiUpdate::Discovery(ev));
+    }) {
         Ok(s) => Some(s),
         Err(e) => {
             warn!(error = %e, "Failed to start mDNS Wi-Fi discovery scanner");
             None
         }
-    };
-    let mdns_bridge = if scanner.is_some() {
-        let update_tx_mdns = update_tx.clone();
-        let ctx_mdns = ctx.clone();
-        std::thread::Builder::new()
-            .name("camcraft-gui-mdns".to_owned())
-            .spawn(move || {
-                while let Ok(ev) = mdns_rx.recv() {
-                    emit(&update_tx_mdns, &ctx_mdns, GuiUpdate::Discovery(ev));
-                }
-            })
-            .ok()
-    } else {
-        None
     };
 
     loop {
@@ -290,6 +410,9 @@ async fn run_session_supervisor(
                     GuiCommand::ConnectUsb { port, vcam_device, auto_reconnect } => {
                         if let Some(conn) = active.take() {
                             conn.stop();
+                        }
+                        if let Some(ref s) = scanner {
+                            s.set_active_queries_paused(false);
                         }
                         let endpoint = format!("127.0.0.1:{port}");
                         emit(&update_tx, &ctx, GuiUpdate::Connecting {
@@ -304,8 +427,10 @@ async fn run_session_supervisor(
                         let channels = SessionChannels {
                             update_tx: &update_tx,
                             frame_tx: &frame_tx,
-                            preview_enabled: &preview_enabled,
+                            preview_recycle_rx: &preview_recycle_rx,
+                            preview_ctrl: &preview_ctrl,
                             audio_level_tx: &audio_level_tx,
+                            audio_meter_active: &audio_meter_active,
                             internal_tx: &internal_tx,
                             ctx: &ctx,
                         };
@@ -334,6 +459,9 @@ async fn run_session_supervisor(
                         if let Some(conn) = active.take() {
                             conn.stop();
                         }
+                        if let Some(ref s) = scanner {
+                            s.set_active_queries_paused(false);
+                        }
                         let normalized = normalize_endpoint(&endpoint);
                         emit(&update_tx, &ctx, GuiUpdate::Connecting {
                             mode: ConnectionMode::Wifi,
@@ -342,8 +470,10 @@ async fn run_session_supervisor(
                         let channels = SessionChannels {
                             update_tx: &update_tx,
                             frame_tx: &frame_tx,
-                            preview_enabled: &preview_enabled,
+                            preview_recycle_rx: &preview_recycle_rx,
+                            preview_ctrl: &preview_ctrl,
                             audio_level_tx: &audio_level_tx,
+                            audio_meter_active: &audio_meter_active,
                             internal_tx: &internal_tx,
                             ctx: &ctx,
                         };
@@ -365,6 +495,9 @@ async fn run_session_supervisor(
                         if let Some(conn) = active.take() {
                             conn.stop();
                             emit(&update_tx, &ctx, GuiUpdate::Disconnected("Disconnected by user".to_owned()));
+                        }
+                        if let Some(ref s) = scanner {
+                            s.set_active_queries_paused(false);
                         }
                         emit(&update_tx, &ctx, GuiUpdate::VcamStatus {
                             path: String::new(),
@@ -427,6 +560,9 @@ async fn run_session_supervisor(
                         if let Some(ref mut conn) = active {
                             conn.sender = Some(sender);
                         }
+                        if let Some(ref s) = scanner {
+                            s.set_active_queries_paused(true);
+                        }
                     }
                     InternalEvent::ConnectionLost => {
                         if let Some(ref mut conn) = active {
@@ -457,6 +593,9 @@ async fn run_session_supervisor(
                         if let Some(conn) = active.take() {
                             conn.stop();
                         }
+                        if let Some(ref s) = scanner {
+                            s.set_active_queries_paused(false);
+                        }
                     }
                 }
             }
@@ -468,9 +607,6 @@ async fn run_session_supervisor(
     }
     if let Some(mut s) = scanner.take() {
         s.stop();
-    }
-    if let Some(handle) = mdns_bridge {
-        let _ = handle.join();
     }
 }
 
@@ -484,8 +620,10 @@ enum InternalEvent {
 struct SessionChannels<'a> {
     update_tx: &'a Sender<GuiUpdate>,
     frame_tx: &'a Sender<PreviewFrame>,
-    preview_enabled: &'a Arc<AtomicBool>,
+    preview_recycle_rx: &'a Receiver<Vec<u8>>,
+    preview_ctrl: &'a PreviewRuntimeControl,
     audio_level_tx: &'a Sender<AudioLevelMetrics>,
+    audio_meter_active: &'a Arc<AtomicBool>,
     internal_tx: &'a mpsc::Sender<InternalEvent>,
     ctx: &'a egui::Context,
 }
@@ -500,10 +638,13 @@ fn start_connection(
 ) -> Option<ActiveConnection> {
     let update_tx = channels.update_tx;
     let frame_tx = channels.frame_tx;
-    let preview_enabled = channels.preview_enabled;
+    let preview_recycle_rx = channels.preview_recycle_rx;
+    let preview_ctrl = channels.preview_ctrl;
     let audio_level_tx = channels.audio_level_tx;
+    let audio_meter_active = channels.audio_meter_active;
     let internal_tx = channels.internal_tx;
     let ctx = channels.ctx;
+
     let shutdown = Arc::new(AtomicBool::new(false));
     let decoder_running = Arc::new(AtomicBool::new(true));
     let (decoder_tx, decoder_rx) = DecoderSender::new_with_capacity(LIVE_DECODER_QUEUE_CAPACITY);
@@ -551,31 +692,27 @@ fn start_connection(
     };
     let vcam_opened = sink.is_some();
 
-    let (kf_tx, kf_rx) = crossbeam_channel::bounded::<KeyframeRequestReason>(4);
+    let ctx_preview = ctx.clone();
     let internal_tx_kf = internal_tx.clone();
-    let kf_bridge_thread = std::thread::Builder::new()
-        .name("camcraft-gui-kf".to_owned())
-        .spawn(move || {
-            while let Ok(reason) = kf_rx.recv() {
-                let _ = internal_tx_kf.try_send(InternalEvent::RequestKeyframe(reason));
-            }
-        })
-        .ok();
+    let worker_opts = LowLatencyWorkerOptions {
+        preview_tx: Some(frame_tx.clone()),
+        preview_recycle_rx: Some(preview_recycle_rx.clone()),
+        preview_ctrl: preview_ctrl.clone(),
+        on_preview_pushed: Some(Arc::new(move || ctx_preview.request_repaint())),
+        on_keyframe_request: Some(Arc::new(move |reason| {
+            let _ = internal_tx_kf.try_send(InternalEvent::RequestKeyframe(reason));
+        })),
+        decoder_options: DecoderOptions::default(),
+    };
 
-    let decoder_thread = match spawn_decoder_worker_low_latency(
+    let decoder_thread = match spawn_decoder_worker_optimized(
         decoder_rx,
         sink,
-        Some(frame_tx.clone()),
-        preview_enabled.clone(),
-        DEFAULT_PREVIEW_MAX_WIDTH,
+        worker_opts,
         decoder_running.clone(),
-        Some(kf_tx),
     ) {
         Ok(handle) => Some(handle),
         Err(e) => {
-            if let Some(handle) = kf_bridge_thread {
-                let _ = handle.join();
-            }
             emit(
                 update_tx,
                 ctx,
@@ -649,6 +786,7 @@ fn start_connection(
     let shutdown_c = shutdown.clone();
     let decoder_tx_c = decoder_tx.clone();
     let audio_tx_c = audio_tx.clone();
+    let audio_meter_active_c = audio_meter_active.clone();
     let internal_tx_c = internal_tx.clone();
     let endpoint_c = endpoint.clone();
     let vcam_display_c = vcam_display.clone();
@@ -686,6 +824,8 @@ fn start_connection(
         });
 
         let mut disconnected_emitted = false;
+        let mut last_audio_repaint: Option<Instant> = None;
+
         while let Some(event) = event_rx.recv().await {
             match event {
                 ClientEvent::Connected(sender) => {
@@ -758,11 +898,7 @@ fn start_connection(
                 ClientEvent::VideoFrame {
                     header, payload, ..
                 } => {
-                    match decoder_tx_c.push_frame(
-                        header.pts_us,
-                        header.flags.is_keyframe(),
-                        payload,
-                    ) {
+                    match decoder_tx_c.push_frame_with_flags(header.pts_us, header.flags, payload) {
                         Ok(true) => {}
                         Ok(false) => {
                             let _ = internal_tx_c.try_send(InternalEvent::RequestKeyframe(
@@ -784,6 +920,12 @@ fn start_connection(
                 } => {
                     if let Err(e) = audio_tx_c.push_frame(header.pts_us, payload) {
                         warn!(error = %e, "Failed to queue AUDIO_FRAME");
+                    } else if audio_meter_active_c.load(Ordering::Relaxed)
+                        && last_audio_repaint
+                            .is_none_or(|prev| prev.elapsed() >= AUDIO_METER_REPAINT_MIN_INTERVAL)
+                    {
+                        last_audio_repaint = Some(Instant::now());
+                        ctx_c.request_repaint();
                     }
                 }
                 ClientEvent::Disconnected(reason) => {
@@ -832,7 +974,6 @@ fn start_connection(
         audio_running,
         audio_tx,
         audio_thread,
-        kf_bridge_thread,
         client_task,
         sender: None,
         last_keyframe_req: None,
@@ -899,6 +1040,34 @@ mod tests {
     use super::*;
     use camcraft_core::decoder::spawn_decoder_worker;
 
+    fn make_test_session_handle() -> (GuiSession, Receiver<Vec<u8>>, Receiver<PreviewFrame>) {
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let (_update_tx, update_rx) = crossbeam_channel::unbounded();
+        let (frame_tx, frame_rx) = crossbeam_channel::bounded(1);
+        let (preview_recycle_tx, preview_recycle_rx) = crossbeam_channel::bounded(2);
+        let (_audio_level_tx, audio_level_rx) = crossbeam_channel::bounded(4);
+        let default_profile = PerformanceProfile::default();
+        let preview_ctrl = PreviewRuntimeControl::new(
+            true,
+            default_profile.max_width(),
+            default_profile.min_interval_ms(),
+        );
+        let session = GuiSession {
+            cmd_tx,
+            update_rx,
+            frame_rx: frame_rx.clone(),
+            preview_recycle_tx,
+            audio_level_rx,
+            preview_ctrl,
+            user_preview_enabled: AtomicBool::new(true),
+            window_hidden: AtomicBool::new(false),
+            audio_meter_active: Arc::new(AtomicBool::new(false)),
+            _runtime_thread: None,
+        };
+        drop(frame_tx);
+        (session, preview_recycle_rx, frame_rx)
+    }
+
     #[test]
     fn normalize_endpoint_handles_defaults_and_ports() {
         assert_eq!(normalize_endpoint(""), format!("127.0.0.1:{DEFAULT_PORT}"));
@@ -911,6 +1080,53 @@ mod tests {
             format!("192.168.1.42:{DEFAULT_PORT}")
         );
         assert_eq!(normalize_endpoint("192.168.1.42:9999"), "192.168.1.42:9999");
+    }
+
+    #[test]
+    fn performance_profile_matches_specs() {
+        assert_eq!(PerformanceProfile::default(), PerformanceProfile::Balanced);
+        assert_eq!(PerformanceProfile::Eco.max_width(), 480);
+        assert_eq!(PerformanceProfile::Eco.min_interval_ms(), 66);
+        assert_eq!(PerformanceProfile::Balanced.max_width(), 640);
+        assert_eq!(PerformanceProfile::Balanced.min_interval_ms(), 42);
+        assert_eq!(PerformanceProfile::Crisp.max_width(), 960);
+        assert_eq!(PerformanceProfile::Crisp.min_interval_ms(), 33);
+    }
+
+    #[test]
+    fn window_hidden_suppresses_and_restores_without_mutating_user_toggle() {
+        let (session, _recycle_rx, _frame_rx) = make_test_session_handle();
+        assert!(session.is_user_preview_enabled());
+        assert!(session.is_effective_preview_enabled());
+
+        // Minimizing suppresses preview output while preserving user toggle
+        session.set_window_hidden(true);
+        assert!(session.is_user_preview_enabled());
+        assert!(!session.is_effective_preview_enabled());
+
+        // Restoring un-minimized window restores preview output
+        session.set_window_hidden(false);
+        assert!(session.is_user_preview_enabled());
+        assert!(session.is_effective_preview_enabled());
+
+        // If user turns preview off explicitly, un-minimizing keeps it off
+        session.set_preview_enabled(false);
+        session.set_window_hidden(true);
+        session.set_window_hidden(false);
+        assert!(!session.is_user_preview_enabled());
+        assert!(!session.is_effective_preview_enabled());
+    }
+
+    #[test]
+    fn recycle_frame_buffer_returns_cleared_buffer_with_capacity() {
+        let (session, recycle_rx, _frame_rx) = make_test_session_handle();
+        let buf = vec![0xAA; 1024];
+        session.recycle_frame_buffer(buf);
+        let recycled = recycle_rx
+            .try_recv()
+            .expect("recycled buffer should arrive");
+        assert!(recycled.is_empty());
+        assert!(recycled.capacity() >= 1024);
     }
 
     #[test]

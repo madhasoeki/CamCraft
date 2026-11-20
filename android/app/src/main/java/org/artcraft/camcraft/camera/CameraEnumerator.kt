@@ -65,6 +65,7 @@ object CameraEnumerator {
                     // Resolutions supported for SurfaceTexture / MediaCodec
                     val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
                     val sizes = map?.getOutputSizes(SurfaceTexture::class.java) ?: emptyArray()
+                    val fpsMetadata = CameraFpsCapabilities.extractCameraFpsMetadata(chars)
 
                     val targetResolutions = listOf(
                         Pair(3840, 2160),
@@ -77,13 +78,12 @@ object CameraEnumerator {
 
                     for ((w, h) in targetResolutions) {
                         if (availableSizes.contains(Pair(w, h))) {
-                            val minDuration = try {
-                                val sizeObj = sizes.first { it.width == w && it.height == h }
-                                map?.getOutputMinFrameDuration(SurfaceTexture::class.java, sizeObj) ?: 0L
-                            } catch (e: Exception) {
-                                0L
-                            }
-                            val maxFps = if (minDuration in 1..16_666_667L) 60 else 30
+                            val maxFps = CameraFpsCapabilities.maxFpsForResolution(
+                                chars = chars,
+                                metadata = fpsMetadata,
+                                width = w,
+                                height = h,
+                            )
                             resolutionOptions.add(ResolutionOption(width = w, height = h, maxFps = maxFps))
                         }
                     }
@@ -92,11 +92,17 @@ object CameraEnumerator {
                     if (resolutionOptions.isEmpty()) {
                         val sortedSizes = sizes.sortedByDescending { it.width * it.height }.take(3)
                         for (size in sortedSizes) {
+                            val maxFps = CameraFpsCapabilities.maxFpsForResolution(
+                                chars = chars,
+                                metadata = fpsMetadata,
+                                width = size.width,
+                                height = size.height,
+                            )
                             resolutionOptions.add(
                                 ResolutionOption(
                                     width = size.width,
                                     height = size.height,
-                                    maxFps = 30,
+                                    maxFps = maxFps,
                                 )
                             )
                         }
@@ -110,6 +116,11 @@ object CameraEnumerator {
                             ResolutionOption(1280, 720, 60),
                         )
                     }
+
+                    Log.i(
+                        TAG,
+                        "Camera $id ($facing): ${finalResolutions.joinToString { "${it.width}x${it.height}@${it.maxFps}fps" }}",
+                    )
 
                     // Max zoom ratio
                     val maxZoom = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {

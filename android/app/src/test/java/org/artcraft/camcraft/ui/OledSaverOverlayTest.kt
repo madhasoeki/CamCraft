@@ -1,11 +1,13 @@
 package org.artcraft.camcraft.ui
 
+import android.os.BatteryManager
 import kotlin.math.abs
 import org.artcraft.camcraft.network.StreamConnectionStatus
 import org.artcraft.camcraft.network.StreamServiceState
 import org.artcraft.camcraft.network.defaultActiveCameraState
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -65,5 +67,80 @@ class OledSaverOverlayTest {
         )
         assertEquals("ERROR • Port in use", OledSaverMotion.formatStatusLine(error))
         assertEquals("Double-tap anywhere to wake", OledSaverMotion.formatDetailLine(error))
+    }
+
+    @Test
+    fun detailLineWithBatterySummaryAppendsOnlyWhenNonBlank() {
+        val connected = StreamServiceState(
+            status = StreamConnectionStatus.CONNECTED,
+            activeState = defaultActiveCameraState().copy(audioEnabled = true, audioMuted = false),
+        )
+        assertEquals(
+            "Mic ON • Double-tap anywhere to wake • 84% • 34°C",
+            OledSaverMotion.formatDetailLine(connected, "84% • 34°C"),
+        )
+        assertEquals(
+            "Mic ON • Double-tap anywhere to wake",
+            OledSaverMotion.formatDetailLine(connected, null),
+        )
+        assertEquals(
+            "Mic ON • Double-tap anywhere to wake",
+            OledSaverMotion.formatDetailLine(connected, "   "),
+        )
+
+        val stopped = StreamServiceState(status = StreamConnectionStatus.STOPPED)
+        assertEquals(
+            "Double-tap anywhere to wake • 72% ⚡ • 39°C",
+            OledSaverMotion.formatDetailLine(stopped, "72% ⚡ • 39°C"),
+        )
+    }
+
+    @Test
+    fun formatBatterySummaryFormatsAllTelemetryStates() {
+        assertEquals(
+            "84% • 34°C",
+            formatBatterySummary(DeviceTelemetry(batteryPct = 84, temperatureC = 34.2f, isCharging = false)),
+        )
+        assertEquals(
+            "84% ⚡ • 34°C",
+            formatBatterySummary(DeviceTelemetry(batteryPct = 84, temperatureC = 34.4f, isCharging = true)),
+        )
+        assertEquals(
+            "92%",
+            formatBatterySummary(DeviceTelemetry(batteryPct = 92, temperatureC = null, isCharging = false)),
+        )
+        assertEquals(
+            "92% ⚡",
+            formatBatterySummary(DeviceTelemetry(batteryPct = 92, temperatureC = null, isCharging = true)),
+        )
+        assertEquals(
+            "38°C",
+            formatBatterySummary(DeviceTelemetry(batteryPct = null, temperatureC = 37.6f, isCharging = false)),
+        )
+        assertNull(formatBatterySummary(DeviceTelemetry(batteryPct = null, temperatureC = null, isCharging = false)))
+        assertNull(formatBatterySummary(DeviceTelemetry(batteryPct = null, temperatureC = null, isCharging = true)))
+    }
+
+    @Test
+    fun extractDeviceTelemetryHandlesValidAndInvalidBatteryExtras() {
+        val charging = extractDeviceTelemetry(
+            level = 42,
+            scale = 50,
+            tempTenthsC = 345,
+            status = BatteryManager.BATTERY_STATUS_CHARGING,
+        )
+        assertEquals(84, charging.batteryPct)
+        assertEquals(34.5f, charging.temperatureC!!, 0.01f)
+        assertTrue(charging.isCharging)
+
+        val missing = extractDeviceTelemetry(
+            level = -1,
+            scale = 100,
+            tempTenthsC = Int.MIN_VALUE,
+            status = BatteryManager.BATTERY_STATUS_DISCHARGING,
+        )
+        assertNull(missing.batteryPct)
+        assertNull(missing.temperatureC)
+        assertEquals(false, missing.isCharging)
     }
 }

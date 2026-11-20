@@ -3,9 +3,11 @@ package org.artcraft.camcraft
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Color as AndroidColor
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
@@ -13,20 +15,23 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.safeDrawingPadding
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.compose.LifecycleStartEffect
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import org.artcraft.camcraft.network.CamCraftStreamService
 import org.artcraft.camcraft.network.StreamConnectionStatus
-import org.artcraft.camcraft.ui.ArtCraftColors
 import org.artcraft.camcraft.ui.CamCraftScreen
-import org.artcraft.camcraft.ui.CamCraftTheme
 import org.artcraft.camcraft.ui.OledSaverOverlay
+import org.artcraft.camcraft.ui.rememberDeviceTelemetry
+import org.artcraft.camcraft.ui.theme.ArtCraftColors
+import org.artcraft.camcraft.ui.theme.CamCraftTheme
 
 class MainActivity : ComponentActivity() {
 
@@ -45,7 +50,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
+        )
         CamCraftStreamService.refreshLocalIp(this)
 
         if (intent?.getBooleanExtra("autostart", false) == true) {
@@ -53,8 +61,18 @@ class MainActivity : ComponentActivity() {
         }
 
         setContent {
-            val serviceState by CamCraftStreamService.serviceState.collectAsState()
+            val serviceState by CamCraftStreamService.serviceState.collectAsStateWithLifecycle()
+            val deviceTelemetry = rememberDeviceTelemetry()
             var isDimmed by rememberSaveable { mutableStateOf(false) }
+            var isForeground by remember { mutableStateOf(true) }
+
+            LifecycleStartEffect(Unit) {
+                isForeground = true
+                onStopOrDispose {
+                    isForeground = false
+                    CamCraftStreamService.detachPreviewView()
+                }
+            }
 
             CamCraftTheme {
                 Box(
@@ -78,6 +96,11 @@ class MainActivity : ComponentActivity() {
                         onToggleTorch = { CamCraftStreamService.toggleTorch() },
                         onToggleMute = { CamCraftStreamService.toggleMute() },
                         onDimScreen = { isDimmed = true },
+                        onAttachPreview = { CamCraftStreamService.attachPreviewView(it) },
+                        onDetachPreview = { CamCraftStreamService.detachPreviewView() },
+                        onTapToFocus = { CamCraftStreamService.focusAtPoint(it) },
+                        showViewfinder = !isDimmed && isForeground,
+                        telemetry = deviceTelemetry,
                         modifier = Modifier.safeDrawingPadding(),
                     )
 
@@ -85,6 +108,7 @@ class MainActivity : ComponentActivity() {
                         OledSaverOverlay(
                             state = serviceState,
                             onExit = { isDimmed = false },
+                            telemetry = deviceTelemetry,
                         )
                     }
                 }

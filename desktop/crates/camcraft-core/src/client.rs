@@ -152,7 +152,7 @@ pub struct ClientConfig {
     pub ping_interval: Duration,
     /// Read inactivity timeout before considering a silent link dropped (defaults to 5 seconds).
     pub read_timeout: Duration,
-    /// Initial read buffer capacity in bytes (defaults to 64 KB).
+    /// Initial read buffer capacity in bytes (defaults to 256 KiB).
     pub read_buffer_capacity: usize,
 }
 
@@ -165,7 +165,7 @@ impl ClientConfig {
             interface: None,
             ping_interval: Duration::from_secs(1),
             read_timeout: DEFAULT_READ_TIMEOUT,
-            read_buffer_capacity: 65536,
+            read_buffer_capacity: 262_144,
         }
     }
 
@@ -177,7 +177,7 @@ impl ClientConfig {
             interface: None,
             ping_interval: Duration::from_secs(1),
             read_timeout: DEFAULT_READ_TIMEOUT,
-            read_buffer_capacity: 65536,
+            read_buffer_capacity: 262_144,
         }
     }
 
@@ -431,7 +431,12 @@ async fn run_client_loop_inner(
     let mut last_stats_tick = Instant::now();
     let mut last_activity = Instant::now();
     let mut last_rtt_ms: f64 = 0.0;
-    let idle_poll = Duration::from_millis(100).min(config.read_timeout);
+    let idle_poll = Duration::from_millis(100)
+        .min(config.read_timeout)
+        .max(Duration::from_millis(1));
+    let mut idle_tick = tokio::time::interval(idle_poll);
+    idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    idle_tick.tick().await;
 
     let loop_result: Result<(), ClientError> = async {
         loop {
@@ -465,6 +470,7 @@ async fn run_client_loop_inner(
 
             // Read available bytes from TCP socket
             tokio::select! {
+                biased;
                 read_res = reader.read_buf(&mut read_buf) => {
                     let n = read_res?;
                     if n == 0 {
@@ -473,7 +479,7 @@ async fn run_client_loop_inner(
                     }
                     last_activity = Instant::now();
                 }
-                _ = tokio::time::sleep(idle_poll) => {
+                _ = idle_tick.tick() => {
                     // Periodic wake-up to allow stats update, timeout check, and shutdown check
                     continue;
                 }
@@ -509,10 +515,11 @@ async fn run_client_loop_inner(
                         let _ = cmd_tx.send(pong).await;
                     }
                     PacketType::VideoFrame => {
+                        let payload_len = packet.payload.len();
                         stats.total_frames += 1;
-                        stats.total_video_bytes += packet.payload.len() as u64;
+                        stats.total_video_bytes += payload_len as u64;
                         interval_frames += 1;
-                        interval_bytes += packet.payload.len() as u64;
+                        interval_bytes += payload_len as u64;
 
                         if packet.header.flags.is_keyframe() {
                             stats.keyframe_count += 1;
@@ -521,21 +528,22 @@ async fn run_client_loop_inner(
                         let _ = event_tx
                             .send(ClientEvent::VideoFrame {
                                 header: packet.header,
-                                payload_len: packet.payload.len(),
-                                payload: packet.payload.clone(),
+                                payload_len,
+                                payload: packet.payload,
                             })
                             .await;
                     }
                     PacketType::VideoConfig => {
+                        let payload_len = packet.payload.len();
                         info!(
-                            payload_len = packet.payload.len(),
+                            payload_len,
                             "Received VIDEO_CONFIG (SPS/PPS parameter sets)"
                         );
                         let _ = event_tx
                             .send(ClientEvent::VideoConfig {
                                 header: packet.header,
-                                payload_len: packet.payload.len(),
-                                payload: packet.payload.clone(),
+                                payload_len,
+                                payload: packet.payload,
                             })
                             .await;
                     }

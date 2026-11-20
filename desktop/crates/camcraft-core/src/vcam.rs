@@ -572,6 +572,25 @@ impl V4l2LoopbackSink {
     }
 }
 
+#[cfg(unix)]
+fn set_cloexec(fd: std::os::raw::c_int) -> Result<(), std::io::Error> {
+    // SAFETY: `fd` is a valid open file descriptor owned by the caller; `F_GETFD` only reads
+    // descriptor flags without mutating or closing the descriptor.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if (flags & libc::FD_CLOEXEC) == 0 {
+        // SAFETY: `fd` is a valid open file descriptor and `F_SETFD` with `FD_CLOEXEC`
+        // atomically prevents child processes (`pacat`, `pactl`, `adb`) from inheriting `/dev/video*`.
+        let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 impl VirtualCameraSink for V4l2LoopbackSink {
     fn open(&mut self) -> Result<(), VcamError> {
         if self.device.is_some() {
@@ -583,6 +602,12 @@ impl VirtualCameraSink for V4l2LoopbackSink {
         let dev = v4l::Device::with_path(&self.device_path).map_err(|e| VcamError::DeviceOpen {
             path: self.device_path.clone(),
             details: e.to_string(),
+        })?;
+
+        #[cfg(unix)]
+        set_cloexec(dev.handle().fd()).map_err(|e| VcamError::DeviceOpen {
+            path: self.device_path.clone(),
+            details: format!("failed to set FD_CLOEXEC: {e}"),
         })?;
 
         let caps = dev
@@ -752,9 +777,29 @@ mod tests {
     fn test_v4l2_loopback_sink_lifecycle() {
         let path = "/dev/video10";
         if Path::new(path).exists() {
+            let Ok(caps) = v4l::Device::with_path(path).and_then(|d| d.query_caps()) else {
+                return;
+            };
+            if !caps.capabilities.contains(CapFlags::VIDEO_OUTPUT) {
+                // Live CamCraft/OBS session holds exclusive_caps=1 device; skip safely.
+                return;
+            }
+
             let mut sink = V4l2LoopbackSink::new(path);
             assert!(sink.open().is_ok());
             assert!(sink.is_open());
+
+            #[cfg(unix)]
+            if let Some(ref dev) = sink.device {
+                // SAFETY: `dev.handle().fd()` is an open descriptor owned by `sink`.
+                let fd_flags = unsafe { libc::fcntl(dev.handle().fd(), libc::F_GETFD) };
+                assert!(fd_flags >= 0);
+                assert_ne!(
+                    fd_flags & libc::FD_CLOEXEC,
+                    0,
+                    "V4L2 loopback fd must have FD_CLOEXEC set"
+                );
+            }
 
             // Write 1 standby frame
             let res = sink.write_standby_frame(1920, 1080);
@@ -763,6 +808,43 @@ mod tests {
             assert!(sink.close().is_ok());
             assert!(!sink.is_open());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_set_cloexec_marks_fd_close_on_exec() {
+        struct PipeGuard([libc::c_int; 2]);
+        impl Drop for PipeGuard {
+            fn drop(&mut self) {
+                for fd in self.0 {
+                    if fd >= 0 {
+                        // SAFETY: Each valid descriptor in `self.0` was opened by `pipe(2)`
+                        // and is closed once when the guard drops.
+                        unsafe {
+                            libc::close(fd);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut fds = [-1 as libc::c_int; 2];
+        // SAFETY: `fds` is a valid 2-element `c_int` array passed to `pipe(2)`.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let guard = PipeGuard(fds);
+        let read_fd = guard.0[0];
+
+        // SAFETY: `read_fd` is an open pipe descriptor owned by `guard`.
+        let initial_flags = unsafe { libc::fcntl(read_fd, libc::F_GETFD) };
+        assert!(initial_flags >= 0);
+        assert_eq!(initial_flags & libc::FD_CLOEXEC, 0);
+
+        set_cloexec(read_fd).expect("set_cloexec should succeed on valid pipe fd");
+
+        // SAFETY: `read_fd` remains open and valid until `guard` drops.
+        let updated_flags = unsafe { libc::fcntl(read_fd, libc::F_GETFD) };
+        assert!(updated_flags >= 0);
+        assert_ne!(updated_flags & libc::FD_CLOEXEC, 0);
     }
 
     #[test]

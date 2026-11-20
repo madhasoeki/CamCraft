@@ -1,18 +1,30 @@
 package org.artcraft.camcraft.camera
 
+import android.annotation.SuppressLint
 import android.content.Context
+import android.hardware.camera2.CameraCaptureSession
+import android.hardware.camera2.CameraDevice
+import android.hardware.camera2.CameraMetadata
+import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.TotalCaptureResult
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.util.Size
 import androidx.annotation.OptIn
 import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.FocusMeteringAction
+import androidx.camera.core.MeteringPoint
 import androidx.camera.core.Preview
 import androidx.camera.core.SurfaceOrientedMeteringPointFactory
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
@@ -22,7 +34,9 @@ import androidx.lifecycle.LifecycleRegistry
 import java.lang.ref.WeakReference
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.roundToInt
 import org.artcraft.camcraft.encoder.H264SurfaceEncoder
 import org.artcraft.camcraft.protocol.PacketType
@@ -81,12 +95,33 @@ class ServiceLifecycleOwner : LifecycleOwner {
 
 /**
  * Manages the CameraX lifecycle, GPU surface routing to [H264SurfaceEncoder],
- * real-time camera controls (Zoom, EV, Torch, AF), and stream reconfiguration.
+ * real-time camera controls (Zoom, EV, Torch, AF, Tap-to-Focus), and stream reconfiguration.
  */
 class CameraStreamManager(
     private val context: Context,
-    private val onVideoPacket: (packetType: PacketType, flags: Int, ptsUs: Long, payload: ByteArray) -> Unit,
+    private val onVideoPacketSlice: (
+        packetType: PacketType,
+        flags: Int,
+        ptsUs: Long,
+        payload: ByteArray,
+        offset: Int,
+        length: Int,
+    ) -> Unit,
 ) {
+    constructor(
+        context: Context,
+        onVideoPacket: (packetType: PacketType, flags: Int, ptsUs: Long, payload: ByteArray) -> Unit,
+    ) : this(
+        context = context,
+        onVideoPacketSlice = { packetType, flags, ptsUs, payload, offset, length ->
+            val standalone = if (offset == 0 && length == payload.size) {
+                payload
+            } else {
+                payload.copyOfRange(offset, offset + length)
+            }
+            onVideoPacket(packetType, flags, ptsUs, standalone)
+        },
+    )
 
     private val lifecycleOwner = ServiceLifecycleOwner()
     private val cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
@@ -94,6 +129,7 @@ class CameraStreamManager(
     private val isReleased = AtomicBoolean(false)
 
     private var cameraProvider: ProcessCameraProvider? = null
+    @Volatile
     private var activeCamera: Camera? = null
     private var encoder: H264SurfaceEncoder? = null
 
@@ -244,6 +280,7 @@ class CameraStreamManager(
 
     /**
      * Dynamically reconfigures resolution, framerate, bitrate, or switches lens.
+     * Bitrate-only updates adjust [MediaCodec] dynamically without restarting CameraX.
      */
     fun rebindCamera(
         cameraId: String,
@@ -254,11 +291,10 @@ class CameraStreamManager(
     ) {
         if (isReleased.get()) return
 
-        val encoderConfigChanged = width != currentWidth ||
+        val streamGeometryOrFpsChanged = width != currentWidth ||
             height != currentHeight ||
-            fps != currentFps ||
-            bitrateKbps != currentBitrateKbps
-
+            fps != currentFps
+        val bitrateChanged = bitrateKbps != currentBitrateKbps
         val cameraChanged = cameraId != currentCameraId
 
         currentCameraId = cameraId
@@ -271,10 +307,16 @@ class CameraStreamManager(
 
         runOnMain {
             if (!isStreaming || isReleased.get()) return@runOnMain
-            if (encoderConfigChanged || encoder == null) {
+            val activeEncoder = encoder
+            if (streamGeometryOrFpsChanged || activeEncoder == null) {
                 setupEncoderAndBind()
-            } else if (cameraChanged) {
-                bindUseCases()
+            } else {
+                if (bitrateChanged) {
+                    activeEncoder.updateBitrate(bitrateKbps)
+                }
+                if (cameraChanged) {
+                    bindUseCases()
+                }
             }
         }
     }
@@ -292,7 +334,7 @@ class CameraStreamManager(
                 height = currentHeight,
                 fps = currentFps,
                 bitrateKbps = currentBitrateKbps,
-                onVideoPacket = onVideoPacket,
+                onVideoPacketSlice = onVideoPacketSlice,
             )
             newEncoder.start()
             encoder = newEncoder
@@ -304,6 +346,250 @@ class CameraStreamManager(
         }
 
         bindUseCases()
+    }
+
+    private fun createFpsTelemetryCallback(): CameraCaptureSession.CaptureCallback {
+        val hasLoggedFirstFrame = AtomicBoolean(false)
+        val frameCount = AtomicLong(0L)
+        val lastRangePacked = AtomicLong(Long.MIN_VALUE)
+
+        return object : CameraCaptureSession.CaptureCallback() {
+            override fun onCaptureCompleted(
+                session: CameraCaptureSession,
+                request: CaptureRequest,
+                result: TotalCaptureResult,
+            ) {
+                val count = frameCount.incrementAndGet()
+                val aeRange = result.get(CaptureResult.CONTROL_AE_TARGET_FPS_RANGE)
+                val packed = if (aeRange != null) {
+                    (aeRange.lower.toLong() shl 32) or (aeRange.upper.toLong() and 0xFFFF_FFFFL)
+                } else {
+                    Long.MIN_VALUE + 1L
+                }
+                val previousPacked = lastRangePacked.getAndSet(packed)
+                val isFirst = hasLoggedFirstFrame.compareAndSet(false, true)
+                val rangeChanged = aeRange != null && previousPacked != packed
+
+                if (isFirst || rangeChanged || (count % 180L == 0L)) {
+                    val frameDurationNs = result.get(CaptureResult.SENSOR_FRAME_DURATION)
+                    Log.i(
+                        TAG,
+                        "CaptureResult telemetry: frame=$count aeFpsRange=$aeRange frameDurationNs=$frameDurationNs",
+                    )
+                }
+            }
+        }
+    }
+
+    @SuppressLint("RestrictedApi") // Needed to request TEMPLATE_RECORD on Preview for Qualcomm/OEM 60fps sessions
+    @OptIn(ExperimentalCamera2Interop::class)
+    private fun applyVideoFpsInterop(
+        builder: Preview.Builder,
+        plan: TargetFpsPlan?,
+        streamUseCase: Long?,
+        attachTelemetryCallback: Boolean,
+    ) {
+        val extender = Camera2Interop.Extender(builder)
+        if (plan != null) {
+            val androidRange = plan.range.toAndroidRange()
+            if (plan.isStandardAeRange) {
+                builder.setTargetFrameRate(androidRange)
+            }
+            try {
+                extender.setCaptureRequestOption(
+                    CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                    androidRange,
+                )
+                if (plan.useVideoSessionMode) {
+                    extender.setCaptureRequestTemplate(CameraDevice.TEMPLATE_RECORD)
+                    extender.setCaptureRequestOption(
+                        CaptureRequest.CONTROL_CAPTURE_INTENT,
+                        CaptureRequest.CONTROL_CAPTURE_INTENT_VIDEO_RECORD,
+                    )
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed configuring Camera2 FPS options (${plan.range}): ${e.message}")
+            }
+        }
+
+        if (streamUseCase != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            try {
+                extender.setStreamUseCase(streamUseCase)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed setting stream use case $streamUseCase: ${e.message}")
+            }
+        }
+
+        if (attachTelemetryCallback) {
+            extender.setSessionCaptureCallback(createFpsTelemetryCallback())
+        }
+    }
+
+    private fun buildEncoderPreview(
+        surface: android.view.Surface,
+        fpsPlan: TargetFpsPlan?,
+    ): Preview {
+        val resolutionSelector = ResolutionSelector.Builder()
+            .setResolutionStrategy(
+                ResolutionStrategy(
+                    Size(currentWidth, currentHeight),
+                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
+                ),
+            )
+            .build()
+
+        val encPreviewBuilder = Preview.Builder()
+            .setResolutionSelector(resolutionSelector)
+
+        val videoStreamUseCase = if (
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            CameraFpsCapabilities.supportsStreamUseCase(
+                context,
+                currentCameraId,
+                CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_VIDEO_RECORD.toLong(),
+            )
+        ) {
+            CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_VIDEO_RECORD.toLong()
+        } else {
+            null
+        }
+
+        applyVideoFpsInterop(
+            builder = encPreviewBuilder,
+            plan = fpsPlan,
+            streamUseCase = videoStreamUseCase,
+            attachTelemetryCallback = true,
+        )
+
+        return encPreviewBuilder.build().apply {
+            setSurfaceProvider(cameraExecutor) { request ->
+                if (!isReleased.get() && surface.isValid) {
+                    request.provideSurface(surface, cameraExecutor) { result ->
+                        Log.d(TAG, "Encoder surface provider result: ${result.resultCode}")
+                    }
+                } else {
+                    request.willNotProvideSurface()
+                }
+            }
+        }
+    }
+
+    private fun buildUiPreview(
+        view: PreviewView,
+        fpsPlan: TargetFpsPlan?,
+    ): Preview {
+        val previewTargetSize = Size(minOf(currentWidth, 1280), minOf(currentHeight, 720))
+        val uiResolutionSelector = ResolutionSelector.Builder()
+            .setResolutionStrategy(
+                ResolutionStrategy(
+                    previewTargetSize,
+                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
+                ),
+            )
+            .build()
+
+        val uiBuilder = Preview.Builder()
+            .setResolutionSelector(uiResolutionSelector)
+
+        val previewUseCase = if (
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            CameraFpsCapabilities.supportsStreamUseCase(
+                context,
+                currentCameraId,
+                CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_PREVIEW.toLong(),
+            )
+        ) {
+            CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_PREVIEW.toLong()
+        } else {
+            null
+        }
+
+        applyVideoFpsInterop(
+            builder = uiBuilder,
+            plan = fpsPlan,
+            streamUseCase = previewUseCase,
+            attachTelemetryCallback = false,
+        )
+
+        return uiBuilder.build().apply {
+            setSurfaceProvider(view.surfaceProvider)
+        }
+    }
+
+    private fun bindEncoderOnly(
+        provider: ProcessCameraProvider,
+        surface: android.view.Surface,
+        cameraSelector: CameraSelector,
+        fpsPlan: TargetFpsPlan?,
+    ) {
+        provider.unbindAll()
+        val encPreview = buildEncoderPreview(surface, fpsPlan)
+        encoderPreview = encPreview
+        uiPreview = null
+        activeCamera = provider.bindToLifecycle(
+            lifecycleOwner,
+            cameraSelector,
+            encPreview,
+        )
+    }
+
+    private fun bindWithFallback(
+        provider: ProcessCameraProvider,
+        surface: android.view.Surface,
+        cameraSelector: CameraSelector,
+        fpsPlan: TargetFpsPlan?,
+    ) {
+        provider.unbindAll()
+        val encPreview = buildEncoderPreview(surface, fpsPlan)
+        encoderPreview = encPreview
+
+        val view = attachedPreviewViewRef?.get()
+        if (view != null) {
+            val uiPrev = buildUiPreview(view, fpsPlan)
+            uiPreview = uiPrev
+            try {
+                activeCamera = provider.bindToLifecycle(
+                    lifecycleOwner,
+                    cameraSelector,
+                    encPreview,
+                    uiPrev,
+                )
+                return
+            } catch (dualError: Exception) {
+                Log.w(
+                    TAG,
+                    "Dual preview binding failed (${dualError.message}); retrying encoder-only at target FPS",
+                )
+                try {
+                    bindEncoderOnly(provider, surface, cameraSelector, fpsPlan)
+                    return
+                } catch (singleError: Exception) {
+                    if (fpsPlan == null) throw singleError
+                    Log.w(
+                        TAG,
+                        "Encoder-only target FPS binding failed (${singleError.message}); falling back to default 30 FPS",
+                    )
+                }
+            }
+        } else {
+            uiPreview = null
+            try {
+                activeCamera = provider.bindToLifecycle(
+                    lifecycleOwner,
+                    cameraSelector,
+                    encPreview,
+                )
+                return
+            } catch (primaryError: Exception) {
+                if (fpsPlan == null) throw primaryError
+                Log.w(
+                    TAG,
+                    "Primary target FPS binding failed (${primaryError.message}); falling back to default 30 FPS",
+                )
+            }
+        }
+
+        bindEncoderOnly(provider, surface, cameraSelector, fpsPlan = null)
     }
 
     private fun bindUseCases() {
@@ -338,59 +624,31 @@ class CameraStreamManager(
             return
         }
 
-        try {
-            provider.unbindAll()
-
-            // 1. Configure encoder Preview use case
-            @Suppress("DEPRECATION")
-            val encPreview = Preview.Builder()
-                .setTargetResolution(Size(currentWidth, currentHeight))
-                .build()
-
-            encPreview.setSurfaceProvider(cameraExecutor) { request ->
-                if (!isReleased.get() && surface.isValid) {
-                    request.provideSurface(surface, cameraExecutor) { result ->
-                        Log.d(TAG, "Encoder surface provider result: ${result.resultCode}")
-                    }
+        val fpsPlan = CameraFpsCapabilities.resolveForCamera(
+            context = context,
+            cameraId = currentCameraId,
+            width = currentWidth,
+            height = currentHeight,
+            requestedFps = currentFps,
+        )
+        Log.i(
+            TAG,
+            "Resolved FPS plan for cam=$currentCameraId ${currentWidth}x$currentHeight@${currentFps}fps: " +
+                if (fpsPlan != null) {
+                    "range=[${fpsPlan.range.minFps}, ${fpsPlan.range.maxFps}], " +
+                        "standardAe=${fpsPlan.isStandardAeRange}, " +
+                        "videoSession=${fpsPlan.useVideoSessionMode}, " +
+                        "source=${fpsPlan.source}"
                 } else {
-                    request.willNotProvideSurface()
-                }
-            }
-            encoderPreview = encPreview
+                    "none (HAL default)"
+                },
+        )
 
-            // 2. Camera selector for currentCameraId
+        try {
             val cameraSelector = buildCameraSelector(currentCameraId)
-
-            // 3. Optional UI PreviewView use case
-            val view = attachedPreviewViewRef?.get()
-            val useCases = mutableListOf<androidx.camera.core.UseCase>(encPreview)
-
-            if (view != null) {
-                val uiPrev = Preview.Builder().build()
-                uiPrev.setSurfaceProvider(view.surfaceProvider)
-                uiPreview = uiPrev
-                useCases.add(uiPrev)
-            } else {
-                uiPreview = null
-            }
-
-            try {
-                activeCamera = provider.bindToLifecycle(
-                    lifecycleOwner,
-                    cameraSelector,
-                    *useCases.toTypedArray(),
-                )
-            } catch (e: Exception) {
-                Log.w(TAG, "Dual preview binding failed, falling back to encoder-only: ${e.message}")
-                activeCamera = provider.bindToLifecycle(
-                    lifecycleOwner,
-                    cameraSelector,
-                    encPreview,
-                )
-            }
-
+            bindWithFallback(provider, surface, cameraSelector, fpsPlan)
             applyActiveControls()
-            Log.i(TAG, "Camera bound successfully to camera ID $currentCameraId ($currentWidth x $currentHeight)")
+            Log.i(TAG, "Camera bound successfully to camera ID $currentCameraId ($currentWidth x $currentHeight @ $currentFps fps)")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to bind CameraX use cases: ${e.message}", e)
         }
@@ -403,7 +661,7 @@ class CameraStreamManager(
                 val matched = cameraInfos.filter { info ->
                     try {
                         Camera2CameraInfo.from(info).cameraId == targetId
-                    } catch (e: Exception) {
+                    } catch (_: Exception) {
                         false
                     }
                 }
@@ -451,6 +709,25 @@ class CameraStreamManager(
             control.startFocusAndMetering(action)
         } else {
             control.cancelFocusAndMetering()
+        }
+    }
+
+    /**
+     * Triggers tap-to-focus and auto-exposure metering at the provided [MeteringPoint].
+     */
+    fun focusAtPoint(point: MeteringPoint) {
+        val control = activeCamera?.cameraControl ?: return
+        try {
+            val action = FocusMeteringAction.Builder(
+                point,
+                FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE,
+            )
+                .setAutoCancelDuration(3, TimeUnit.SECONDS)
+                .build()
+            control.startFocusAndMetering(action)
+            targetAutoFocus = true
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to focus at point: ${e.message}")
         }
     }
 
