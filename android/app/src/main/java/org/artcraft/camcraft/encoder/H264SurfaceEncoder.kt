@@ -26,9 +26,13 @@ class H264SurfaceEncoder(
     private val onVideoPacket: (packetType: PacketType, flags: Int, ptsUs: Long, payload: ByteArray) -> Unit,
 ) {
 
+    private val lifecycleLock = Any()
     private var codec: MediaCodec? = null
     var inputSurface: Surface? = null
         private set
+
+    @Volatile
+    private var hasStarted = false
 
     @Volatile
     var cachedConfig: ByteArray? = null
@@ -44,55 +48,83 @@ class H264SurfaceEncoder(
     private fun initCodec() {
         val mime = MediaFormat.MIMETYPE_VIDEO_AVC
         val mediaCodec = MediaCodec.createEncoderByType(mime)
+        var createdSurface: Surface? = null
 
-        val format = MediaFormat.createVideoFormat(mime, width, height).apply {
-            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, bitrateKbps * 1_000)
-            setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+        try {
+            val format = MediaFormat.createVideoFormat(mime, width, height).apply {
+                setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                setInteger(MediaFormat.KEY_BIT_RATE, bitrateKbps * 1_000)
+                setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
 
-            // Low-latency and chipset-tolerant optimizations
+                // Low-latency and chipset-tolerant optimizations
+                try {
+                    setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
+                } catch (ignored: Exception) {}
+
+                try {
+                    setInteger(MediaFormat.KEY_LATENCY, 1)
+                } catch (ignored: Exception) {}
+
+                try {
+                    setInteger(MediaFormat.KEY_PRIORITY, 0)
+                } catch (ignored: Exception) {}
+
+                try {
+                    setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+                } catch (ignored: Exception) {}
+
+                try {
+                    setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
+                    setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel41)
+                } catch (ignored: Exception) {}
+            }
+
+            mediaCodec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            createdSurface = mediaCodec.createInputSurface()
+            synchronized(lifecycleLock) {
+                inputSurface = createdSurface
+                codec = mediaCodec
+                hasStarted = false
+            }
+        } catch (e: Exception) {
             try {
-                setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
-            } catch (ignored: Exception) {}
-
+                createdSurface?.release()
+            } catch (_: Exception) {}
             try {
-                setInteger(MediaFormat.KEY_LATENCY, 0)
-            } catch (ignored: Exception) {}
-
-            try {
-                setInteger(MediaFormat.KEY_PRIORITY, 0)
-            } catch (ignored: Exception) {}
-
-            try {
-                setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
-                setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel41)
-            } catch (ignored: Exception) {}
+                mediaCodec.release()
+            } catch (_: Exception) {}
+            throw e
         }
-
-        mediaCodec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        inputSurface = mediaCodec.createInputSurface()
-        codec = mediaCodec
     }
 
     /**
      * Starts the encoder and launches the background drain loop.
      */
     fun start() {
-        if (isRunning.getAndSet(true)) return
+        val activeCodec = synchronized(lifecycleLock) {
+            if (isRunning.get()) return
+            val existing = codec ?: return
+            try {
+                existing.start()
+            } catch (e: Exception) {
+                isRunning.set(false)
+                throw e
+            }
+            hasStarted = true
+            isRunning.set(true)
 
-        val activeCodec = codec ?: return
-        activeCodec.start()
-
-        val thread = Thread({
-            drainEncoderLoop(activeCodec)
-        }, "CamCraft-H264-Drain").apply {
-            priority = Thread.MAX_PRIORITY
-            isDaemon = true
+            val thread = Thread({
+                drainEncoderLoop(existing)
+            }, "CamCraft-H264-Drain").apply {
+                priority = Thread.MAX_PRIORITY
+                isDaemon = true
+            }
+            drainThread = thread
+            thread.start()
+            existing
         }
-        drainThread = thread
-        thread.start()
-        Log.i(TAG, "H264SurfaceEncoder started ($width x $height @ $fps fps, $bitrateKbps kbps)")
+        Log.i(TAG, "H264SurfaceEncoder started ($width x $height @ $fps fps, $bitrateKbps kbps, codec=$activeCodec)")
     }
 
     /**
@@ -166,11 +198,16 @@ class H264SurfaceEncoder(
      * Requests an immediate IDR keyframe from hardware encoder.
      */
     fun requestKeyFrame() {
+        val activeCodec = synchronized(lifecycleLock) {
+            if (!isRunning.get() || !hasStarted) return
+            codec
+        } ?: return
+
         try {
             val params = Bundle().apply {
                 putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
             }
-            codec?.setParameters(params)
+            activeCodec.setParameters(params)
             Log.d(TAG, "Requested IDR sync keyframe from MediaCodec")
         } catch (e: Exception) {
             Log.w(TAG, "Failed to request IDR keyframe: ${e.message}")
@@ -183,30 +220,51 @@ class H264SurfaceEncoder(
     fun release() {
         isRunning.set(false)
 
-        try {
-            drainThread?.join(500)
-        } catch (ignored: InterruptedException) {}
-        drainThread = null
-
-        try {
-            codec?.stop()
-        } catch (e: Exception) {
-            Log.w(TAG, "Codec stop exception: ${e.message}")
+        val threadToJoin = synchronized(lifecycleLock) {
+            drainThread.also { drainThread = null }
+        }
+        if (threadToJoin != null && threadToJoin !== Thread.currentThread()) {
+            try {
+                threadToJoin.join(500)
+                if (threadToJoin.isAlive) {
+                    threadToJoin.interrupt()
+                    threadToJoin.join(100)
+                }
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
         }
 
-        try {
-            codec?.release()
-        } catch (e: Exception) {
-            Log.w(TAG, "Codec release exception: ${e.message}")
-        }
-        codec = null
+        synchronized(lifecycleLock) {
+            val activeCodec = codec
+            val wasStarted = hasStarted
+            codec = null
+            hasStarted = false
 
-        try {
-            inputSurface?.release()
-        } catch (e: Exception) {
-            Log.w(TAG, "Input surface release exception: ${e.message}")
+            if (activeCodec != null && wasStarted) {
+                try {
+                    activeCodec.stop()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Codec stop exception: ${e.message}")
+                }
+            }
+
+            if (activeCodec != null) {
+                try {
+                    activeCodec.release()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Codec release exception: ${e.message}")
+                }
+            }
+
+            try {
+                inputSurface?.release()
+            } catch (e: Exception) {
+                Log.w(TAG, "Input surface release exception: ${e.message}")
+            }
+            inputSurface = null
+            cachedConfig = null
         }
-        inputSurface = null
 
         Log.i(TAG, "H264SurfaceEncoder released")
     }

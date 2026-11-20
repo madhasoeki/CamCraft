@@ -229,7 +229,10 @@ pub fn setup_adb_forward(
                     ),
                 });
             }
-            devices.into_iter().next().expect("guaranteed by len == 1")
+            let Some(device) = devices.into_iter().next() else {
+                return Err(AdbError::NoDevicesFound);
+            };
+            device
         }
     };
 

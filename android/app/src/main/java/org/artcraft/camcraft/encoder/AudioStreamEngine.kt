@@ -148,57 +148,81 @@ class AudioStreamEngine(
 
     private fun captureLoop(record: AudioRecord) {
         try {
-            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
-        } catch (_: Throwable) {}
+            try {
+                Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+            } catch (_: Throwable) {}
 
-        val configBytes = buildAudioConfigBytes()
-        onAudioPacket(
-            PacketType.AUDIO_CONFIG,
-            System.nanoTime() / 1_000L,
-            configBytes,
-            configBytes.size,
-        )
+            val configBytes = buildAudioConfigBytes()
+            onAudioPacket(
+                PacketType.AUDIO_CONFIG,
+                System.nanoTime() / 1_000L,
+                configBytes,
+                configBytes.size,
+            )
 
-        val pcmBuffer = ByteArray(FRAME_SIZE_BYTES)
-        val silentBuffer = ByteArray(FRAME_SIZE_BYTES)
+            val pcmBuffer = ByteArray(FRAME_SIZE_BYTES)
+            val silentBuffer = ByteArray(FRAME_SIZE_BYTES)
 
-        while (isRunning.get()) {
-            var filled = 0
-            while (filled < FRAME_SIZE_BYTES && isRunning.get()) {
-                val read = try {
-                    record.read(
-                        pcmBuffer,
-                        filled,
-                        FRAME_SIZE_BYTES - filled,
-                        AudioRecord.READ_BLOCKING,
-                    )
-                } catch (e: Exception) {
-                    if (isRunning.get()) {
-                        Log.w(TAG, "AudioRecord.read exception: ${e.message}")
+            while (isRunning.get()) {
+                var filled = 0
+                while (filled < FRAME_SIZE_BYTES && isRunning.get()) {
+                    val read = try {
+                        record.read(
+                            pcmBuffer,
+                            filled,
+                            FRAME_SIZE_BYTES - filled,
+                            AudioRecord.READ_BLOCKING,
+                        )
+                    } catch (e: Exception) {
+                        if (isRunning.get()) {
+                            Log.w(TAG, "AudioRecord.read exception: ${e.message}")
+                        }
+                        -1
                     }
-                    -1
+
+                    if (read <= 0) {
+                        if (read < 0 && isRunning.get()) {
+                            Log.w(TAG, "AudioRecord.read returned error code $read")
+                        }
+                        break
+                    }
+                    filled += read
                 }
 
-                if (read <= 0) {
-                    if (read < 0 && isRunning.get()) {
-                        Log.w(TAG, "AudioRecord.read returned error code $read")
-                    }
+                if (!isRunning.get()) {
                     break
                 }
-                filled += read
-            }
 
-            if (!isRunning.get()) {
-                break
+                if (filled == FRAME_SIZE_BYTES) {
+                    val ptsUs = System.nanoTime() / 1_000L
+                    val payload = selectFramePayload(pcmBuffer, silentBuffer, isMuted.get())
+                    onAudioPacket(PacketType.AUDIO_FRAME, ptsUs, payload, FRAME_SIZE_BYTES)
+                } else if (filled == 0) {
+                    // Avoid tight spin if AudioRecord stopped reporting samples
+                    break
+                }
             }
-
-            if (filled == FRAME_SIZE_BYTES) {
-                val ptsUs = System.nanoTime() / 1_000L
-                val payload = selectFramePayload(pcmBuffer, silentBuffer, isMuted.get())
-                onAudioPacket(PacketType.AUDIO_FRAME, ptsUs, payload, FRAME_SIZE_BYTES)
-            } else if (filled == 0) {
-                // Avoid tight spin if AudioRecord stopped reporting samples
-                break
+        } finally {
+            val orphanRecord = synchronized(lifecycleLock) {
+                if (audioRecord === record) {
+                    isRunning.set(false)
+                    audioRecord = null
+                    if (captureThread === Thread.currentThread()) {
+                        captureThread = null
+                    }
+                    record
+                } else {
+                    null
+                }
+            }
+            if (orphanRecord != null) {
+                try {
+                    orphanRecord.stop()
+                } catch (_: Exception) {}
+                try {
+                    orphanRecord.release()
+                } catch (_: Exception) {}
+                Log.w(TAG, "AudioStreamEngine captureLoop exited unexpectedly; AudioRecord released")
             }
         }
     }
@@ -207,32 +231,39 @@ class AudioStreamEngine(
      * Stops audio recording, joins the capture thread, and releases [AudioRecord].
      */
     fun stop() {
-        synchronized(lifecycleLock) {
+        val (record, thread) = synchronized(lifecycleLock) {
             val wasRunning = isRunning.getAndSet(false)
-            val record = audioRecord
-            val thread = captureThread
-            if (!wasRunning && record == null && thread == null) {
+            val activeRecord = audioRecord
+            val activeThread = captureThread
+            if (!wasRunning && activeRecord == null && activeThread == null) {
                 return
             }
-
-            try {
-                record?.stop()
-            } catch (_: Exception) {}
-
-            if (thread != null && thread !== Thread.currentThread()) {
-                try {
-                    thread.join(500)
-                } catch (_: InterruptedException) {}
-            }
-            captureThread = null
-
-            try {
-                record?.release()
-            } catch (_: Exception) {}
             audioRecord = null
-
-            Log.i(TAG, "AudioStreamEngine stopped")
+            captureThread = null
+            activeRecord to activeThread
         }
+
+        try {
+            record?.stop()
+        } catch (_: Exception) {}
+
+        if (thread != null && thread !== Thread.currentThread()) {
+            try {
+                thread.join(500)
+                if (thread.isAlive) {
+                    thread.interrupt()
+                    thread.join(100)
+                }
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }
+
+        try {
+            record?.release()
+        } catch (_: Exception) {}
+
+        Log.i(TAG, "AudioStreamEngine stopped")
     }
 
     fun release() {

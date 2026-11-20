@@ -1,9 +1,12 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::BytesMut;
-use camcraft_core::client::{ClientConfig, ClientEvent, run_client_loop};
+use camcraft_core::client::{
+    ClientConfig, ClientError, ClientEvent, DEFAULT_READ_TIMEOUT, ReconnectConfig, run_client_loop,
+    run_client_with_reconnect,
+};
 use camcraft_core::vmic::{
     AudioWorkerSender, DEFAULT_FRAME_BYTES, DEFAULT_FRAME_SAMPLES, spawn_audio_worker,
 };
@@ -115,6 +118,7 @@ async fn test_client_receiver_end_to_end_mock_stream() {
         endpoint,
         interface: None,
         ping_interval: Duration::from_millis(50),
+        read_timeout: DEFAULT_READ_TIMEOUT,
         read_buffer_capacity: 65536,
     };
     let (event_tx, mut event_rx) = mpsc::channel(64);
@@ -353,4 +357,151 @@ async fn test_client_receiver_audio_stream_to_worker_sink() {
         .expect("should emit non-silent meter level");
     assert!(!level.muted);
     assert!(level.rms_db > -30.0);
+}
+
+#[tokio::test]
+async fn test_client_heartbeat_timeout_triggers_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+
+    let hold_open = Arc::new(AtomicBool::new(true));
+    let hold_open_c = hold_open.clone();
+    let server_handle = tokio::spawn(async move {
+        let (_socket, _) = listener.accept().await.unwrap();
+        while hold_open_c.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    });
+
+    let mut config = ClientConfig::new(endpoint);
+    config.ping_interval = Duration::from_millis(50);
+    config.read_timeout = Duration::from_millis(250);
+
+    let (event_tx, mut event_rx) = mpsc::channel(16);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let res = run_client_loop(config, event_tx, shutdown).await;
+
+    hold_open.store(false, Ordering::Relaxed);
+    let _ = server_handle.await;
+
+    assert!(
+        matches!(res, Err(ClientError::HeartbeatTimeout(_))),
+        "Expected HeartbeatTimeout error, got: {res:?}"
+    );
+
+    let mut saw_disconnected = false;
+    while let Ok(ev) = event_rx.try_recv() {
+        if matches!(ev, ClientEvent::Disconnected(_)) {
+            saw_disconnected = true;
+        }
+    }
+    assert!(saw_disconnected);
+}
+
+#[tokio::test]
+async fn test_client_auto_reconnect_recovers_after_abrupt_drop() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+
+    let server_handle = tokio::spawn(async move {
+        let make_hello = |name: &str| ControlHello {
+            device_name: name.to_string(),
+            protocol_version: 1,
+            cameras: vec![],
+            active_state: ActiveCameraState {
+                camera_id: "0".to_string(),
+                width: 1920,
+                height: 1080,
+                fps: 60,
+                bitrate_kbps: 12000,
+                zoom_ratio: 1.0,
+                exposure_ev: 0.0,
+                autofocus: true,
+                torch_on: false,
+                mirror_horizontal: false,
+                rotation_deg: 0,
+                audio_enabled: true,
+                audio_muted: false,
+            },
+        };
+
+        // Session 1: send Hello + 2 frames, then drop TCP socket abruptly
+        {
+            let (mut sock1, _) = listener.accept().await.unwrap();
+            sock1.set_nodelay(true).unwrap();
+            let mut out = BytesMut::new();
+            Packet::control_hello(100, &make_hello("Phone-Session-1"))
+                .unwrap()
+                .encode(&mut out);
+            Packet::video_frame(0, 200, bytes::Bytes::from_static(&[1, 2, 3, 4])).encode(&mut out);
+            sock1.write_all(&out).await.unwrap();
+            sock1.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Session 2: accept reconnected client and send Hello + frame
+        {
+            let (mut sock2, _) = listener.accept().await.unwrap();
+            sock2.set_nodelay(true).unwrap();
+            let mut out = BytesMut::new();
+            Packet::control_hello(300, &make_hello("Phone-Session-2"))
+                .unwrap()
+                .encode(&mut out);
+            Packet::video_frame(0, 400, bytes::Bytes::from_static(&[5, 6, 7, 8])).encode(&mut out);
+            sock2.write_all(&out).await.unwrap();
+            sock2.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    });
+
+    let config = ClientConfig::new(endpoint);
+    let reconnect = ReconnectConfig {
+        retry_interval: Duration::from_millis(100),
+        reconnect_on_initial_failure: false,
+    };
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    let hook_calls_c = hook_calls.clone();
+    let shutdown_c = shutdown.clone();
+
+    let client_task = tokio::spawn(async move {
+        run_client_with_reconnect(config, reconnect, event_tx, shutdown_c, move |attempt| {
+            let counter = hook_calls_c.clone();
+            async move {
+                assert_eq!(attempt, 1);
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .await
+    });
+
+    let mut hellos = Vec::new();
+    let mut reconnecting_attempts = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+
+    while std::time::Instant::now() < deadline && hellos.len() < 2 {
+        if let Ok(Some(ev)) =
+            tokio::time::timeout(Duration::from_millis(200), event_rx.recv()).await
+        {
+            match ev {
+                ClientEvent::Hello(hello) => hellos.push(hello.device_name),
+                ClientEvent::Reconnecting { attempt, .. } => reconnecting_attempts.push(attempt),
+                _ => {}
+            }
+        }
+    }
+
+    shutdown.store(true, Ordering::Relaxed);
+    let client_res = client_task.await.unwrap();
+    let _ = server_handle.await;
+
+    assert!(
+        client_res.is_ok(),
+        "Expected clean shutdown: {client_res:?}"
+    );
+    assert_eq!(hellos, vec!["Phone-Session-1", "Phone-Session-2"]);
+    assert_eq!(reconnecting_attempts, vec![1]);
+    assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
 }

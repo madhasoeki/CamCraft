@@ -13,7 +13,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use crossbeam_channel::{Receiver, Sender, TrySendError};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 use ffmpeg_next::codec::flag::Flags as CodecFlags;
 use ffmpeg_next::format::Pixel;
 use ffmpeg_next::software::scaling::{Context as ScaleContext, flag::Flags as ScaleFlags};
@@ -22,13 +22,26 @@ use ffmpeg_next::util::frame::video::Video as VideoFrame;
 use thiserror::Error;
 use tracing::{debug, info, trace, warn};
 
-use crate::vcam::VirtualCameraSink;
+use crate::vcam::{StandbyKind, VirtualCameraSink, fill_standby_frame};
 
-/// Maximum number of unrendered frames queued before dropping non-keyframes.
+/// Maximum number of unrendered frames queued before dropping non-keyframes (default unit capacity).
 pub const DECODER_QUEUE_CAPACITY: usize = 3;
 
+/// Queue capacity used by live streaming sessions to absorb network/Wi-Fi jitter without
+/// triggering premature keyframe recovery storms while still capping worst-case delay.
+pub const LIVE_DECODER_QUEUE_CAPACITY: usize = 6;
+
+/// Maximum width (in pixels) used for the desktop GUI live preview texture.
+pub const DEFAULT_PREVIEW_MAX_WIDTH: u32 = 960;
+
+/// Minimum interval between desktop GUI preview uploads (~33 FPS) while `/dev/video10` receives full FPS.
+pub const PREVIEW_MIN_INTERVAL: Duration = Duration::from_millis(30);
+
+/// Cadence for keepalive standby frames while reconnecting (5 FPS keeps V4L2 consumers alive).
+pub const STANDBY_FRAME_INTERVAL: Duration = Duration::from_millis(200);
+
 /// Minimum interval between outbound keyframe recovery requests.
-pub const KEYFRAME_REQUEST_COOLDOWN: Duration = Duration::from_millis(500);
+pub const KEYFRAME_REQUEST_COOLDOWN: Duration = Duration::from_secs(1);
 
 /// Maximum expected inter-frame PTS gap (microseconds) before suspecting dropped packets.
 pub const MAX_INTER_FRAME_GAP_US: u64 = 500_000;
@@ -231,6 +244,35 @@ impl KeyframeRecoveryTracker {
     }
 }
 
+/// Lightweight downscaled RGBA frame produced lazily for the desktop GUI preview.
+#[derive(Debug, Clone)]
+pub struct PreviewFrame {
+    /// Original decoded stream width in pixels (e.g. 1920).
+    pub source_width: u32,
+    /// Original decoded stream height in pixels (e.g. 1080).
+    pub source_height: u32,
+    /// Scaled preview texture width in pixels (e.g. 960).
+    pub preview_width: u32,
+    /// Scaled preview texture height in pixels (e.g. 540).
+    pub preview_height: u32,
+    /// Time spent decoding and packing the frame in milliseconds.
+    pub decode_time_ms: f32,
+    /// Contiguous RGBA pixel buffer sized `preview_width * preview_height * 4`.
+    pub rgba: Vec<u8>,
+}
+
+/// Computes even-aligned GUI preview dimensions capped at `max_width` without upscaling.
+#[must_use]
+pub fn compute_preview_dimensions(src_w: u32, src_h: u32, max_width: u32) -> (u32, u32) {
+    if src_w == 0 || src_h == 0 || max_width == 0 || src_w <= max_width {
+        return (src_w, src_h);
+    }
+    let dst_w = (max_width & !1).max(2);
+    let scaled_h = (u64::from(src_h) * u64::from(dst_w)) / u64::from(src_w);
+    let dst_h = ((scaled_h as u32) & !1).max(2);
+    (dst_w, dst_h)
+}
+
 /// A decoded video frame with contiguous pixel buffers (owned variant for cross-thread preview).
 #[derive(Debug, Clone)]
 pub struct DecodedFrame {
@@ -299,6 +341,8 @@ pub enum DecoderCommand {
     },
     /// Flush decoder buffers.
     Flush,
+    /// Reset decoder and continuously emit standby frames on the V4L2 sink until live frames resume.
+    EnterStandby,
     /// Terminate decoder worker.
     Stop,
 }
@@ -306,6 +350,8 @@ pub enum DecoderCommand {
 struct CachedScaler {
     ctx: ScaleContext,
     dst_frame: VideoFrame,
+    dst_width: u32,
+    dst_height: u32,
 }
 
 struct FrameConverter {
@@ -331,13 +377,7 @@ impl FrameConverter {
         }
     }
 
-    fn convert(
-        &mut self,
-        raw: &VideoFrame,
-        pts_us: u64,
-        is_keyframe: bool,
-        decode_time_ms: f32,
-    ) -> Result<DecodedFrameRef<'_>, DecoderError> {
+    fn extract_yuv420p(&mut self, raw: &VideoFrame) -> Result<(u32, u32, &[u8]), DecoderError> {
         let width = raw.width();
         let height = raw.height();
         let format = raw.format();
@@ -348,12 +388,19 @@ impl FrameConverter {
             ));
         }
 
-        // 1. Convert/pack to contiguous YUV420P buffer for V4L2 without per-frame allocation
-        if format == Pixel::YUV420P {
+        // YUV420P and YUVJ420P share identical planar 4:2:0 memory layout; avoid libswscale copy.
+        if matches!(format, Pixel::YUV420P | Pixel::YUVJ420P) {
             copy_contiguous_yuv420p(raw, width, height, &mut self.yuv_scratch);
         } else {
-            let (scaler, _rebuilt) =
-                get_or_init_scaler(&mut self.yuv_scaler, format, width, height, Pixel::YUV420P)?;
+            let (scaler, _rebuilt) = get_or_init_scaler(
+                &mut self.yuv_scaler,
+                format,
+                width,
+                height,
+                Pixel::YUV420P,
+                width,
+                height,
+            )?;
             scaler
                 .ctx
                 .run(raw, &mut scaler.dst_frame)
@@ -361,25 +408,58 @@ impl FrameConverter {
             copy_contiguous_yuv420p(&scaler.dst_frame, width, height, &mut self.yuv_scratch);
         }
 
-        // 2. Convert to RGBA if GUI preview is enabled
-        let rgba = if self.enable_rgba {
-            let (scaler, rebuilt) =
-                get_or_init_scaler(&mut self.rgba_scaler, format, width, height, Pixel::RGBA)?;
-            #[cfg(test)]
-            if rebuilt {
-                self.rgba_scaler_rebuilds += 1;
-            }
-            #[cfg(not(test))]
-            let _ = rebuilt;
+        Ok((width, height, self.yuv_scratch.as_slice()))
+    }
 
-            scaler
-                .ctx
-                .run(raw, &mut scaler.dst_frame)
-                .map_err(DecoderError::Ffmpeg)?;
-            copy_contiguous_rgba(&scaler.dst_frame, width, height, &mut self.rgba_scratch);
-            Some(self.rgba_scratch.as_slice())
+    fn convert_preview_rgba(
+        &mut self,
+        raw: &VideoFrame,
+        max_width: u32,
+    ) -> Result<(u32, u32, &[u8]), DecoderError> {
+        let width = raw.width();
+        let height = raw.height();
+        let format = raw.format();
+        let (dst_w, dst_h) = compute_preview_dimensions(width, height, max_width);
+
+        let (scaler, rebuilt) = get_or_init_scaler(
+            &mut self.rgba_scaler,
+            format,
+            width,
+            height,
+            Pixel::RGBA,
+            dst_w,
+            dst_h,
+        )?;
+        #[cfg(test)]
+        if rebuilt {
+            self.rgba_scaler_rebuilds += 1;
+        }
+        #[cfg(not(test))]
+        let _ = rebuilt;
+
+        scaler
+            .ctx
+            .run(raw, &mut scaler.dst_frame)
+            .map_err(DecoderError::Ffmpeg)?;
+        copy_contiguous_rgba(&scaler.dst_frame, dst_w, dst_h, &mut self.rgba_scratch);
+        Ok((dst_w, dst_h, self.rgba_scratch.as_slice()))
+    }
+
+    fn convert(
+        &mut self,
+        raw: &VideoFrame,
+        pts_us: u64,
+        is_keyframe: bool,
+        decode_time_ms: f32,
+    ) -> Result<DecodedFrameRef<'_>, DecoderError> {
+        let (width, height, _) = self.extract_yuv420p(raw)?;
+
+        // Convert to full-resolution RGBA only if explicitly requested by legacy callers
+        let has_rgba = if self.enable_rgba {
+            let _ = self.convert_preview_rgba(raw, width)?;
+            true
         } else {
-            None
+            false
         };
 
         Ok(DecodedFrameRef {
@@ -389,7 +469,7 @@ impl FrameConverter {
             is_keyframe,
             decode_time_ms,
             yuv420p: self.yuv_scratch.as_slice(),
-            rgba,
+            rgba: has_rgba.then_some(self.rgba_scratch.as_slice()),
         })
     }
 }
@@ -397,14 +477,20 @@ impl FrameConverter {
 fn get_or_init_scaler(
     slot: &mut Option<CachedScaler>,
     src_format: Pixel,
-    width: u32,
-    height: u32,
+    src_width: u32,
+    src_height: u32,
     dst_format: Pixel,
+    dst_width: u32,
+    dst_height: u32,
 ) -> Result<(&mut CachedScaler, bool), DecoderError> {
     let needs_rebuild = match slot.as_ref() {
         Some(cached) => {
             let input = cached.ctx.input();
-            input.format != src_format || input.width != width || input.height != height
+            input.format != src_format
+                || input.width != src_width
+                || input.height != src_height
+                || cached.dst_width != dst_width
+                || cached.dst_height != dst_height
         }
         None => true,
     };
@@ -413,17 +499,19 @@ fn get_or_init_scaler(
         debug!(
             ?src_format,
             ?dst_format,
-            width,
-            height,
+            src_width,
+            src_height,
+            dst_width,
+            dst_height,
             "Configuring libswscale scaler"
         );
         let ctx = ScaleContext::get(
             src_format,
-            width,
-            height,
+            src_width,
+            src_height,
             dst_format,
-            width,
-            height,
+            dst_width,
+            dst_height,
             ScaleFlags::FAST_BILINEAR,
         )
         .map_err(DecoderError::Ffmpeg)?;
@@ -431,6 +519,8 @@ fn get_or_init_scaler(
         *slot = Some(CachedScaler {
             ctx,
             dst_frame: VideoFrame::empty(),
+            dst_width,
+            dst_height,
         });
     }
 
@@ -503,23 +593,12 @@ impl H264Decoder {
         Ok(())
     }
 
-    /// Feeds a `VIDEO_FRAME` packet and invokes `on_frame` for each decoded frame without
-    /// allocating new pixel buffers in steady state.
-    pub fn decode_frame_with<F>(
+    fn send_annex_b_packet(
         &mut self,
         pts_us: u64,
         is_keyframe: bool,
         data: &[u8],
-        mut on_frame: F,
-    ) -> Result<(), DecoderError>
-    where
-        F: FnMut(DecodedFrameRef<'_>),
-    {
-        if data.is_empty() {
-            return Ok(());
-        }
-
-        let decode_start = std::time::Instant::now();
+    ) -> Result<(), DecoderError> {
         self.last_pts_us = pts_us;
         self.last_is_keyframe = is_keyframe;
 
@@ -538,25 +617,54 @@ impl H264Decoder {
         packet.set_pts(i64::try_from(pts_us).ok());
         self.decoder
             .send_packet(&packet)
-            .map_err(DecoderError::Ffmpeg)?;
+            .map_err(DecoderError::Ffmpeg)
+    }
+
+    fn validate_decoded_raw_frame(
+        &self,
+        pts_us: u64,
+        is_keyframe: bool,
+    ) -> Result<(), DecoderError> {
+        if self.raw_frame.is_corrupt() || self.raw_frame.has_decode_errors() {
+            warn!(
+                pts_us,
+                is_keyframe,
+                corrupt = self.raw_frame.is_corrupt(),
+                decode_error_flags = ?self.raw_frame.decode_error_flags(),
+                "Discarding corrupted decoded H.264 frame"
+            );
+            return Err(DecoderError::CorruptedFrame(format!(
+                "frame pts={pts_us} corrupt={} decode_errors={}",
+                self.raw_frame.is_corrupt(),
+                self.raw_frame.has_decode_errors()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Feeds a `VIDEO_FRAME` packet and invokes `on_frame` for each decoded frame without
+    /// allocating new pixel buffers in steady state.
+    pub fn decode_frame_with<F>(
+        &mut self,
+        pts_us: u64,
+        is_keyframe: bool,
+        data: &[u8],
+        mut on_frame: F,
+    ) -> Result<(), DecoderError>
+    where
+        F: FnMut(DecodedFrameRef<'_>),
+    {
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let decode_start = std::time::Instant::now();
+        self.send_annex_b_packet(pts_us, is_keyframe, data)?;
 
         loop {
             match self.decoder.receive_frame(&mut self.raw_frame) {
                 Ok(()) => {
-                    if self.raw_frame.is_corrupt() || self.raw_frame.has_decode_errors() {
-                        warn!(
-                            pts_us,
-                            is_keyframe,
-                            corrupt = self.raw_frame.is_corrupt(),
-                            decode_error_flags = ?self.raw_frame.decode_error_flags(),
-                            "Discarding corrupted decoded H.264 frame"
-                        );
-                        return Err(DecoderError::CorruptedFrame(format!(
-                            "frame pts={pts_us} corrupt={} decode_errors={}",
-                            self.raw_frame.is_corrupt(),
-                            self.raw_frame.has_decode_errors()
-                        )));
-                    }
+                    self.validate_decoded_raw_frame(pts_us, is_keyframe)?;
                     let frame_pts_us = self
                         .raw_frame
                         .pts()
@@ -573,6 +681,68 @@ impl H264Decoder {
                 }
                 Err(ffmpeg_next::Error::Other { errno }) if errno == EAGAIN => {
                     // Decoder needs more input packets before returning more frames
+                    break;
+                }
+                Err(ffmpeg_next::Error::Eof) => {
+                    break;
+                }
+                Err(e) => {
+                    warn!(error = %e, "Decoder receive_frame returned error");
+                    return Err(DecoderError::Ffmpeg(e));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Decodes a `VIDEO_FRAME`, emits contiguous `YUV420P` immediately to `on_yuv` (for V4L2),
+    /// and builds a downscaled RGBA [`PreviewFrame`] only when `preview_max_width()` returns
+    /// `Some(max_width)`.
+    pub fn decode_yuv_and_optional_preview<FYuv, FPreview>(
+        &mut self,
+        pts_us: u64,
+        is_keyframe: bool,
+        data: &[u8],
+        mut on_yuv: FYuv,
+        mut preview_max_width: impl FnMut() -> Option<u32>,
+        mut on_preview: FPreview,
+    ) -> Result<(), DecoderError>
+    where
+        FYuv: FnMut(u32, u32, &[u8], f32),
+        FPreview: FnMut(PreviewFrame),
+    {
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let decode_start = std::time::Instant::now();
+        self.send_annex_b_packet(pts_us, is_keyframe, data)?;
+
+        loop {
+            match self.decoder.receive_frame(&mut self.raw_frame) {
+                Ok(()) => {
+                    self.validate_decoded_raw_frame(pts_us, is_keyframe)?;
+                    let decode_time_ms = decode_start.elapsed().as_secs_f32() * 1000.0;
+                    let (width, height, yuv_slice) =
+                        self.converter.extract_yuv420p(&self.raw_frame)?;
+                    on_yuv(width, height, yuv_slice, decode_time_ms);
+
+                    if let Some(max_width) = preview_max_width() {
+                        let (preview_width, preview_height, rgba_slice) = self
+                            .converter
+                            .convert_preview_rgba(&self.raw_frame, max_width)?;
+                        on_preview(PreviewFrame {
+                            source_width: width,
+                            source_height: height,
+                            preview_width,
+                            preview_height,
+                            decode_time_ms,
+                            rgba: rgba_slice.to_vec(),
+                        });
+                    }
+                }
+                Err(ffmpeg_next::Error::Other { errno }) if errno == EAGAIN => {
                     break;
                 }
                 Err(ffmpeg_next::Error::Eof) => {
@@ -645,6 +815,14 @@ impl H264Decoder {
     pub fn reset_after_error(&mut self) {
         self.decoder.flush();
         self.pending_config = !self.cached_config.is_empty();
+    }
+
+    /// Flushes decoder state and clears cached SPS/PPS configuration when entering standby
+    /// so a reconnected stream initializes cleanly from fresh `VIDEO_CONFIG` parameter sets.
+    pub fn reset_for_reconnect(&mut self) {
+        self.decoder.flush();
+        self.cached_config.clear();
+        self.pending_config = false;
     }
 }
 
@@ -740,17 +918,26 @@ pub struct DecoderSender {
     cmd_tx: Sender<DecoderCommand>,
     cmd_rx_drain: Receiver<DecoderCommand>,
     next_seq: Arc<AtomicU64>,
+    capacity: usize,
 }
 
 impl DecoderSender {
     /// Creates a sender/receiver pair with a bounded queue of capacity [`DECODER_QUEUE_CAPACITY`].
     #[must_use]
     pub fn new_bounded() -> (Self, Receiver<DecoderCommand>) {
-        let (tx, rx) = crossbeam_channel::bounded(DECODER_QUEUE_CAPACITY);
+        Self::new_with_capacity(DECODER_QUEUE_CAPACITY)
+    }
+
+    /// Creates a sender/receiver pair with an explicit bounded queue `capacity` (`>= 1`).
+    #[must_use]
+    pub fn new_with_capacity(capacity: usize) -> (Self, Receiver<DecoderCommand>) {
+        let cap = capacity.max(1);
+        let (tx, rx) = crossbeam_channel::bounded(cap);
         let sender = Self {
             cmd_tx: tx,
             cmd_rx_drain: rx.clone(),
             next_seq: Arc::new(AtomicU64::new(0)),
+            capacity: cap,
         };
         (sender, rx)
     }
@@ -759,22 +946,16 @@ impl DecoderSender {
     /// `Config` if no `Frame` is present) while preserving relative order of `Config`/`Flush`/`Stop`,
     /// and re-inserts the remaining commands.
     fn drop_one_stale_frame(&self) -> bool {
-        let mut drained: [Option<DecoderCommand>; DECODER_QUEUE_CAPACITY] =
-            [const { None }; DECODER_QUEUE_CAPACITY];
-        let mut count = 0;
-
-        while count < DECODER_QUEUE_CAPACITY {
+        let mut drained: Vec<Option<DecoderCommand>> = Vec::with_capacity(self.capacity);
+        while drained.len() < self.capacity {
             match self.cmd_rx_drain.try_recv() {
-                Ok(cmd) => {
-                    drained[count] = Some(cmd);
-                    count += 1;
-                }
+                Ok(cmd) => drained.push(Some(cmd)),
                 Err(_) => break,
             }
         }
 
         let mut freed = false;
-        for slot in &mut drained[..count] {
+        for slot in &mut drained {
             if matches!(slot, Some(DecoderCommand::Frame { .. })) {
                 *slot = None;
                 freed = true;
@@ -784,11 +965,11 @@ impl DecoderSender {
 
         // If no frames are queued, coalesce any superseded older Config before the latest Config.
         if !freed {
-            let last_config_idx = drained[..count]
+            let last_config_idx = drained
                 .iter()
                 .rposition(|slot| matches!(slot, Some(DecoderCommand::Config { .. })));
             if let Some(last_idx) = last_config_idx {
-                for (idx, slot) in drained[..count].iter_mut().enumerate() {
+                for (idx, slot) in drained.iter_mut().enumerate() {
                     if idx < last_idx && matches!(slot, Some(DecoderCommand::Config { .. })) {
                         *slot = None;
                         freed = true;
@@ -797,7 +978,7 @@ impl DecoderSender {
             }
         }
 
-        for slot in &mut drained[..count] {
+        for slot in &mut drained {
             if let Some(cmd) = slot.take() {
                 let _ = self.cmd_tx.try_send(cmd);
             }
@@ -809,22 +990,16 @@ impl DecoderSender {
     /// Fallback used by `push_config` / `stop` when no frames are queued: drops the oldest
     /// queued `Config` while preserving relative order of remaining commands.
     fn drop_oldest_config(&self) -> bool {
-        let mut drained: [Option<DecoderCommand>; DECODER_QUEUE_CAPACITY] =
-            [const { None }; DECODER_QUEUE_CAPACITY];
-        let mut count = 0;
-
-        while count < DECODER_QUEUE_CAPACITY {
+        let mut drained: Vec<Option<DecoderCommand>> = Vec::with_capacity(self.capacity);
+        while drained.len() < self.capacity {
             match self.cmd_rx_drain.try_recv() {
-                Ok(cmd) => {
-                    drained[count] = Some(cmd);
-                    count += 1;
-                }
+                Ok(cmd) => drained.push(Some(cmd)),
                 Err(_) => break,
             }
         }
 
         let mut freed = false;
-        for slot in &mut drained[..count] {
+        for slot in &mut drained {
             if matches!(slot, Some(DecoderCommand::Config { .. })) {
                 *slot = None;
                 freed = true;
@@ -832,7 +1007,7 @@ impl DecoderSender {
             }
         }
 
-        for slot in &mut drained[..count] {
+        for slot in &mut drained {
             if let Some(cmd) = slot.take() {
                 let _ = self.cmd_tx.try_send(cmd);
             }
@@ -912,6 +1087,16 @@ impl DecoderSender {
         }
     }
 
+    /// Switches the decoder worker into standby mode without closing the virtual camera sink.
+    pub fn enter_standby(&self) {
+        if let Err(TrySendError::Full(cmd)) = self.cmd_tx.try_send(DecoderCommand::EnterStandby) {
+            if !self.drop_one_stale_frame() {
+                let _ = self.drop_oldest_config();
+            }
+            let _ = self.cmd_tx.try_send(cmd);
+        }
+    }
+
     /// Requests the decoder worker to flush and terminate without blocking.
     pub fn stop(&self) {
         if let Err(TrySendError::Full(cmd)) = self.cmd_tx.try_send(DecoderCommand::Stop) {
@@ -920,6 +1105,29 @@ impl DecoderSender {
             }
             let _ = self.cmd_tx.try_send(cmd);
         }
+    }
+}
+
+fn write_standby_tick(
+    sink: &mut Option<Box<dyn VirtualCameraSink>>,
+    last_dims: (u32, u32),
+    standby_buf: &mut Vec<u8>,
+    standby_buf_dims: &mut (u32, u32),
+) {
+    let Some(vcam_sink) = sink.as_mut() else {
+        return;
+    };
+    if *standby_buf_dims != last_dims {
+        fill_standby_frame(
+            standby_buf,
+            last_dims.0,
+            last_dims.1,
+            StandbyKind::Reconnecting,
+        );
+        *standby_buf_dims = last_dims;
+    }
+    if let Err(e) = vcam_sink.write_frame(last_dims.0, last_dims.1, standby_buf) {
+        warn!(error = %e, "Failed to write standby frame to virtual camera sink");
     }
 }
 
@@ -952,12 +1160,69 @@ pub fn spawn_decoder_worker(
     spawn_decoder_worker_with_recovery(cmd_rx, sink, frame_tx, enable_rgba, running, None)
 }
 
+enum WorkerOutputMode {
+    Legacy {
+        frame_tx: Option<Sender<DecodedFrame>>,
+        enable_rgba: bool,
+    },
+    LowLatency {
+        preview_tx: Option<Sender<PreviewFrame>>,
+        preview_enabled: Arc<AtomicBool>,
+        preview_max_width: u32,
+        last_preview_sent: Option<Instant>,
+    },
+}
+
 /// Spawns the dedicated background worker thread (`camcraft-vdec`) with keyframe recovery signaling.
 pub fn spawn_decoder_worker_with_recovery(
     cmd_rx: Receiver<DecoderCommand>,
-    mut sink: Option<Box<dyn VirtualCameraSink>>,
+    sink: Option<Box<dyn VirtualCameraSink>>,
     frame_tx: Option<Sender<DecodedFrame>>,
     enable_rgba: bool,
+    running: Arc<AtomicBool>,
+    keyframe_req_tx: Option<Sender<KeyframeRequestReason>>,
+) -> std::io::Result<JoinHandle<Result<(), DecoderError>>> {
+    spawn_decoder_worker_inner(
+        cmd_rx,
+        sink,
+        WorkerOutputMode::Legacy {
+            frame_tx,
+            enable_rgba,
+        },
+        running,
+        keyframe_req_tx,
+    )
+}
+
+/// Spawns a V4L2-first low-latency decoder worker (`camcraft-vdec`) that writes YUV420P frames
+/// directly to `/dev/video*` before building downscaled GUI [`PreviewFrame`]s on demand.
+pub fn spawn_decoder_worker_low_latency(
+    cmd_rx: Receiver<DecoderCommand>,
+    sink: Option<Box<dyn VirtualCameraSink>>,
+    preview_tx: Option<Sender<PreviewFrame>>,
+    preview_enabled: Arc<AtomicBool>,
+    preview_max_width: u32,
+    running: Arc<AtomicBool>,
+    keyframe_req_tx: Option<Sender<KeyframeRequestReason>>,
+) -> std::io::Result<JoinHandle<Result<(), DecoderError>>> {
+    spawn_decoder_worker_inner(
+        cmd_rx,
+        sink,
+        WorkerOutputMode::LowLatency {
+            preview_tx,
+            preview_enabled,
+            preview_max_width,
+            last_preview_sent: None,
+        },
+        running,
+        keyframe_req_tx,
+    )
+}
+
+fn spawn_decoder_worker_inner(
+    cmd_rx: Receiver<DecoderCommand>,
+    mut sink: Option<Box<dyn VirtualCameraSink>>,
+    mut output_mode: WorkerOutputMode,
     running: Arc<AtomicBool>,
     keyframe_req_tx: Option<Sender<KeyframeRequestReason>>,
 ) -> std::io::Result<JoinHandle<Result<(), DecoderError>>> {
@@ -965,9 +1230,23 @@ pub fn spawn_decoder_worker_with_recovery(
         .name("camcraft-vdec".to_string())
         .spawn(move || {
             info!("Dedicated video decoder thread started (camcraft-vdec)");
-            let mut decoder = H264Decoder::new(enable_rgba)?;
+            let init_rgba = matches!(
+                output_mode,
+                WorkerOutputMode::Legacy {
+                    enable_rgba: true,
+                    ..
+                }
+            );
+            let mut decoder = H264Decoder::new(init_rgba)?;
             let mut tracker = KeyframeRecoveryTracker::default();
             let mut last_frame_seq: Option<u64> = None;
+            let mut in_standby = false;
+            let mut last_dims = sink
+                .as_ref()
+                .and_then(|s| s.current_dimensions())
+                .unwrap_or((1920, 1080));
+            let mut standby_buf: Vec<u8> = Vec::new();
+            let mut standby_buf_dims: (u32, u32) = (0, 0);
 
             let emit_keyframe_req = |reason: Option<KeyframeRequestReason>| {
                 if let (Some(r), Some(tx)) = (reason, keyframe_req_tx.as_ref()) {
@@ -976,19 +1255,46 @@ pub fn spawn_decoder_worker_with_recovery(
             };
 
             while running.load(Ordering::Relaxed) {
-                match cmd_rx.recv() {
-                    Ok(DecoderCommand::Config { pts_us, data }) => {
+                let cmd = if in_standby {
+                    match cmd_rx.recv_timeout(STANDBY_FRAME_INTERVAL) {
+                        Ok(cmd) => cmd,
+                        Err(RecvTimeoutError::Timeout) => {
+                            write_standby_tick(
+                                &mut sink,
+                                last_dims,
+                                &mut standby_buf,
+                                &mut standby_buf_dims,
+                            );
+                            continue;
+                        }
+                        Err(RecvTimeoutError::Disconnected) => {
+                            info!("Video decoder command channel disconnected");
+                            break;
+                        }
+                    }
+                } else {
+                    match cmd_rx.recv() {
+                        Ok(cmd) => cmd,
+                        Err(_) => {
+                            info!("Video decoder command channel disconnected");
+                            break;
+                        }
+                    }
+                };
+
+                match cmd {
+                    DecoderCommand::Config { pts_us, data } => {
                         tracker.on_config_received();
                         if let Err(e) = decoder.decode_config(pts_us, &data) {
                             warn!(error = %e, "Failed to decode VIDEO_CONFIG");
                         }
                     }
-                    Ok(DecoderCommand::Frame {
+                    DecoderCommand::Frame {
                         seq,
                         pts_us,
                         is_keyframe,
                         data,
-                    }) => {
+                    } => {
                         let now = Instant::now();
                         if !is_keyframe
                             && let Some(prev_seq) = last_frame_seq
@@ -1010,10 +1316,60 @@ pub fn spawn_decoder_worker_with_recovery(
                         }
 
                         let mut decoded_count = 0usize;
-                        let decode_res = decoder.decode_frame_with(pts_us, is_keyframe, &data, |frame| {
-                            decoded_count += 1;
-                            dispatch_decoded_frame(frame, &mut sink, &frame_tx);
-                        });
+                        let decode_res = match &mut output_mode {
+                            WorkerOutputMode::Legacy { frame_tx, .. } => {
+                                decoder.decode_frame_with(pts_us, is_keyframe, &data, |frame| {
+                                    decoded_count += 1;
+                                    last_dims = (frame.width, frame.height);
+                                    in_standby = false;
+                                    dispatch_decoded_frame(frame, &mut sink, frame_tx);
+                                })
+                            }
+                            WorkerOutputMode::LowLatency {
+                                preview_tx,
+                                preview_enabled,
+                                preview_max_width,
+                                last_preview_sent,
+                            } => {
+                                let has_vcam = sink.is_some();
+                                let preview_channel_ready =
+                                    preview_enabled.load(Ordering::Relaxed)
+                                        && preview_tx.as_ref().is_some_and(|tx| !tx.is_full());
+                                let interval_elapsed = !has_vcam
+                                    || last_preview_sent
+                                        .is_none_or(|t| t.elapsed() >= PREVIEW_MIN_INTERVAL);
+                                let want_preview = preview_channel_ready && interval_elapsed;
+
+                                let preview_limit = want_preview.then_some(*preview_max_width);
+
+                                decoder.decode_yuv_and_optional_preview(
+                                    pts_us,
+                                    is_keyframe,
+                                    &data,
+                                    |width, height, yuv420p, _decode_time_ms| {
+                                        decoded_count += 1;
+                                        last_dims = (width, height);
+                                        in_standby = false;
+                                        if let Some(vcam_sink) = sink.as_mut()
+                                            && let Err(e) =
+                                                vcam_sink.write_frame(width, height, yuv420p)
+                                        {
+                                            warn!(
+                                                error = %e,
+                                                "Failed to write frame to virtual camera sink"
+                                            );
+                                        }
+                                    },
+                                    || preview_limit,
+                                    |preview| {
+                                        *last_preview_sent = Some(Instant::now());
+                                        if let Some(tx) = preview_tx.as_ref() {
+                                            let _ = tx.try_send(preview);
+                                        }
+                                    },
+                                )
+                            }
+                        };
 
                         match decode_res {
                             Ok(()) => {
@@ -1031,14 +1387,36 @@ pub fn spawn_decoder_worker_with_recovery(
                             }
                         }
                     }
-                    Ok(DecoderCommand::Flush) => {
+                    DecoderCommand::Flush => {
+                        let legacy_tx = match &output_mode {
+                            WorkerOutputMode::Legacy { frame_tx, .. } => frame_tx,
+                            WorkerOutputMode::LowLatency { .. } => &None,
+                        };
                         if let Err(e) = decoder.flush_with(|frame| {
-                            dispatch_decoded_frame(frame, &mut sink, &frame_tx);
+                            last_dims = (frame.width, frame.height);
+                            dispatch_decoded_frame(frame, &mut sink, legacy_tx);
                         }) {
                             warn!(error = %e, "Failed to flush video decoder");
                         }
                     }
-                    Ok(DecoderCommand::Stop) | Err(_) => {
+                    DecoderCommand::EnterStandby => {
+                        info!(
+                            width = last_dims.0,
+                            height = last_dims.1,
+                            "Video decoder entering standby frame mode"
+                        );
+                        decoder.reset_for_reconnect();
+                        tracker = KeyframeRecoveryTracker::default();
+                        last_frame_seq = None;
+                        in_standby = true;
+                        write_standby_tick(
+                            &mut sink,
+                            last_dims,
+                            &mut standby_buf,
+                            &mut standby_buf_dims,
+                        );
+                    }
+                    DecoderCommand::Stop => {
                         info!("Video decoder worker received stop signal");
                         break;
                     }
@@ -1440,5 +1818,46 @@ mod tests {
         sender.stop();
         running.store(false, Ordering::Relaxed);
         assert!(handle.join().expect("worker join").is_ok());
+    }
+
+    #[test]
+    fn compute_preview_dimensions_scales_proportionally_without_upscaling() {
+        assert_eq!(compute_preview_dimensions(1920, 1080, 960), (960, 540));
+        assert_eq!(compute_preview_dimensions(3840, 2160, 960), (960, 540));
+        assert_eq!(compute_preview_dimensions(640, 480, 960), (640, 480));
+        assert_eq!(compute_preview_dimensions(1080, 1920, 960), (960, 1706));
+        let (odd_w, odd_h) = compute_preview_dimensions(1001, 751, 501);
+        assert_eq!(odd_w % 2, 0);
+        assert_eq!(odd_h % 2, 0);
+        assert_eq!(compute_preview_dimensions(0, 1080, 960), (0, 1080));
+    }
+
+    #[test]
+    fn decoder_sender_live_capacity_queues_six_frames_before_backpressure() {
+        let (sender, rx) = DecoderSender::new_with_capacity(LIVE_DECODER_QUEUE_CAPACITY);
+        let payload = Bytes::from_static(b"\x00\x00\x00\x01\x41P");
+
+        for idx in 0..LIVE_DECODER_QUEUE_CAPACITY {
+            assert!(
+                sender
+                    .push_frame((idx as u64) * 16_666, idx == 0, payload.clone())
+                    .unwrap()
+            );
+        }
+        assert_eq!(rx.len(), LIVE_DECODER_QUEUE_CAPACITY);
+        // 7th P-frame drops under full capacity
+        assert!(!sender.push_frame(100_000, false, payload).unwrap());
+    }
+
+    #[test]
+    fn h264_decoder_avoids_yuv_swscale_for_planar_420_streams() {
+        let mut dec = H264Decoder::new(false).expect("H264Decoder should init");
+        dec.decode_config(0, SPS_PPS_64X64).unwrap();
+        let frames = dec.decode_frame(1_000, true, IDR_64X64_RED).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert!(
+            dec.converter.yuv_scaler.is_none(),
+            "YUV420P/YUVJ420P should pack directly without libswscale YUV conversion"
+        );
     }
 }

@@ -22,6 +22,7 @@ import java.io.DataInputStream
 import java.io.EOFException
 import java.io.IOException
 import java.io.OutputStream
+import java.lang.ref.WeakReference
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
@@ -178,17 +179,18 @@ class CamCraftStreamService : Service() {
         }
 
         try {
-            val cameras = CameraEnumerator.enumerateCameras(this)
+            val appContext = applicationContext ?: this
+            val cameras = CameraEnumerator.enumerateCameras(appContext)
             _serviceState.update { it.copy(cameras = cameras) }
-            val manager = CameraStreamManager(this) { packetType, flags, ptsUs, payload ->
+            val manager = CameraStreamManager(appContext) { packetType, flags, ptsUs, payload ->
                 handleVideoPacketFromEncoder(packetType, flags, ptsUs, payload)
             }
             cameraStreamManager = manager
-            audioStreamEngine = AudioStreamEngine(this) { packetType, ptsUs, payload, length ->
+            audioStreamEngine = AudioStreamEngine(appContext) { packetType, ptsUs, payload, length ->
                 handleAudioPacketFromEngine(packetType, ptsUs, payload, length)
             }
             activeInstance = this
-            pendingPreviewView?.let { previewView ->
+            pendingPreviewView?.get()?.let { previewView ->
                 manager.attachPreviewView(previewView)
             }
         } catch (e: Exception) {
@@ -225,6 +227,7 @@ class CamCraftStreamService : Service() {
         audioStreamEngine = null
         cameraStreamManager?.release()
         cameraStreamManager = null
+        pendingPreviewView = null
         if (activeInstance == this) {
             activeInstance = null
         }
@@ -265,9 +268,10 @@ class CamCraftStreamService : Service() {
         isStopping.set(false)
 
         serverJob = serviceScope.launch {
+            var socket: ServerSocket? = null
             try {
                 val port = CcftProtocolConstants.DEFAULT_PORT
-                val socket = ServerSocket(port).apply {
+                socket = ServerSocket(port).apply {
                     reuseAddress = true
                 }
                 serverSocket = socket
@@ -315,6 +319,15 @@ class CamCraftStreamService : Service() {
                     )
                 }
                 updateNotification("Error: ${e.message}")
+            } finally {
+                if (socket != null) {
+                    try {
+                        socket.close()
+                    } catch (_: IOException) {}
+                    if (serverSocket === socket) {
+                        serverSocket = null
+                    }
+                }
             }
         }
     }
@@ -344,6 +357,12 @@ class CamCraftStreamService : Service() {
             true
         } catch (e: IOException) {
             Log.w(TAG, "Failed writing $tagLabel packet to client: ${e.message}")
+            if (activeClientOutputStream === stream) {
+                activeClientOutputStream = null
+            }
+            try {
+                activeClientSocket?.close()
+            } catch (_: IOException) {}
             false
         }
     }
@@ -488,9 +507,13 @@ class CamCraftStreamService : Service() {
 
             try {
                 inputStream?.close()
+            } catch (_: IOException) {}
+            try {
                 outputStream?.close()
+            } catch (_: IOException) {}
+            try {
                 clientSocket.close()
-            } catch (ignored: IOException) {}
+            } catch (_: IOException) {}
 
             val isActiveCoroutine = currentCoroutineContext().isActive
             val revertedToListening = synchronized(lifecycleLock) {
@@ -782,17 +805,15 @@ class CamCraftStreamService : Service() {
         }
 
     private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                "CamCraft Streaming",
-                NotificationManager.IMPORTANCE_LOW,
-            ).apply {
-                description = "Shows live streaming status for CamCraft USB/Wi-Fi connection"
-            }
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(channel)
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            "CamCraft Streaming",
+            NotificationManager.IMPORTANCE_LOW,
+        ).apply {
+            description = "Shows live streaming status for CamCraft USB/Wi-Fi connection"
         }
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(channel)
     }
 
     private fun buildNotification(contentText: String): Notification {
@@ -828,7 +849,7 @@ class CamCraftStreamService : Service() {
 
         @Volatile
         private var activeInstance: CamCraftStreamService? = null
-        private var pendingPreviewView: PreviewView? = null
+        private var pendingPreviewView: WeakReference<PreviewView>? = null
 
         private val _serviceState = MutableStateFlow(StreamServiceState())
         val serviceState: StateFlow<StreamServiceState> = _serviceState.asStateFlow()
@@ -863,7 +884,7 @@ class CamCraftStreamService : Service() {
         }
 
         fun attachPreviewView(previewView: PreviewView) {
-            pendingPreviewView = previewView
+            pendingPreviewView = WeakReference(previewView)
             activeInstance?.cameraStreamManager?.attachPreviewView(previewView)
         }
 
@@ -888,11 +909,7 @@ class CamCraftStreamService : Service() {
             val intent = Intent(context, CamCraftStreamService::class.java).apply {
                 action = ACTION_START
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
-            }
+            context.startForegroundService(intent)
         }
 
         fun stop(context: Context) {

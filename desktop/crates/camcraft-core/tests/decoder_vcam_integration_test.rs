@@ -4,7 +4,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use camcraft_core::decoder::{DecodedFrame, DecoderSender, spawn_decoder_worker};
+use camcraft_core::decoder::{
+    DecodedFrame, DecoderSender, LIVE_DECODER_QUEUE_CAPACITY, PreviewFrame, spawn_decoder_worker,
+    spawn_decoder_worker_low_latency,
+};
 use camcraft_core::vcam::{VcamError, VirtualCameraSink, generate_standby_frame};
 
 const SPS_PPS_64X64: &[u8] = &[
@@ -31,6 +34,7 @@ const IDR_32X32_BLUE: &[u8] = &[
 struct MockCameraSink {
     open_called: bool,
     frame_count: Arc<AtomicUsize>,
+    close_count: Arc<AtomicUsize>,
     last_dimensions: Arc<Mutex<(u32, u32)>>,
     recorded_dimensions: Arc<Mutex<Vec<(u32, u32)>>>,
     path: PathBuf,
@@ -45,10 +49,16 @@ impl MockCameraSink {
         Self {
             open_called: false,
             frame_count,
+            close_count: Arc::new(AtomicUsize::new(0)),
             last_dimensions,
             recorded_dimensions,
             path: PathBuf::from("/dev/mock_video0"),
         }
+    }
+
+    fn with_close_counter(mut self, close_count: Arc<AtomicUsize>) -> Self {
+        self.close_count = close_count;
+        self
     }
 }
 
@@ -70,8 +80,18 @@ impl VirtualCameraSink for MockCameraSink {
         Ok(())
     }
 
+    fn current_dimensions(&self) -> Option<(u32, u32)> {
+        let dims = *self.last_dimensions.lock().unwrap();
+        if dims.0 > 0 && dims.1 > 0 {
+            Some(dims)
+        } else {
+            None
+        }
+    }
+
     fn close(&mut self) -> Result<(), VcamError> {
         self.open_called = false;
+        self.close_count.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -226,4 +246,159 @@ fn test_decoder_worker_decodes_real_h264_and_resizes_in_vcam() {
     running.store(false, Ordering::Relaxed);
     let join_res = handle.join().expect("Worker thread should join");
     assert!(join_res.is_ok());
+}
+
+#[test]
+fn test_decoder_worker_emits_standby_frames_and_resumes_live() {
+    let frame_count = Arc::new(AtomicUsize::new(0));
+    let close_count = Arc::new(AtomicUsize::new(0));
+    let last_dimensions = Arc::new(Mutex::new((0, 0)));
+    let recorded_dimensions = Arc::new(Mutex::new(Vec::new()));
+
+    let mut mock_sink = MockCameraSink::new(
+        frame_count.clone(),
+        last_dimensions.clone(),
+        recorded_dimensions.clone(),
+    )
+    .with_close_counter(close_count.clone());
+    mock_sink.open().unwrap();
+
+    let (decoder_sender, decoder_rx) = DecoderSender::new_bounded();
+    let (frame_tx, frame_rx) = crossbeam_channel::bounded::<DecodedFrame>(8);
+    let running = Arc::new(AtomicBool::new(true));
+
+    let handle = spawn_decoder_worker(
+        decoder_rx,
+        Some(Box::new(mock_sink)),
+        Some(frame_tx),
+        false,
+        running.clone(),
+    )
+    .expect("Worker thread should spawn successfully");
+
+    // 1. Decode initial 64x64 frame
+    decoder_sender
+        .push_config(1_000, Bytes::from_static(SPS_PPS_64X64))
+        .unwrap();
+    assert!(
+        decoder_sender
+            .push_frame(1_000, true, Bytes::from_static(IDR_64X64_RED))
+            .unwrap()
+    );
+    let first = frame_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("Should decode initial 64x64 frame");
+    assert_eq!((first.width, first.height), (64, 64));
+    let count_before_standby = frame_count.load(Ordering::SeqCst);
+    assert_eq!(count_before_standby, 1);
+
+    // 2. Enter standby on disconnect -> sink must remain open and keep receiving 64x64 standby frames
+    decoder_sender.enter_standby();
+    std::thread::sleep(Duration::from_millis(550));
+
+    assert_eq!(
+        close_count.load(Ordering::SeqCst),
+        0,
+        "Sink must stay open across standby"
+    );
+    let count_during_standby = frame_count.load(Ordering::SeqCst);
+    assert!(
+        count_during_standby >= count_before_standby + 2,
+        "Expected continuous standby ticks, got before={count_before_standby} during={count_during_standby}"
+    );
+    assert_eq!(*last_dimensions.lock().unwrap(), (64, 64));
+
+    // 3. Reconnect with a fresh 32x32 stream -> live decoding resumes seamlessly
+    decoder_sender
+        .push_config(2_000, Bytes::from_static(SPS_PPS_32X32))
+        .unwrap();
+    assert!(
+        decoder_sender
+            .push_frame(2_000, true, Bytes::from_static(IDR_32X32_BLUE))
+            .unwrap()
+    );
+    let resumed = frame_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("Should resume live decoding at 32x32");
+    assert_eq!((resumed.width, resumed.height), (32, 32));
+    assert_eq!(*last_dimensions.lock().unwrap(), (32, 32));
+
+    decoder_sender.stop();
+    running.store(false, Ordering::Relaxed);
+    let join_res = handle.join().expect("Worker thread should join");
+    assert!(join_res.is_ok());
+    assert_eq!(close_count.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn test_low_latency_worker_skips_preview_when_disabled_and_caps_preview_size() {
+    let frame_count = Arc::new(AtomicUsize::new(0));
+    let last_dimensions = Arc::new(Mutex::new((0, 0)));
+    let recorded_dimensions = Arc::new(Mutex::new(Vec::new()));
+
+    let mut mock_sink = MockCameraSink::new(
+        frame_count.clone(),
+        last_dimensions.clone(),
+        recorded_dimensions,
+    );
+    mock_sink.open().unwrap();
+
+    let (decoder_sender, decoder_rx) =
+        DecoderSender::new_with_capacity(LIVE_DECODER_QUEUE_CAPACITY);
+    let (preview_tx, preview_rx) = crossbeam_channel::bounded::<PreviewFrame>(1);
+    let preview_enabled = Arc::new(AtomicBool::new(false));
+    let running = Arc::new(AtomicBool::new(true));
+
+    let handle = spawn_decoder_worker_low_latency(
+        decoder_rx,
+        Some(Box::new(mock_sink)),
+        Some(preview_tx),
+        preview_enabled.clone(),
+        32,
+        running.clone(),
+        None,
+    )
+    .expect("Low-latency worker should spawn");
+
+    // 1. With preview_enabled = false, V4L2 sink receives full 64x64 YUV420P and no PreviewFrame is produced
+    decoder_sender
+        .push_config(1_000, Bytes::from_static(SPS_PPS_64X64))
+        .unwrap();
+    assert!(
+        decoder_sender
+            .push_frame(1_000, true, Bytes::from_static(IDR_64X64_RED))
+            .unwrap()
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while frame_count.load(Ordering::SeqCst) < 1 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(frame_count.load(Ordering::SeqCst), 1);
+    assert_eq!(*last_dimensions.lock().unwrap(), (64, 64));
+    assert!(
+        preview_rx.try_recv().is_err(),
+        "PreviewFrame must not be built when preview_enabled is false"
+    );
+
+    // 2. Enable preview dynamically -> sink continues receiving full 64x64 while preview is capped at 32x32
+    preview_enabled.store(true, Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(35));
+    assert!(
+        decoder_sender
+            .push_frame(2_000, true, Bytes::from_static(IDR_64X64_RED))
+            .unwrap()
+    );
+
+    let preview = preview_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("Should emit downscaled PreviewFrame when enabled");
+    assert_eq!((preview.source_width, preview.source_height), (64, 64));
+    assert_eq!((preview.preview_width, preview.preview_height), (32, 32));
+    assert_eq!(preview.rgba.len(), 32 * 32 * 4);
+    assert_eq!(frame_count.load(Ordering::SeqCst), 2);
+
+    decoder_sender.stop();
+    running.store(false, Ordering::Relaxed);
+    assert!(handle.join().expect("Worker thread should join").is_ok());
 }

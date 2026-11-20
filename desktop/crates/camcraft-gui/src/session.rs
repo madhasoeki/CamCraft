@@ -10,11 +10,11 @@ use std::time::Instant;
 use camcraft_core::AudioOutputSink;
 use camcraft_core::adb;
 use camcraft_core::client::{
-    self, ClientConfig, ClientError, ClientEvent, ClientSender, StreamStats,
+    self, ClientConfig, ClientError, ClientEvent, ClientSender, ReconnectConfig, StreamStats,
 };
 use camcraft_core::decoder::{
-    DecodedFrame, DecoderSender, KEYFRAME_REQUEST_COOLDOWN, KeyframeRequestReason,
-    spawn_decoder_worker_with_recovery,
+    DEFAULT_PREVIEW_MAX_WIDTH, DecoderSender, KEYFRAME_REQUEST_COOLDOWN, KeyframeRequestReason,
+    LIVE_DECODER_QUEUE_CAPACITY, PreviewFrame, spawn_decoder_worker_low_latency,
 };
 use camcraft_core::discovery::{DiscoveryEvent, MdnsScanner};
 use camcraft_core::vcam::{V4l2LoopbackSink, VirtualCameraSink, find_camcraft_v4l2_device};
@@ -51,10 +51,12 @@ pub enum GuiCommand {
     ConnectUsb {
         port: u16,
         vcam_device: String,
+        auto_reconnect: bool,
     },
     ConnectWifi {
         endpoint: String,
         vcam_device: String,
+        auto_reconnect: bool,
     },
     RefreshWifiDiscovery,
     Disconnect,
@@ -73,6 +75,12 @@ pub enum GuiUpdate {
         endpoint: String,
     },
     Connected(ConnectionMode),
+    Reconnecting {
+        mode: ConnectionMode,
+        endpoint: String,
+        attempt: u32,
+        reason: String,
+    },
     Hello(ControlHello),
     ControlAck(ControlAck),
     Stats(StreamStats),
@@ -80,6 +88,7 @@ pub enum GuiUpdate {
     VcamStatus {
         path: String,
         active: bool,
+        standby: bool,
         error: Option<String>,
     },
     VmicStatus {
@@ -96,8 +105,9 @@ pub enum GuiUpdate {
 pub struct GuiSession {
     cmd_tx: mpsc::UnboundedSender<GuiCommand>,
     update_rx: Receiver<GuiUpdate>,
-    frame_rx: Receiver<DecodedFrame>,
+    frame_rx: Receiver<PreviewFrame>,
     audio_level_rx: Receiver<AudioLevelMetrics>,
+    preview_enabled: Arc<AtomicBool>,
     _runtime_thread: Option<JoinHandle<()>>,
 }
 
@@ -107,8 +117,10 @@ impl GuiSession {
     pub fn start(ctx: egui::Context) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<GuiCommand>();
         let (update_tx, update_rx) = crossbeam_channel::unbounded::<GuiUpdate>();
-        let (frame_tx, frame_rx) = crossbeam_channel::bounded::<DecodedFrame>(2);
+        let (frame_tx, frame_rx) = crossbeam_channel::bounded::<PreviewFrame>(1);
         let (audio_level_tx, audio_level_rx) = crossbeam_channel::bounded::<AudioLevelMetrics>(4);
+        let preview_enabled = Arc::new(AtomicBool::new(true));
+        let preview_enabled_rt = preview_enabled.clone();
 
         let runtime_thread = std::thread::Builder::new()
             .name("camcraft-gui-rt".to_owned())
@@ -132,6 +144,7 @@ impl GuiSession {
                     cmd_rx,
                     update_tx,
                     frame_tx,
+                    preview_enabled_rt,
                     audio_level_tx,
                     ctx,
                 ));
@@ -143,7 +156,16 @@ impl GuiSession {
             update_rx,
             frame_rx,
             audio_level_rx,
+            preview_enabled,
             _runtime_thread: runtime_thread,
+        }
+    }
+
+    /// Enables or pauses downscaled RGBA GUI preview generation without affecting `/dev/video*`.
+    pub fn set_preview_enabled(&self, enabled: bool) {
+        self.preview_enabled.store(enabled, Ordering::Relaxed);
+        if !enabled {
+            while self.frame_rx.try_recv().is_ok() {}
         }
     }
 
@@ -163,9 +185,9 @@ impl GuiSession {
         updates
     }
 
-    /// Drains the preview frame channel and returns only the newest decoded frame.
+    /// Drains the preview frame channel and returns only the newest downscaled preview frame.
     #[must_use]
-    pub fn take_latest_frame(&self) -> Option<DecodedFrame> {
+    pub fn take_latest_frame(&self) -> Option<PreviewFrame> {
         let mut latest = None;
         while let Ok(frame) = self.frame_rx.try_recv() {
             latest = Some(frame);
@@ -227,7 +249,8 @@ impl ActiveConnection {
 async fn run_session_supervisor(
     mut cmd_rx: mpsc::UnboundedReceiver<GuiCommand>,
     update_tx: Sender<GuiUpdate>,
-    frame_tx: Sender<DecodedFrame>,
+    frame_tx: Sender<PreviewFrame>,
+    preview_enabled: Arc<AtomicBool>,
     audio_level_tx: Sender<AudioLevelMetrics>,
     ctx: egui::Context,
 ) {
@@ -264,7 +287,7 @@ async fn run_session_supervisor(
                     break;
                 };
                 match cmd {
-                    GuiCommand::ConnectUsb { port, vcam_device } => {
+                    GuiCommand::ConnectUsb { port, vcam_device, auto_reconnect } => {
                         if let Some(conn) = active.take() {
                             conn.stop();
                         }
@@ -281,6 +304,7 @@ async fn run_session_supervisor(
                         let channels = SessionChannels {
                             update_tx: &update_tx,
                             frame_tx: &frame_tx,
+                            preview_enabled: &preview_enabled,
                             audio_level_tx: &audio_level_tx,
                             internal_tx: &internal_tx,
                             ctx: &ctx,
@@ -292,7 +316,9 @@ async fn run_session_supervisor(
                                 active = start_connection(
                                     ConnectionMode::Usb,
                                     endpoint,
+                                    port,
                                     vcam_device,
+                                    auto_reconnect,
                                     &channels,
                                 );
                             }
@@ -304,7 +330,7 @@ async fn run_session_supervisor(
                             }
                         }
                     }
-                    GuiCommand::ConnectWifi { endpoint, vcam_device } => {
+                    GuiCommand::ConnectWifi { endpoint, vcam_device, auto_reconnect } => {
                         if let Some(conn) = active.take() {
                             conn.stop();
                         }
@@ -316,6 +342,7 @@ async fn run_session_supervisor(
                         let channels = SessionChannels {
                             update_tx: &update_tx,
                             frame_tx: &frame_tx,
+                            preview_enabled: &preview_enabled,
                             audio_level_tx: &audio_level_tx,
                             internal_tx: &internal_tx,
                             ctx: &ctx,
@@ -323,7 +350,9 @@ async fn run_session_supervisor(
                         active = start_connection(
                             ConnectionMode::Wifi,
                             normalized,
+                            DEFAULT_PORT,
                             vcam_device,
+                            auto_reconnect,
                             &channels,
                         );
                     }
@@ -340,6 +369,7 @@ async fn run_session_supervisor(
                         emit(&update_tx, &ctx, GuiUpdate::VcamStatus {
                             path: String::new(),
                             active: false,
+                            standby: false,
                             error: None,
                         });
                         emit(&update_tx, &ctx, GuiUpdate::VmicStatus {
@@ -398,6 +428,11 @@ async fn run_session_supervisor(
                             conn.sender = Some(sender);
                         }
                     }
+                    InternalEvent::ConnectionLost => {
+                        if let Some(ref mut conn) = active {
+                            conn.sender = None;
+                        }
+                    }
                     InternalEvent::RequestKeyframe(reason) => {
                         if let Some(ref mut conn) = active
                             && let Some(ref sender) = conn.sender
@@ -441,13 +476,15 @@ async fn run_session_supervisor(
 
 enum InternalEvent {
     SenderReady(ClientSender),
+    ConnectionLost,
     RequestKeyframe(KeyframeRequestReason),
     SessionEnded,
 }
 
 struct SessionChannels<'a> {
     update_tx: &'a Sender<GuiUpdate>,
-    frame_tx: &'a Sender<DecodedFrame>,
+    frame_tx: &'a Sender<PreviewFrame>,
+    preview_enabled: &'a Arc<AtomicBool>,
     audio_level_tx: &'a Sender<AudioLevelMetrics>,
     internal_tx: &'a mpsc::Sender<InternalEvent>,
     ctx: &'a egui::Context,
@@ -456,17 +493,20 @@ struct SessionChannels<'a> {
 fn start_connection(
     mode: ConnectionMode,
     endpoint: String,
+    port: u16,
     vcam_device: String,
+    auto_reconnect: bool,
     channels: &SessionChannels<'_>,
 ) -> Option<ActiveConnection> {
     let update_tx = channels.update_tx;
     let frame_tx = channels.frame_tx;
+    let preview_enabled = channels.preview_enabled;
     let audio_level_tx = channels.audio_level_tx;
     let internal_tx = channels.internal_tx;
     let ctx = channels.ctx;
     let shutdown = Arc::new(AtomicBool::new(false));
     let decoder_running = Arc::new(AtomicBool::new(true));
-    let (decoder_tx, decoder_rx) = DecoderSender::new_bounded();
+    let (decoder_tx, decoder_rx) = DecoderSender::new_with_capacity(LIVE_DECODER_QUEUE_CAPACITY);
 
     // Open V4L2 virtual camera if available; fall back gracefully to preview-only mode.
     let vcam_path = if vcam_device.trim().is_empty() || vcam_device.trim() == "auto" {
@@ -488,6 +528,7 @@ fn start_connection(
                 GuiUpdate::VcamStatus {
                     path: vcam_display.clone(),
                     active: true,
+                    standby: false,
                     error: None,
                 },
             );
@@ -499,14 +540,16 @@ fn start_connection(
                 update_tx,
                 ctx,
                 GuiUpdate::VcamStatus {
-                    path: vcam_display,
+                    path: vcam_display.clone(),
                     active: false,
+                    standby: false,
                     error: Some(e.to_string()),
                 },
             );
             None
         }
     };
+    let vcam_opened = sink.is_some();
 
     let (kf_tx, kf_rx) = crossbeam_channel::bounded::<KeyframeRequestReason>(4);
     let internal_tx_kf = internal_tx.clone();
@@ -519,11 +562,12 @@ fn start_connection(
         })
         .ok();
 
-    let decoder_thread = match spawn_decoder_worker_with_recovery(
+    let decoder_thread = match spawn_decoder_worker_low_latency(
         decoder_rx,
         sink,
         Some(frame_tx.clone()),
-        true,
+        preview_enabled.clone(),
+        DEFAULT_PREVIEW_MAX_WIDTH,
         decoder_running.clone(),
         Some(kf_tx),
     ) {
@@ -606,23 +650,87 @@ fn start_connection(
     let decoder_tx_c = decoder_tx.clone();
     let audio_tx_c = audio_tx.clone();
     let internal_tx_c = internal_tx.clone();
+    let endpoint_c = endpoint.clone();
+    let vcam_display_c = vcam_display.clone();
 
     let client_task = tokio::spawn(async move {
         let (event_tx, mut event_rx) = mpsc::channel::<ClientEvent>(128);
-        let cfg = ClientConfig::new(endpoint.clone());
+        let cfg = ClientConfig::new(endpoint_c.clone());
         let client_shutdown = shutdown_c.clone();
 
-        let net_handle =
-            tokio::spawn(
-                async move { client::run_client_loop(cfg, event_tx, client_shutdown).await },
-            );
+        let net_handle = tokio::spawn(async move {
+            if auto_reconnect {
+                client::run_client_with_reconnect(
+                    cfg,
+                    ReconnectConfig::default(),
+                    event_tx,
+                    client_shutdown,
+                    move |_attempt| async move {
+                        if mode == ConnectionMode::Usb {
+                            tokio::task::spawn_blocking(move || {
+                                adb::setup_adb_forward(None, port, port)
+                            })
+                            .await
+                            .map_err(|e| format!("ADB forward task failed: {e}"))?
+                            .map(|_| ())
+                            .map_err(|e| format!("ADB error: {e}"))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )
+                .await
+            } else {
+                client::run_client_loop(cfg, event_tx, client_shutdown).await
+            }
+        });
 
         let mut disconnected_emitted = false;
         while let Some(event) = event_rx.recv().await {
             match event {
                 ClientEvent::Connected(sender) => {
                     let _ = internal_tx_c.send(InternalEvent::SenderReady(sender)).await;
+                    if vcam_opened {
+                        emit(
+                            &update_tx_c,
+                            &ctx_c,
+                            GuiUpdate::VcamStatus {
+                                path: vcam_display_c.clone(),
+                                active: true,
+                                standby: false,
+                                error: None,
+                            },
+                        );
+                    }
                     emit(&update_tx_c, &ctx_c, GuiUpdate::Connected(mode));
+                }
+                ClientEvent::Reconnecting {
+                    attempt, reason, ..
+                } => {
+                    let _ = internal_tx_c.send(InternalEvent::ConnectionLost).await;
+                    decoder_tx_c.enter_standby();
+                    if vcam_opened {
+                        emit(
+                            &update_tx_c,
+                            &ctx_c,
+                            GuiUpdate::VcamStatus {
+                                path: vcam_display_c.clone(),
+                                active: true,
+                                standby: true,
+                                error: None,
+                            },
+                        );
+                    }
+                    emit(
+                        &update_tx_c,
+                        &ctx_c,
+                        GuiUpdate::Reconnecting {
+                            mode,
+                            endpoint: endpoint_c.clone(),
+                            attempt,
+                            reason: format_disconnect_reason(&reason),
+                        },
+                    );
                 }
                 ClientEvent::Hello(hello) => {
                     audio_tx_c.set_state(
@@ -743,14 +851,26 @@ fn normalize_endpoint(raw: &str) -> String {
 }
 
 fn format_client_error(err: &ClientError) -> String {
-    if let ClientError::Io(io_err) = err {
-        if io_err.kind() == std::io::ErrorKind::ConnectionRefused {
-            return "Phone reached, but CamCraft Server is not running (tap 'Start Server' on Android)".to_owned();
+    match err {
+        ClientError::Io(io_err) => {
+            if io_err.kind() == std::io::ErrorKind::ConnectionRefused {
+                return "Phone reached, but CamCraft Server is not running (tap 'Start Server' on Android)".to_owned();
+            }
+            if io_err.raw_os_error() == Some(113) {
+                return "No route to phone — check phone Wi-Fi IP, same SSID, or router AP Isolation"
+                    .to_owned();
+            }
         }
-        if io_err.raw_os_error() == Some(113) {
-            return "No route to phone — check phone Wi-Fi IP, same SSID, or router AP Isolation"
-                .to_owned();
+        ClientError::HeartbeatTimeout(dur) => {
+            return format!(
+                "Heartbeat timed out after {:.1}s — phone unreachable or app suspended",
+                dur.as_secs_f64()
+            );
         }
+        ClientError::ConnectionClosed => {
+            return "Connection closed by Android sender".to_owned();
+        }
+        _ => {}
     }
     format!("Connection failed: {err}")
 }
@@ -762,6 +882,8 @@ fn format_disconnect_reason(reason: &str) -> String {
             .to_owned()
     } else if lower.contains("no route to host") || lower.contains("os error 113") {
         "No route to phone — check phone Wi-Fi IP, same SSID, or router AP Isolation".to_owned()
+    } else if lower.contains("timed out") {
+        "Connection timed out — waiting for phone to respond".to_owned()
     } else {
         reason.to_owned()
     }

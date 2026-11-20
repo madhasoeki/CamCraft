@@ -409,16 +409,13 @@ impl PacketHeader {
 
     /// Decodes a header from a slice containing at least 20 bytes.
     pub fn from_slice(src: &[u8]) -> Result<Self, ProtocolError> {
-        if src.len() < HEADER_LEN {
+        let Some(fixed) = src.first_chunk::<HEADER_LEN>() else {
             return Err(ProtocolError::BufferTooShort {
                 expected: HEADER_LEN,
                 actual: src.len(),
             });
-        }
-        let fixed: [u8; HEADER_LEN] = src[..HEADER_LEN]
-            .try_into()
-            .expect("slice length verified >= HEADER_LEN");
-        Self::from_bytes(&fixed)
+        };
+        Self::from_bytes(fixed)
     }
 }
 
@@ -559,14 +556,11 @@ impl Packet {
     /// Returns `Ok(None)` without consuming bytes if either header or payload
     /// is incomplete, preserving buffer state across partial TCP reads.
     pub fn decode(src: &mut BytesMut) -> Result<Option<Self>, ProtocolError> {
-        if src.len() < HEADER_LEN {
+        let Some(header_bytes) = src.first_chunk::<HEADER_LEN>() else {
             return Ok(None);
-        }
+        };
 
-        let header_bytes: [u8; HEADER_LEN] = src[..HEADER_LEN]
-            .try_into()
-            .expect("slice length verified >= HEADER_LEN");
-        let header = PacketHeader::from_bytes(&header_bytes)?;
+        let header = PacketHeader::from_bytes(header_bytes)?;
 
         let total_len = HEADER_LEN + header.payload_len as usize;
         if src.len() < total_len {

@@ -65,6 +65,7 @@ enum ConnectionStatus {
     Disconnected,
     Connecting(ConnectionMode),
     Connected(ConnectionMode),
+    Reconnecting { mode: ConnectionMode, attempt: u32 },
 }
 
 struct CamCraftApp {
@@ -77,6 +78,8 @@ struct CamCraftApp {
     // Connection settings
     vcam_device: String,
     vcam_active: bool,
+    vcam_standby: bool,
+    auto_reconnect: bool,
     wifi_endpoint: String,
     discovered_devices: Vec<DiscoveredDevice>,
 
@@ -109,6 +112,7 @@ struct CamCraftApp {
     last_params_edit: Instant,
 
     // Live preview & telemetry
+    preview_enabled: bool,
     preview_texture: Option<egui::TextureHandle>,
     frame_width: u32,
     frame_height: u32,
@@ -129,6 +133,8 @@ impl CamCraftApp {
             cameras: Vec::new(),
             vcam_device: "/dev/video10".to_owned(),
             vcam_active: false,
+            vcam_standby: false,
+            auto_reconnect: true,
             wifi_endpoint: String::new(),
             discovered_devices: Vec::new(),
             selected_camera_id: "0".to_owned(),
@@ -152,6 +158,7 @@ impl CamCraftApp {
             peak_hold_norm: 0.0,
             params_dirty: false,
             last_params_edit: Instant::now(),
+            preview_enabled: true,
             preview_texture: None,
             frame_width: 0,
             frame_height: 0,
@@ -165,11 +172,29 @@ impl CamCraftApp {
             match update {
                 GuiUpdate::Connecting { mode, endpoint } => {
                     self.status = ConnectionStatus::Connecting(mode);
+                    self.vcam_standby = false;
                     self.status_message = Some(format!("Connecting to {endpoint}..."));
                 }
                 GuiUpdate::Connected(mode) => {
                     self.status = ConnectionStatus::Connected(mode);
+                    self.vcam_standby = false;
                     self.status_message = None;
+                }
+                GuiUpdate::Reconnecting {
+                    mode,
+                    endpoint,
+                    attempt,
+                    reason,
+                } => {
+                    self.status = ConnectionStatus::Reconnecting { mode, attempt };
+                    self.stats = StreamStats::default();
+                    self.decode_time_ms = 0.0;
+                    self.audio_level = AudioLevelMetrics::silence(self.audio_muted);
+                    self.smoothed_level_norm = 0.0;
+                    self.peak_hold_norm = 0.0;
+                    self.status_message = Some(format!(
+                        "Connection lost ({reason}). Reconnecting to {endpoint} (attempt #{attempt})..."
+                    ));
                 }
                 GuiUpdate::Hello(hello) => {
                     self.apply_hello(hello);
@@ -202,12 +227,14 @@ impl CamCraftApp {
                 GuiUpdate::VcamStatus {
                     path,
                     active,
+                    standby,
                     error,
                 } => {
                     if !path.is_empty() {
                         self.vcam_device = path;
                     }
                     self.vcam_active = active;
+                    self.vcam_standby = standby;
                     if let Some(err) = error {
                         self.status_message = Some(format!("Virtual camera inactive: {err}"));
                     }
@@ -229,6 +256,7 @@ impl CamCraftApp {
                 GuiUpdate::Disconnected(reason) => {
                     self.status = ConnectionStatus::Disconnected;
                     self.vcam_active = false;
+                    self.vcam_standby = false;
                     self.vmic_active = false;
                     self.vmic_error = None;
                     self.audio_level = AudioLevelMetrics::silence(false);
@@ -239,9 +267,13 @@ impl CamCraftApp {
                     self.status_message = Some(reason);
                 }
                 GuiUpdate::Error(err) => {
-                    if matches!(self.status, ConnectionStatus::Connecting(_)) {
+                    if matches!(
+                        self.status,
+                        ConnectionStatus::Connecting(_) | ConnectionStatus::Reconnecting { .. }
+                    ) {
                         self.status = ConnectionStatus::Disconnected;
                         self.vcam_active = false;
+                        self.vcam_standby = false;
                         self.vmic_active = false;
                         self.vmic_error = None;
                         self.audio_level = AudioLevelMetrics::silence(false);
@@ -254,14 +286,14 @@ impl CamCraftApp {
         }
 
         if let Some(frame) = self.session.take_latest_frame() {
-            self.frame_width = frame.width;
-            self.frame_height = frame.height;
+            self.frame_width = frame.source_width;
+            self.frame_height = frame.source_height;
             self.decode_time_ms = frame.decode_time_ms;
 
-            if let Some(rgba) = frame.rgba {
+            if self.preview_enabled {
                 let image = egui::ColorImage::from_rgba_unmultiplied(
-                    [frame.width as usize, frame.height as usize],
-                    &rgba,
+                    [frame.preview_width as usize, frame.preview_height as usize],
+                    &frame.rgba,
                 );
                 match self.preview_texture {
                     Some(ref mut tex) => {
@@ -369,6 +401,10 @@ impl CamCraftApp {
         matches!(self.status, ConnectionStatus::Connected(_))
     }
 
+    fn is_reconnecting(&self) -> bool {
+        matches!(self.status, ConnectionStatus::Reconnecting { .. })
+    }
+
     fn is_busy(&self) -> bool {
         !matches!(self.status, ConnectionStatus::Disconnected)
     }
@@ -386,6 +422,10 @@ impl CamCraftApp {
                     ConnectionStatus::Connecting(mode) => (
                         COLOR_STATUS_AMBER,
                         format!("Connecting ({})...", mode.label()),
+                    ),
+                    ConnectionStatus::Reconnecting { mode, attempt } => (
+                        COLOR_STATUS_AMBER,
+                        format!("Reconnecting ({} #{attempt})...", mode.label()),
                     ),
                     ConnectionStatus::Disconnected => (COLOR_TEXT_MUTED, "Disconnected".to_owned()),
                 };
@@ -445,15 +485,12 @@ impl CamCraftApp {
 
                 separator_dot(ui);
 
-                let vcam_label = if self.vcam_active {
-                    format!("{} Active", self.vcam_device)
+                let (vcam_label, vcam_color) = if self.vcam_active && self.vcam_standby {
+                    (format!("{} Standby", self.vcam_device), COLOR_STATUS_AMBER)
+                } else if self.vcam_active {
+                    (format!("{} Active", self.vcam_device), COLOR_STATUS_EMERALD)
                 } else {
-                    format!("{} Standby", self.vcam_device)
-                };
-                let vcam_color = if self.vcam_active {
-                    COLOR_STATUS_EMERALD
-                } else {
-                    COLOR_TEXT_MUTED
+                    (format!("{} Inactive", self.vcam_device), COLOR_TEXT_MUTED)
                 };
                 ui.label(egui::RichText::new(vcam_label).color(vcam_color).strong());
 
@@ -489,7 +526,17 @@ impl CamCraftApp {
             ui.set_min_size(inner_size);
             ui.set_max_size(inner_size);
 
-            if self.is_connected()
+            if self.is_connected() && !self.preview_enabled {
+                ui.centered_and_justified(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Live Preview Paused — Ultra-Low Latency Mode\nStreaming directly to {} (OBS/Discord)",
+                            self.vcam_device
+                        ))
+                        .color(COLOR_TEXT_MUTED),
+                    );
+                });
+            } else if self.is_connected()
                 && let Some(ref tex) = self.preview_texture
             {
                 let tex_size = tex.size_vec2();
@@ -531,6 +578,48 @@ impl CamCraftApp {
                     image = image.rotate(radians, egui::vec2(0.5, 0.5));
                 }
                 image.paint_at(ui, img_rect);
+            } else if let ConnectionStatus::Reconnecting { mode, attempt } = self.status {
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(20.0);
+                        ui.horizontal(|ui| {
+                            let (dot_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(12.0, 12.0),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().circle_filled(
+                                dot_rect.center(),
+                                5.0,
+                                COLOR_STATUS_AMBER,
+                            );
+                            ui.label(
+                                egui::RichText::new("CamCraft — Reconnecting...")
+                                    .color(COLOR_STATUS_AMBER)
+                                    .size(18.0)
+                                    .strong(),
+                            );
+                        });
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Retrying {} connection every 2s (attempt #{attempt})",
+                                mode.label()
+                            ))
+                            .color(COLOR_TEXT_PRIMARY),
+                        );
+                        if self.vcam_active {
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} remains active in Standby Frame mode (OBS/Discord safe)",
+                                    self.vcam_device
+                                ))
+                                .color(COLOR_TEXT_MUTED)
+                                .small(),
+                            );
+                        }
+                    });
+                });
             } else {
                 ui.centered_and_justified(|ui| {
                     let placeholder = if self.is_connected() {
@@ -559,6 +648,8 @@ impl CamCraftApp {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.vcam_device).desired_width(f32::INFINITY),
                 );
+                ui.add_space(6.0);
+                ui.checkbox(&mut self.auto_reconnect, "Auto-Reconnect on Drop (2s)");
                 ui.add_space(8.0);
 
                 let usb_btn = egui::Button::new(
@@ -573,6 +664,7 @@ impl CamCraftApp {
                     self.session.send(GuiCommand::ConnectUsb {
                         port: DEFAULT_PORT,
                         vcam_device: self.vcam_device.clone(),
+                        auto_reconnect: self.auto_reconnect,
                     });
                 }
             });
@@ -681,6 +773,7 @@ impl CamCraftApp {
                 self.session.send(GuiCommand::ConnectWifi {
                     endpoint,
                     vcam_device: self.vcam_device.clone(),
+                    auto_reconnect: self.auto_reconnect,
                 });
             }
 
@@ -701,6 +794,7 @@ impl CamCraftApp {
                         self.session.send(GuiCommand::ConnectWifi {
                             endpoint: self.wifi_endpoint.clone(),
                             vcam_device: self.vcam_device.clone(),
+                            auto_reconnect: self.auto_reconnect,
                         });
                     }
                     ui.add(
@@ -713,13 +807,19 @@ impl CamCraftApp {
 
             ui.add_space(10.0);
             ui.add_enabled_ui(self.is_busy(), |ui| {
-                let disconnect_btn =
-                    egui::Button::new(egui::RichText::new("Disconnect").color(COLOR_TEXT_PRIMARY))
-                        .fill(if self.is_busy() {
-                            COLOR_STATUS_ROSE
-                        } else {
-                            COLOR_SURFACE_ELEVATED
-                        });
+                let disconnect_label = if self.is_reconnecting() {
+                    "Cancel Reconnect"
+                } else {
+                    "Disconnect"
+                };
+                let disconnect_btn = egui::Button::new(
+                    egui::RichText::new(disconnect_label).color(COLOR_TEXT_PRIMARY),
+                )
+                .fill(if self.is_busy() {
+                    COLOR_STATUS_ROSE
+                } else {
+                    COLOR_SURFACE_ELEVATED
+                });
                 if ui
                     .add_sized([ui.available_width(), 28.0], disconnect_btn)
                     .clicked()
@@ -727,6 +827,20 @@ impl CamCraftApp {
                     self.session.send(GuiCommand::Disconnect);
                 }
             });
+
+            ui.add_space(8.0);
+            if ui
+                .checkbox(
+                    &mut self.preview_enabled,
+                    "Live Preview (turn off for lowest OBS latency)",
+                )
+                .changed()
+            {
+                self.session.set_preview_enabled(self.preview_enabled);
+                if !self.preview_enabled {
+                    self.preview_texture = None;
+                }
+            }
         });
     }
 
@@ -1158,7 +1272,11 @@ impl eframe::App for CamCraftApp {
         self.flush_debounced_params(&ctx);
 
         if self.is_connected() {
-            ctx.request_repaint_after(Duration::from_millis(16));
+            if self.preview_enabled {
+                ctx.request_repaint_after(Duration::from_millis(30));
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(250));
+            }
         }
 
         egui::Panel::right("inspector_panel")

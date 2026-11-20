@@ -17,9 +17,11 @@ use tracing::{info, warn};
 
 use camcraft_core::AudioOutputSink;
 use camcraft_core::adb;
-use camcraft_core::client::{self, ClientConfig, ClientEvent, ClientSender, StreamStats};
+use camcraft_core::client::{
+    self, ClientConfig, ClientEvent, ClientSender, ReconnectConfig, StreamStats,
+};
 use camcraft_core::decoder::{
-    DecoderSender, KEYFRAME_REQUEST_COOLDOWN, KeyframeRequestReason,
+    DecoderSender, KEYFRAME_REQUEST_COOLDOWN, KeyframeRequestReason, LIVE_DECODER_QUEUE_CAPACITY,
     spawn_decoder_worker_with_recovery,
 };
 use camcraft_core::discovery::{DiscoveredDevice, DiscoveryEvent, MdnsScanner};
@@ -91,6 +93,10 @@ struct ConnectArgs {
     #[arg(long)]
     mute_mic: bool,
 
+    /// Disable automatic reconnection and standby keepalive on unexpected drop.
+    #[arg(long)]
+    no_reconnect: bool,
+
     /// Target TCP port.
     #[arg(long, default_value_t = camcraft_protocol::DEFAULT_PORT)]
     port: u16,
@@ -122,7 +128,7 @@ async fn main() -> Result<()> {
             info!(
                 protocol_version = camcraft_protocol::PROTOCOL_VERSION,
                 default_port = camcraft_protocol::DEFAULT_PORT,
-                "CamCraft CLI receiver ready (Stage 7: Audio Streaming & PipeWire Virtual Mic)"
+                "CamCraft CLI receiver ready (v0.1: Virtual Camera, Virtual Mic, Wi-Fi/USB Auto-Reconnect)"
             );
         }
     }
@@ -202,7 +208,8 @@ async fn run_connect(args: ConnectArgs) -> Result<()> {
     };
 
     // Initialize H.264 decoder worker with bounded channel & keyframe recovery
-    let (decoder_sender, decoder_rx) = DecoderSender::new_bounded();
+    let (decoder_sender, decoder_rx) =
+        DecoderSender::new_with_capacity(LIVE_DECODER_QUEUE_CAPACITY);
     let decoder_running = Arc::new(AtomicBool::new(true));
     let (kf_tx, kf_rx) = crossbeam_channel::bounded::<KeyframeRequestReason>(4);
     let (kf_async_tx, mut kf_async_rx) = mpsc::channel::<KeyframeRequestReason>(8);
@@ -281,10 +288,42 @@ async fn run_connect(args: ConnectArgs) -> Result<()> {
 
     // Spawn client network loop in background
     let client_shutdown = shutdown.clone();
-    let client_handle =
-        tokio::spawn(
-            async move { client::run_client_loop(config, event_tx, client_shutdown).await },
-        );
+    let auto_reconnect = !args.no_reconnect;
+    let reconnect_serial = args.serial.clone();
+    let reconnect_port = args.port;
+    let client_handle = tokio::spawn(async move {
+        if auto_reconnect {
+            client::run_client_with_reconnect(
+                config,
+                ReconnectConfig::default(),
+                event_tx,
+                client_shutdown,
+                move |_attempt| {
+                    let serial = reconnect_serial.clone();
+                    async move {
+                        if is_usb {
+                            tokio::task::spawn_blocking(move || {
+                                adb::setup_adb_forward(
+                                    serial.as_deref(),
+                                    reconnect_port,
+                                    reconnect_port,
+                                )
+                            })
+                            .await
+                            .map_err(|e| format!("ADB forward task failed: {e}"))?
+                            .map(|_| ())
+                            .map_err(|e| format!("ADB error: {e}"))
+                        } else {
+                            Ok(())
+                        }
+                    }
+                },
+            )
+            .await
+        } else {
+            client::run_client_loop(config, event_tx, client_shutdown).await
+        }
+    });
 
     // Handle Ctrl+C for clean shutdown
     let sig_shutdown = shutdown.clone();
@@ -397,6 +436,20 @@ async fn run_connect(args: ConnectArgs) -> Result<()> {
                         } else {
                             warn!(error = ?ack.error, "Camera control rejected by device");
                         }
+                    }
+                    ClientEvent::Reconnecting {
+                        attempt,
+                        reason,
+                        retry_in,
+                    } => {
+                        active_sender = None;
+                        decoder_sender.enter_standby();
+                        warn!(
+                            attempt,
+                            retry_secs = retry_in.as_secs_f64(),
+                            reason = %reason,
+                            "Connection lost; switched virtual camera to Standby Frame mode and retrying"
+                        );
                     }
                     ClientEvent::Disconnected(reason) => {
                         warn!(reason = %reason, "Disconnected from CamCraft sender");

@@ -26,6 +26,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -36,6 +37,7 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import java.util.Locale
 import org.artcraft.camcraft.network.CamCraftStreamService
 import org.artcraft.camcraft.network.StreamConnectionStatus
 import org.artcraft.camcraft.network.StreamServiceState
@@ -77,6 +79,7 @@ fun CamCraftScreen(
     onSwitchCamera: () -> Unit = {},
     onToggleTorch: () -> Unit = {},
     onToggleMute: () -> Unit = {},
+    onDimScreen: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val isRunning = state.status == StreamConnectionStatus.LISTENING ||
@@ -309,7 +312,7 @@ fun CamCraftScreen(
                         ) {
                             Column {
                                 Text(
-                                    text = String.format("%.1f FPS", state.currentFps),
+                                    text = String.format(Locale.US, "%.1f FPS", state.currentFps),
                                     color = ArtCraftColors.StatusEmerald,
                                     fontSize = 20.sp,
                                     fontWeight = FontWeight.ExtraBold,
@@ -324,14 +327,14 @@ fun CamCraftScreen(
 
                             Column(horizontalAlignment = Alignment.End) {
                                 Text(
-                                    text = "${state.framesSent} frames • ${String.format("%.1fx", state.activeState.zoomRatio)}",
+                                    text = "${state.framesSent} frames • ${String.format(Locale.US, "%.1fx", state.activeState.zoomRatio)}",
                                     color = ArtCraftColors.TextPrimary,
                                     fontSize = 13.sp,
                                     fontWeight = FontWeight.SemiBold,
                                     fontFamily = FontFamily.Monospace,
                                 )
                                 Text(
-                                    text = "$activeCameraLabel • EV ${String.format("%+.1f", state.activeState.exposureEv)}",
+                                    text = "$activeCameraLabel • EV ${String.format(Locale.US, "%+.1f", state.activeState.exposureEv)}",
                                     color = ArtCraftColors.TextMuted,
                                     fontSize = 11.sp,
                                 )
@@ -511,6 +514,26 @@ fun CamCraftScreen(
                     fontWeight = FontWeight.SemiBold,
                 )
             }
+        }
+
+        // OLED Battery Saver Toggle
+        Button(
+            onClick = onDimScreen,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = ArtCraftColors.SurfaceCardHighlight,
+            ),
+            shape = RoundedCornerShape(10.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 10.dp)
+                .semantics(mergeDescendants = true) {},
+        ) {
+            Text(
+                text = "Dim Screen (Battery Saver)",
+                color = ArtCraftColors.TextPrimary,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Medium,
+            )
         }
 
         // Bottom Action Button

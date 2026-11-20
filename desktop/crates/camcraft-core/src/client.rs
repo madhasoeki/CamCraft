@@ -4,6 +4,7 @@
 //! decodes CCFT v1 packet frames, sends periodic heartbeat pings, measures RTT latency,
 //! and tracks real-time video frame rate and network bitrate metrics.
 
+use std::future::Future;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,6 +22,12 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default read inactivity / heartbeat timeout before considering a connection dead.
+pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default interval between automatic reconnection attempts after unexpected drops.
+pub const DEFAULT_RECONNECT_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Errors encountered in client networking and packet processing.
 #[derive(Debug, Error)]
@@ -40,6 +47,10 @@ pub enum ClientError {
     /// Connection was terminated by the remote peer.
     #[error("Connection closed by remote sender")]
     ConnectionClosed,
+
+    /// No packets or heartbeats were received within the read timeout window.
+    #[error("Connection timed out (no data received for {:.1}s)", .0.as_secs_f64())]
+    HeartbeatTimeout(Duration),
 
     /// Channel send failure (internal pipeline issue).
     #[error("Internal pipeline channel error: {0}")]
@@ -111,6 +122,12 @@ pub enum ClientEvent {
     ControlAck(ControlAck),
     /// Periodic 1-second streaming metrics update.
     Stats(StreamStats),
+    /// Unexpected drop detected; automatic reconnect scheduled.
+    Reconnecting {
+        attempt: u32,
+        reason: String,
+        retry_in: Duration,
+    },
     /// Disconnection event with reason description.
     Disconnected(String),
 }
@@ -133,6 +150,8 @@ pub struct ClientConfig {
     pub interface: Option<String>,
     /// Heartbeat ping interval (defaults to 1 second).
     pub ping_interval: Duration,
+    /// Read inactivity timeout before considering a silent link dropped (defaults to 5 seconds).
+    pub read_timeout: Duration,
     /// Initial read buffer capacity in bytes (defaults to 64 KB).
     pub read_buffer_capacity: usize,
 }
@@ -145,6 +164,7 @@ impl ClientConfig {
             endpoint: format!("127.0.0.1:{}", camcraft_protocol::DEFAULT_PORT),
             interface: None,
             ping_interval: Duration::from_secs(1),
+            read_timeout: DEFAULT_READ_TIMEOUT,
             read_buffer_capacity: 65536,
         }
     }
@@ -156,6 +176,7 @@ impl ClientConfig {
             endpoint: endpoint.into(),
             interface: None,
             ping_interval: Duration::from_secs(1),
+            read_timeout: DEFAULT_READ_TIMEOUT,
             read_buffer_capacity: 65536,
         }
     }
@@ -170,6 +191,24 @@ impl ClientConfig {
             Some(trimmed)
         };
         self
+    }
+}
+
+/// Configuration for automatic client reconnection after unexpected drops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconnectConfig {
+    /// Delay between reconnection attempts (defaults to 2 seconds).
+    pub retry_interval: Duration,
+    /// Whether to retry if the initial connection fails before `CONTROL_HELLO`.
+    pub reconnect_on_initial_failure: bool,
+}
+
+impl Default for ReconnectConfig {
+    fn default() -> Self {
+        Self {
+            retry_interval: DEFAULT_RECONNECT_INTERVAL,
+            reconnect_on_initial_failure: false,
+        }
     }
 }
 
@@ -206,6 +245,114 @@ pub async fn run_client_loop(
     event_tx: mpsc::Sender<ClientEvent>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), ClientError> {
+    run_client_loop_inner(config, event_tx, shutdown, None, true).await
+}
+
+/// Runs [`run_client_loop`] with an automatic reconnect loop on unexpected disconnections.
+///
+/// Invokes `before_reconnect(attempt)` before each retry attempt (e.g. to refresh `adb forward`
+/// on USB connections) and emits [`ClientEvent::Reconnecting`] until the device reconnects or
+/// `shutdown` is signaled.
+pub async fn run_client_with_reconnect<F, Fut>(
+    config: ClientConfig,
+    reconnect: ReconnectConfig,
+    event_tx: mpsc::Sender<ClientEvent>,
+    shutdown: Arc<AtomicBool>,
+    mut before_reconnect: F,
+) -> Result<(), ClientError>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
+    let mut established_once = false;
+    let mut attempt: u32 = 0;
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        if attempt > 0 {
+            if !sleep_until_retry_or_shutdown(reconnect.retry_interval, &shutdown).await {
+                return Ok(());
+            }
+
+            if let Err(reason) = before_reconnect(attempt).await {
+                if shutdown.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                attempt = attempt.saturating_add(1);
+                let _ = event_tx
+                    .send(ClientEvent::Reconnecting {
+                        attempt,
+                        reason,
+                        retry_in: reconnect.retry_interval,
+                    })
+                    .await;
+                continue;
+            }
+        }
+
+        let hello_seen = AtomicBool::new(false);
+        let res = run_client_loop_inner(
+            config.clone(),
+            event_tx.clone(),
+            shutdown.clone(),
+            Some(&hello_seen),
+            false,
+        )
+        .await;
+
+        match res {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                if shutdown.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+
+                if hello_seen.load(Ordering::Relaxed) {
+                    established_once = true;
+                    attempt = 1;
+                } else if established_once || reconnect.reconnect_on_initial_failure {
+                    attempt = attempt.saturating_add(1).max(1);
+                } else {
+                    let _ = event_tx
+                        .send(ClientEvent::Disconnected(err.to_string()))
+                        .await;
+                    return Err(err);
+                }
+
+                let _ = event_tx
+                    .send(ClientEvent::Reconnecting {
+                        attempt,
+                        reason: err.to_string(),
+                        retry_in: reconnect.retry_interval,
+                    })
+                    .await;
+            }
+        }
+    }
+}
+
+async fn sleep_until_retry_or_shutdown(duration: Duration, shutdown: &AtomicBool) -> bool {
+    let deadline = Instant::now() + duration;
+    while !shutdown.load(Ordering::Relaxed) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        tokio::time::sleep(remaining.min(Duration::from_millis(50))).await;
+    }
+    false
+}
+
+async fn run_client_loop_inner(
+    config: ClientConfig,
+    event_tx: mpsc::Sender<ClientEvent>,
+    shutdown: Arc<AtomicBool>,
+    hello_seen: Option<&AtomicBool>,
+    emit_disconnected: bool,
+) -> Result<(), ClientError> {
     info!(
         endpoint = %config.endpoint,
         interface = ?config.interface,
@@ -222,6 +369,9 @@ pub async fn run_client_loop(
 
     let (mut reader, mut writer) = stream.into_split();
 
+    // Session-scoped stop flag so a single connection drop does not mutate caller's `shutdown`.
+    let session_stop = Arc::new(AtomicBool::new(false));
+
     // Outbound packet channel
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<Packet>(32);
     let sender_handle = ClientSender { tx: cmd_tx.clone() };
@@ -231,9 +381,10 @@ pub async fn run_client_loop(
 
     // Spawn outbound writer task
     let shutdown_writer = shutdown.clone();
+    let stop_writer = session_stop.clone();
     let writer_task = tokio::spawn(async move {
         let mut encode_buf = BytesMut::with_capacity(1024);
-        while !shutdown_writer.load(Ordering::Relaxed) {
+        while !shutdown_writer.load(Ordering::Relaxed) && !stop_writer.load(Ordering::Relaxed) {
             match cmd_rx.recv().await {
                 Some(packet) => {
                     encode_buf.clear();
@@ -254,14 +405,15 @@ pub async fn run_client_loop(
 
     // Spawn periodic 1-second heartbeat ping task
     let ping_shutdown = shutdown.clone();
-    let ping_sender = sender_handle.clone();
+    let ping_stop = session_stop.clone();
+    let ping_sender = sender_handle;
     let ping_interval = config.ping_interval;
     let ping_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(ping_interval);
         // First tick completes immediately, skip it to avoid zero-interval ping at connect
         interval.tick().await;
 
-        while !ping_shutdown.load(Ordering::Relaxed) {
+        while !ping_shutdown.load(Ordering::Relaxed) && !ping_stop.load(Ordering::Relaxed) {
             interval.tick().await;
             if ping_sender.send_ping().await.is_err() {
                 break;
@@ -277,13 +429,23 @@ pub async fn run_client_loop(
     let mut interval_frames: u64 = 0;
     let mut interval_bytes: u64 = 0;
     let mut last_stats_tick = Instant::now();
+    let mut last_activity = Instant::now();
     let mut last_rtt_ms: f64 = 0.0;
+    let idle_poll = Duration::from_millis(100).min(config.read_timeout);
 
     let loop_result: Result<(), ClientError> = async {
         loop {
             if shutdown.load(Ordering::Relaxed) {
                 info!("Client shutdown requested, exiting receiver loop");
                 break;
+            }
+
+            if last_activity.elapsed() >= config.read_timeout {
+                warn!(
+                    timeout_secs = config.read_timeout.as_secs_f64(),
+                    "Connection read inactivity timeout reached"
+                );
+                return Err(ClientError::HeartbeatTimeout(config.read_timeout));
             }
 
             // Check if 1-second sliding window has elapsed for stats
@@ -309,9 +471,10 @@ pub async fn run_client_loop(
                         info!("Remote sender closed the TCP connection");
                         return Err(ClientError::ConnectionClosed);
                     }
+                    last_activity = Instant::now();
                 }
-                _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                    // Periodic wake-up to allow stats update and shutdown check even when idle
+                _ = tokio::time::sleep(idle_poll) => {
+                    // Periodic wake-up to allow stats update, timeout check, and shutdown check
                     continue;
                 }
             }
@@ -321,6 +484,9 @@ pub async fn run_client_loop(
                 match packet.header.packet_type {
                     PacketType::ControlHello => {
                         let hello: ControlHello = packet.decode_json()?;
+                        if let Some(flag) = hello_seen {
+                            flag.store(true, Ordering::Relaxed);
+                        }
                         info!(
                             device_name = %hello.device_name,
                             protocol_version = hello.protocol_version,
@@ -417,12 +583,14 @@ pub async fn run_client_loop(
     }
     .await;
 
-    // Cleanup background tasks
-    shutdown.store(true, Ordering::Relaxed);
+    // Cleanup session background tasks without modifying caller's `shutdown` flag
+    session_stop.store(true, Ordering::Relaxed);
+    ping_task.abort();
+    writer_task.abort();
     let _ = ping_task.await;
     let _ = writer_task.await;
 
-    if let Err(ref e) = loop_result {
+    if emit_disconnected && let Err(ref e) = loop_result {
         let _ = event_tx
             .send(ClientEvent::Disconnected(e.to_string()))
             .await;

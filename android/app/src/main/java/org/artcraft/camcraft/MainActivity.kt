@@ -9,15 +9,24 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.core.content.ContextCompat
 import org.artcraft.camcraft.network.CamCraftStreamService
 import org.artcraft.camcraft.network.StreamConnectionStatus
+import org.artcraft.camcraft.ui.ArtCraftColors
 import org.artcraft.camcraft.ui.CamCraftScreen
 import org.artcraft.camcraft.ui.CamCraftTheme
+import org.artcraft.camcraft.ui.OledSaverOverlay
 
 class MainActivity : ComponentActivity() {
 
@@ -45,25 +54,40 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             val serviceState by CamCraftStreamService.serviceState.collectAsState()
+            var isDimmed by rememberSaveable { mutableStateOf(false) }
 
             CamCraftTheme {
-                CamCraftScreen(
-                    state = serviceState,
-                    onToggleServer = {
-                        val isRunning = serviceState.status == StreamConnectionStatus.LISTENING ||
-                            serviceState.status == StreamConnectionStatus.CONNECTED
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(if (isDimmed) Color.Black else ArtCraftColors.BgCarbon),
+                ) {
+                    CamCraftScreen(
+                        state = serviceState,
+                        onToggleServer = {
+                            val isRunning = serviceState.status == StreamConnectionStatus.LISTENING ||
+                                serviceState.status == StreamConnectionStatus.CONNECTED
 
-                        if (isRunning) {
-                            CamCraftStreamService.stop(this)
-                        } else {
-                            startServerWithPermissionCheck()
-                        }
-                    },
-                    onSwitchCamera = { CamCraftStreamService.switchCamera() },
-                    onToggleTorch = { CamCraftStreamService.toggleTorch() },
-                    onToggleMute = { CamCraftStreamService.toggleMute() },
-                    modifier = Modifier.safeDrawingPadding(),
-                )
+                            if (isRunning) {
+                                CamCraftStreamService.stop(this@MainActivity)
+                            } else {
+                                startServerWithPermissionCheck()
+                            }
+                        },
+                        onSwitchCamera = { CamCraftStreamService.switchCamera() },
+                        onToggleTorch = { CamCraftStreamService.toggleTorch() },
+                        onToggleMute = { CamCraftStreamService.toggleMute() },
+                        onDimScreen = { isDimmed = true },
+                        modifier = Modifier.safeDrawingPadding(),
+                    )
+
+                    if (isDimmed) {
+                        OledSaverOverlay(
+                            state = serviceState,
+                            onExit = { isDimmed = false },
+                        )
+                    }
+                }
             }
         }
     }

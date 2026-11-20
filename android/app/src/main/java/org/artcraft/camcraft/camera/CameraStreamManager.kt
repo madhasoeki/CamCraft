@@ -5,9 +5,10 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.util.Size
+import androidx.annotation.OptIn
 import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
-import androidx.camera.core.CameraControl
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.Preview
@@ -18,8 +19,10 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
+import java.lang.ref.WeakReference
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.roundToInt
 import org.artcraft.camcraft.encoder.H264SurfaceEncoder
 import org.artcraft.camcraft.protocol.PacketType
@@ -48,6 +51,7 @@ class ServiceLifecycleOwner : LifecycleOwner {
 
     fun start() {
         runOnMain {
+            if (registry.currentState == Lifecycle.State.DESTROYED) return@runOnMain
             registry.currentState = Lifecycle.State.STARTED
             registry.currentState = Lifecycle.State.RESUMED
         }
@@ -55,14 +59,19 @@ class ServiceLifecycleOwner : LifecycleOwner {
 
     fun stop() {
         runOnMain {
-            registry.currentState = Lifecycle.State.STARTED
+            if (registry.currentState == Lifecycle.State.DESTROYED) return@runOnMain
+            if (registry.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+                registry.currentState = Lifecycle.State.STARTED
+            }
             registry.currentState = Lifecycle.State.CREATED
         }
     }
 
     fun destroy() {
         runOnMain {
-            registry.currentState = Lifecycle.State.DESTROYED
+            if (registry.currentState != Lifecycle.State.DESTROYED) {
+                registry.currentState = Lifecycle.State.DESTROYED
+            }
         }
     }
 
@@ -82,6 +91,7 @@ class CameraStreamManager(
     private val lifecycleOwner = ServiceLifecycleOwner()
     private val cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val mainExecutor = ContextCompat.getMainExecutor(context)
+    private val isReleased = AtomicBoolean(false)
 
     private var cameraProvider: ProcessCameraProvider? = null
     private var activeCamera: Camera? = null
@@ -89,7 +99,7 @@ class CameraStreamManager(
 
     private var encoderPreview: Preview? = null
     private var uiPreview: Preview? = null
-    private var attachedPreviewView: PreviewView? = null
+    private var attachedPreviewViewRef: WeakReference<PreviewView>? = null
 
     // Active streaming parameters
     var currentCameraId: String = "0"
@@ -109,6 +119,7 @@ class CameraStreamManager(
     private var targetTorch: Boolean = false
     private var targetAutoFocus: Boolean = true
 
+    @Volatile
     var isStreaming: Boolean = false
         private set
 
@@ -119,12 +130,25 @@ class CameraStreamManager(
         initCameraProvider()
     }
 
+    private fun runOnMain(block: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            block()
+        } else {
+            mainExecutor.execute(block)
+        }
+    }
+
     private fun initCameraProvider() {
         try {
             val future = ProcessCameraProvider.getInstance(context)
             future.addListener({
                 try {
-                    cameraProvider = future.get()
+                    val provider = future.get()
+                    if (isReleased.get()) {
+                        runCatching { provider.unbindAll() }
+                        return@addListener
+                    }
+                    cameraProvider = provider
                     Log.i(TAG, "ProcessCameraProvider initialized")
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to get ProcessCameraProvider: ${e.message}", e)
@@ -145,6 +169,8 @@ class CameraStreamManager(
         fps: Int,
         bitrateKbps: Int,
     ) {
+        if (isReleased.get()) return
+
         currentCameraId = cameraId
         currentWidth = width
         currentHeight = height
@@ -153,7 +179,8 @@ class CameraStreamManager(
 
         isStreaming = true
 
-        mainExecutor.execute {
+        runOnMain {
+            if (isReleased.get() || !isStreaming) return@runOnMain
             lifecycleOwner.start()
             setupEncoderAndBind()
         }
@@ -165,31 +192,38 @@ class CameraStreamManager(
     fun stopStream() {
         isStreaming = false
 
-        mainExecutor.execute {
+        runOnMain {
+            cleanupActivePipeline()
             lifecycleOwner.stop()
-            try {
-                cameraProvider?.unbindAll()
-            } catch (e: Exception) {
-                Log.w(TAG, "Exception unbinding use cases: ${e.message}")
-            }
-            activeCamera = null
-            encoderPreview = null
-            uiPreview = null
-
-            encoder?.release()
-            encoder = null
             Log.i(TAG, "CameraStreamManager stopped")
         }
+    }
+
+    private fun cleanupActivePipeline() {
+        try {
+            cameraProvider?.unbindAll()
+        } catch (e: Exception) {
+            Log.w(TAG, "Exception unbinding use cases: ${e.message}")
+        }
+        activeCamera = null
+        encoderPreview = null
+        uiPreview = null
+
+        encoder?.release()
+        encoder = null
     }
 
     /**
      * Attaches a [PreviewView] from the UI to display the camera viewfinder on phone screen.
      */
     fun attachPreviewView(previewView: PreviewView) {
-        attachedPreviewView = previewView
+        if (isReleased.get()) return
+        attachedPreviewViewRef = WeakReference(previewView)
         if (isStreaming) {
-            mainExecutor.execute {
-                bindUseCases()
+            runOnMain {
+                if (isStreaming && !isReleased.get()) {
+                    bindUseCases()
+                }
             }
         }
     }
@@ -198,10 +232,12 @@ class CameraStreamManager(
      * Detaches the UI [PreviewView] when screen is dimmed or Activity is backgrounded.
      */
     fun detachPreviewView() {
-        attachedPreviewView = null
-        if (isStreaming) {
-            mainExecutor.execute {
-                bindUseCases()
+        attachedPreviewViewRef = null
+        if (isStreaming && !isReleased.get()) {
+            runOnMain {
+                if (isStreaming && !isReleased.get()) {
+                    bindUseCases()
+                }
             }
         }
     }
@@ -216,6 +252,8 @@ class CameraStreamManager(
         fps: Int,
         bitrateKbps: Int,
     ) {
+        if (isReleased.get()) return
+
         val encoderConfigChanged = width != currentWidth ||
             height != currentHeight ||
             fps != currentFps ||
@@ -231,7 +269,8 @@ class CameraStreamManager(
 
         if (!isStreaming) return
 
-        mainExecutor.execute {
+        runOnMain {
+            if (!isStreaming || isReleased.get()) return@runOnMain
             if (encoderConfigChanged || encoder == null) {
                 setupEncoderAndBind()
             } else if (cameraChanged) {
@@ -241,10 +280,14 @@ class CameraStreamManager(
     }
 
     private fun setupEncoderAndBind() {
-        encoder?.release()
+        if (!isStreaming || isReleased.get()) return
 
+        // Unbind CameraX before releasing the old encoder so CameraX never renders to a closed Surface.
+        cleanupActivePipeline()
+
+        var newEncoder: H264SurfaceEncoder? = null
         try {
-            val newEncoder = H264SurfaceEncoder(
+            newEncoder = H264SurfaceEncoder(
                 width = currentWidth,
                 height = currentHeight,
                 fps = currentFps,
@@ -255,6 +298,8 @@ class CameraStreamManager(
             encoder = newEncoder
         } catch (e: Exception) {
             Log.e(TAG, "Failed to instantiate H264SurfaceEncoder: ${e.message}", e)
+            runCatching { newEncoder?.release() }
+            encoder = null
             return
         }
 
@@ -262,13 +307,26 @@ class CameraStreamManager(
     }
 
     private fun bindUseCases() {
+        if (!isStreaming || isReleased.get()) return
+
         val provider = cameraProvider
         if (provider == null) {
             Log.w(TAG, "ProcessCameraProvider not ready yet, retrying...")
             val future = ProcessCameraProvider.getInstance(context)
             future.addListener({
-                cameraProvider = future.get()
-                bindUseCases()
+                try {
+                    val resolved = future.get()
+                    if (isReleased.get()) {
+                        runCatching { resolved.unbindAll() }
+                        return@addListener
+                    }
+                    cameraProvider = resolved
+                    if (isStreaming && !isReleased.get()) {
+                        bindUseCases()
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed retrying ProcessCameraProvider: ${e.message}", e)
+                }
             }, mainExecutor)
             return
         }
@@ -290,7 +348,7 @@ class CameraStreamManager(
                 .build()
 
             encPreview.setSurfaceProvider(cameraExecutor) { request ->
-                if (surface.isValid) {
+                if (!isReleased.get() && surface.isValid) {
                     request.provideSurface(surface, cameraExecutor) { result ->
                         Log.d(TAG, "Encoder surface provider result: ${result.resultCode}")
                     }
@@ -304,7 +362,7 @@ class CameraStreamManager(
             val cameraSelector = buildCameraSelector(currentCameraId)
 
             // 3. Optional UI PreviewView use case
-            val view = attachedPreviewView
+            val view = attachedPreviewViewRef?.get()
             val useCases = mutableListOf<androidx.camera.core.UseCase>(encPreview)
 
             if (view != null) {
@@ -338,6 +396,7 @@ class CameraStreamManager(
         }
     }
 
+    @OptIn(ExperimentalCamera2Interop::class)
     private fun buildCameraSelector(targetId: String): CameraSelector {
         return CameraSelector.Builder()
             .addCameraFilter { cameraInfos ->
@@ -400,9 +459,17 @@ class CameraStreamManager(
     }
 
     fun release() {
-        stopStream()
-        lifecycleOwner.destroy()
-        cameraExecutor.shutdown()
+        if (!isReleased.compareAndSet(false, true)) return
+        isStreaming = false
+        attachedPreviewViewRef = null
+
+        runOnMain {
+            cleanupActivePipeline()
+            cameraProvider = null
+            lifecycleOwner.destroy()
+            cameraExecutor.shutdown()
+            Log.i(TAG, "CameraStreamManager released")
+        }
     }
 
     companion object {

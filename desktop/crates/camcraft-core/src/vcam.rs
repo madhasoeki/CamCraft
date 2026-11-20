@@ -55,6 +55,15 @@ pub enum VcamError {
     NotOpen,
 }
 
+/// Visual mode for generated standby patterns on `/dev/video*`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StandbyKind {
+    /// Initial idle standby before a phone connects.
+    Standby,
+    /// Active reconnect standby after an unexpected connection loss.
+    Reconnecting,
+}
+
 /// Platform-independent virtual camera sink abstraction.
 pub trait VirtualCameraSink: Send {
     /// Opens or connects to the virtual camera device.
@@ -69,6 +78,17 @@ pub trait VirtualCameraSink: Send {
     fn write_standby_frame(&mut self, width: u32, height: u32) -> Result<(), VcamError> {
         let frame = generate_standby_frame(width, height);
         self.write_frame(width, height, &frame)
+    }
+
+    /// Generates and writes one reconnecting pattern frame at the given resolution.
+    fn write_reconnecting_frame(&mut self, width: u32, height: u32) -> Result<(), VcamError> {
+        let frame = generate_reconnecting_frame(width, height);
+        self.write_frame(width, height, &frame)
+    }
+
+    /// Returns the most recently configured `(width, height)`, if known.
+    fn current_dimensions(&self) -> Option<(u32, u32)> {
+        None
     }
 
     /// Closes and releases the virtual camera device.
@@ -148,26 +168,56 @@ pub fn find_camcraft_v4l2_device() -> PathBuf {
     }
 }
 
-/// Generates a sleek dark standby pattern frame in contiguous YUV420P format.
+/// Populates `buf` in place with a sleek dark standby or reconnecting pattern frame in
+/// contiguous YUV420P format, reusing `buf`'s existing heap capacity when possible.
 ///
 /// Ensures `/dev/video10` continuously streams a valid video signal even when the phone
 /// is disconnected or changing resolutions, preventing calling apps (OBS, Discord) from failing.
-#[must_use]
-pub fn generate_standby_frame(width: u32, height: u32) -> Vec<u8> {
+pub fn fill_standby_frame(buf: &mut Vec<u8>, width: u32, height: u32, kind: StandbyKind) {
     let w = width as usize;
     let h = height as usize;
     let half_w = w / 2;
     let half_h = h / 2;
     let total_size = w * h + 2 * (half_w * half_h);
 
-    let mut buf = vec![0u8; total_size];
+    buf.resize(total_size, 0);
+    if w == 0 || h == 0 {
+        return;
+    }
 
     // Y plane: default dark charcoal background (Y = 32)
     buf[..w * h].fill(32);
 
-    // Center indicator box (ArtCraft theme styling)
-    let box_w = (w / 4).clamp(120, 360).min(w);
-    let box_h = (h / 5).clamp(80, 240).min(h);
+    // U (Cb) and V (Cr) planes: default neutral chroma (128)
+    let u_start = w * h;
+    let v_start = u_start + half_w * half_h;
+    buf[u_start..u_start + half_w * half_h].fill(128);
+    buf[v_start..v_start + half_w * half_h].fill(128);
+
+    let label = match kind {
+        StandbyKind::Standby => "CAMCRAFT - STANDBY",
+        StandbyKind::Reconnecting => "CAMCRAFT - RECONNECTING...",
+    };
+
+    let scale = (w / 320).clamp(1, 5);
+    let text_w = (label.len() * 6).saturating_sub(1) * scale;
+    let text_h = 7 * scale;
+    let text_fits = w >= text_w + 24 && h >= text_h + 48;
+
+    let dot_radius = (h / 40).clamp(6, 16);
+    let box_w = if text_fits {
+        (w / 4)
+            .max(text_w + 24 * scale)
+            .min(w.saturating_sub(4).max(1))
+    } else {
+        (w / 4).clamp(120, 360).min(w)
+    };
+    let box_h = if text_fits {
+        (h / 5).max(text_h + dot_radius * 4 + 16 * scale).min(h)
+    } else {
+        (h / 5).clamp(80, 240).min(h)
+    };
+
     let start_x = (w - box_w) / 2;
     let end_x = start_x + box_w;
     let start_y = (h - box_h) / 2;
@@ -193,15 +243,18 @@ pub fn generate_standby_frame(width: u32, height: u32) -> Vec<u8> {
         }
     }
 
-    // Draw centered crosshair / status dot (Y = 220)
+    // Draw status dot (Y = 220, subtle ArtCraft amber chroma U = 80, V = 180)
     let center_x = w / 2;
-    let center_y = h / 2;
-    let dot_radius = (box_h / 8).clamp(6, 16);
+    let dot_center_y = if text_fits {
+        start_y + box_h / 3
+    } else {
+        h / 2
+    };
 
     for dy in -(dot_radius as isize)..=(dot_radius as isize) {
         for dx in -(dot_radius as isize)..=(dot_radius as isize) {
             if dx * dx + dy * dy <= (dot_radius * dot_radius) as isize {
-                let py = center_y as isize + dy;
+                let py = dot_center_y as isize + dy;
                 let px = center_x as isize + dx;
                 if py >= 0 && px >= 0 {
                     let py_u = py as usize;
@@ -214,15 +267,8 @@ pub fn generate_standby_frame(width: u32, height: u32) -> Vec<u8> {
         }
     }
 
-    // U (Cb) and V (Cr) planes: default neutral chroma (128)
-    let u_start = w * h;
-    let v_start = u_start + half_w * half_h;
-    buf[u_start..u_start + half_w * half_h].fill(128);
-    buf[v_start..v_start + half_w * half_h].fill(128);
-
-    // Accent color on the center dot: subtle amber/gold tint (U = 80, V = 180)
-    let uv_center_x = half_w / 2;
-    let uv_center_y = half_h / 2;
+    let uv_center_x = center_x / 2;
+    let uv_center_y = dot_center_y / 2;
     let uv_radius = dot_radius / 2;
 
     for dy in -(uv_radius as isize)..=(uv_radius as isize) {
@@ -242,7 +288,199 @@ pub fn generate_standby_frame(width: u32, height: u32) -> Vec<u8> {
         }
     }
 
+    if text_fits {
+        let text_x = (w - text_w) / 2;
+        let text_y = (start_y + (box_h * 2) / 3).saturating_sub(text_h / 2);
+        if text_y + text_h <= h {
+            let mut canvas = YPlaneCanvas {
+                buf,
+                width: w,
+                height: h,
+            };
+            draw_bitmap_text_y(&mut canvas, (text_x, text_y), scale, label, 225);
+        }
+    }
+}
+
+/// Generates a sleek dark standby pattern frame in contiguous YUV420P format.
+#[must_use]
+pub fn generate_standby_frame(width: u32, height: u32) -> Vec<u8> {
+    generate_standby_frame_for(width, height, StandbyKind::Standby)
+}
+
+/// Generates a dark `"CAMCRAFT - RECONNECTING..."` standby frame in contiguous YUV420P format.
+#[must_use]
+pub fn generate_reconnecting_frame(width: u32, height: u32) -> Vec<u8> {
+    generate_standby_frame_for(width, height, StandbyKind::Reconnecting)
+}
+
+/// Generates a standby pattern frame for the requested [`StandbyKind`].
+#[must_use]
+pub fn generate_standby_frame_for(width: u32, height: u32, kind: StandbyKind) -> Vec<u8> {
+    let mut buf = Vec::new();
+    fill_standby_frame(&mut buf, width, height, kind);
     buf
+}
+
+struct YPlaneCanvas<'a> {
+    buf: &'a mut [u8],
+    width: usize,
+    height: usize,
+}
+
+fn draw_bitmap_text_y(
+    canvas: &mut YPlaneCanvas<'_>,
+    origin: (usize, usize),
+    scale: usize,
+    text: &str,
+    luma: u8,
+) {
+    let (start_x, start_y) = origin;
+    for (char_idx, ch) in text.chars().enumerate() {
+        let glyph = glyph_5x7(ch);
+        let char_x = start_x + char_idx * 6 * scale;
+        for (row_idx, &row_bits) in glyph.iter().enumerate() {
+            for col_idx in 0..5 {
+                if (row_bits & (1 << (4 - col_idx))) != 0 {
+                    for sy in 0..scale {
+                        let py = start_y + row_idx * scale + sy;
+                        if py >= canvas.height {
+                            continue;
+                        }
+                        for sx in 0..scale {
+                            let px = char_x + col_idx * scale + sx;
+                            if px < canvas.width {
+                                canvas.buf[py * canvas.width + px] = luma;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+const fn glyph_5x7(ch: char) -> [u8; 7] {
+    match ch.to_ascii_uppercase() {
+        'A' => [
+            0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'B' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110,
+        ],
+        'C' => [
+            0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110,
+        ],
+        'D' => [
+            0b11100, 0b10010, 0b10001, 0b10001, 0b10001, 0b10010, 0b11100,
+        ],
+        'E' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
+        ],
+        'F' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000,
+        ],
+        'G' => [
+            0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110,
+        ],
+        'H' => [
+            0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'I' => [
+            0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ],
+        'J' => [
+            0b00111, 0b00010, 0b00010, 0b00010, 0b10010, 0b10010, 0b01100,
+        ],
+        'K' => [
+            0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001,
+        ],
+        'L' => [
+            0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
+        ],
+        'M' => [
+            0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001,
+        ],
+        'N' => [
+            0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001,
+        ],
+        'O' => [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        'P' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000,
+        ],
+        'Q' => [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101,
+        ],
+        'R' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
+        ],
+        'S' => [
+            0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        'T' => [
+            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        'U' => [
+            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        'V' => [
+            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100,
+        ],
+        'W' => [
+            0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001,
+        ],
+        'X' => [
+            0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001,
+        ],
+        'Y' => [
+            0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        'Z' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111,
+        ],
+        '0' => [
+            0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
+        ],
+        '1' => [
+            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ],
+        '2' => [
+            0b01110, 0b10001, 0b00001, 0b00110, 0b01000, 0b10000, 0b11111,
+        ],
+        '3' => [
+            0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        '4' => [
+            0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
+        ],
+        '5' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110,
+        ],
+        '6' => [
+            0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
+        ],
+        '7' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
+        ],
+        '8' => [
+            0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
+        ],
+        '9' => [
+            0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110,
+        ],
+        '-' => [
+            0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000,
+        ],
+        '.' => [
+            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100,
+        ],
+        ':' => [
+            0b00000, 0b01100, 0b01100, 0b00000, 0b01100, 0b01100, 0b00000,
+        ],
+        _ => [0b00000; 7],
+    }
 }
 
 /// Linux `v4l2loopback` virtual camera sink writing directly to `/dev/videoX`.
@@ -453,6 +691,19 @@ impl VirtualCameraSink for V4l2LoopbackSink {
         VirtualCameraSink::write_frame(self, width, height, &frame)
     }
 
+    fn write_reconnecting_frame(&mut self, width: u32, height: u32) -> Result<(), VcamError> {
+        let frame = generate_reconnecting_frame(width, height);
+        VirtualCameraSink::write_frame(self, width, height, &frame)
+    }
+
+    fn current_dimensions(&self) -> Option<(u32, u32)> {
+        if self.current_width > 0 && self.current_height > 0 {
+            Some((self.current_width, self.current_height))
+        } else {
+            None
+        }
+    }
+
     fn close(&mut self) -> Result<(), VcamError> {
         if self.device.is_some() {
             info!(path = %self.device_path.display(), "Closing V4L2 virtual camera sink");
@@ -517,9 +768,29 @@ mod tests {
     #[test]
     fn test_standby_frame_tiny_resolutions_no_panic() {
         for (w, h) in [(2, 2), (16, 16), (64, 64)] {
-            let frame = generate_standby_frame(w, h);
-            assert_eq!(frame.len(), (w * h * 3 / 2) as usize);
+            for kind in [StandbyKind::Standby, StandbyKind::Reconnecting] {
+                let frame = generate_standby_frame_for(w, h, kind);
+                assert_eq!(frame.len(), (w * h * 3 / 2) as usize);
+            }
         }
+    }
+
+    #[test]
+    fn test_reconnecting_frame_renders_text_and_reuses_buffer() {
+        let standby = generate_standby_frame(1280, 720);
+        let reconnecting = generate_reconnecting_frame(1280, 720);
+        assert_eq!(reconnecting.len(), 1280 * 720 * 3 / 2);
+        assert_ne!(standby, reconnecting);
+        assert_eq!(reconnecting[0], 32);
+        assert!(reconnecting[..1280 * 720].contains(&225));
+
+        let mut reused = Vec::with_capacity(1280 * 720 * 3 / 2);
+        fill_standby_frame(&mut reused, 1280, 720, StandbyKind::Reconnecting);
+        let ptr_before = reused.as_ptr();
+        let cap_before = reused.capacity();
+        fill_standby_frame(&mut reused, 1280, 720, StandbyKind::Standby);
+        assert_eq!(reused.as_ptr(), ptr_before);
+        assert_eq!(reused.capacity(), cap_before);
     }
 
     #[test]
