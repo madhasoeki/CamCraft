@@ -1,6 +1,7 @@
 package org.artcraft.camcraft
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -37,6 +38,10 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
+        if (intent?.getBooleanExtra("autostart", false) == true) {
+            startServerWithPermissionCheck()
+        }
+
         setContent {
             val serviceState by CamCraftStreamService.serviceState.collectAsState()
 
@@ -56,6 +61,14 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.safeDrawingPadding(),
                 )
             }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent.getBooleanExtra("autostart", false)) {
+            startServerWithPermissionCheck()
         }
     }
 

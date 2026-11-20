@@ -17,6 +17,12 @@ pub enum CoreError {
     #[error("client network error: {0}")]
     Client(#[from] client::ClientError),
 
+    #[error("video decoder error: {0}")]
+    Decoder(#[from] decoder::DecoderError),
+
+    #[error("virtual camera error: {0}")]
+    Vcam(#[from] vcam::VcamError),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -60,20 +66,10 @@ pub mod adb;
 pub mod client;
 
 /// Bounded video/audio frame queues and H.264/Opus decoders (Stage 4 / Stage 7).
-pub mod decoder {
-    /// Bounded queue capacity for real-time video frames (`docs/DESIGN.md` §3.1).
-    pub const DEFAULT_VIDEO_QUEUE_CAPACITY: usize = 4;
-
-    /// Creates a bounded crossbeam channel used to drop stale frames under backpressure.
-    #[must_use]
-    pub fn bounded_video_channel<T>()
-    -> (crossbeam_channel::Sender<T>, crossbeam_channel::Receiver<T>) {
-        crossbeam_channel::bounded(DEFAULT_VIDEO_QUEUE_CAPACITY)
-    }
-}
+pub mod decoder;
 
 /// Linux `v4l2loopback` virtual camera sink (Stage 4+).
-pub mod vcam {}
+pub mod vcam;
 
 /// PipeWire / PulseAudio virtual microphone sink (Stage 7+).
 pub mod vmic {}

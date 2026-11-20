@@ -329,7 +329,7 @@ fun CamCraftScreen(
             modifier = Modifier.fillMaxWidth(),
         ) {
             Text(
-                text = if (isRunning) "Stop Server" else "Start Server (Stage 2)",
+                text = if (isRunning) "Stop Server" else "Start Server",
                 color = ArtCraftColors.TextPrimary,
                 fontWeight = FontWeight.SemiBold,
                 modifier = Modifier.padding(vertical = 8.dp),

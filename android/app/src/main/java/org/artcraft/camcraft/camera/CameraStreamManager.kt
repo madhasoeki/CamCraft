@@ -1,6 +1,8 @@
 package org.artcraft.camcraft.camera
 
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.util.Size
 import androidx.camera.camera2.interop.Camera2CameraInfo
@@ -28,23 +30,40 @@ import org.artcraft.camcraft.protocol.PacketType
  */
 class ServiceLifecycleOwner : LifecycleOwner {
     private val registry = LifecycleRegistry(this)
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     init {
-        registry.currentState = Lifecycle.State.CREATED
+        runOnMain {
+            registry.currentState = Lifecycle.State.CREATED
+        }
+    }
+
+    private fun runOnMain(block: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            block()
+        } else {
+            mainHandler.post(block)
+        }
     }
 
     fun start() {
-        registry.currentState = Lifecycle.State.STARTED
-        registry.currentState = Lifecycle.State.RESUMED
+        runOnMain {
+            registry.currentState = Lifecycle.State.STARTED
+            registry.currentState = Lifecycle.State.RESUMED
+        }
     }
 
     fun stop() {
-        registry.currentState = Lifecycle.State.STARTED
-        registry.currentState = Lifecycle.State.CREATED
+        runOnMain {
+            registry.currentState = Lifecycle.State.STARTED
+            registry.currentState = Lifecycle.State.CREATED
+        }
     }
 
     fun destroy() {
-        registry.currentState = Lifecycle.State.DESTROYED
+        runOnMain {
+            registry.currentState = Lifecycle.State.DESTROYED
+        }
     }
 
     override val lifecycle: Lifecycle
@@ -132,10 +151,10 @@ class CameraStreamManager(
         currentFps = fps
         currentBitrateKbps = bitrateKbps
 
-        lifecycleOwner.start()
         isStreaming = true
 
         mainExecutor.execute {
+            lifecycleOwner.start()
             setupEncoderAndBind()
         }
     }
@@ -145,9 +164,9 @@ class CameraStreamManager(
      */
     fun stopStream() {
         isStreaming = false
-        lifecycleOwner.stop()
 
         mainExecutor.execute {
+            lifecycleOwner.stop()
             try {
                 cameraProvider?.unbindAll()
             } catch (e: Exception) {

@@ -1,93 +1,105 @@
-# Graph Report - CamCraft  (2026-11-15)
+# Graph Report - CamCraft  (2026-11-16)
 
 ## Corpus Check
-- 42 files · ~56,039 words
+- 45 files · ~60,376 words
 - Verdict: corpus is large enough that graph structure adds value.
 - Unclassified: 17 file(s) not represented in the graph (top: .pftxt 7, .xml 3, (none) 2)
 
 ## Summary
-- 844 nodes · 1345 edges · 60 communities (37 shown, 23 thin omitted)
-- Extraction: 96% EXTRACTED · 4% INFERRED · 0% AMBIGUOUS · INFERRED: 55 edges (avg confidence: 0.89)
-- Token cost: 0 input · 0 output
+- 952 nodes · 1569 edges · 77 communities (44 shown, 33 thin omitted)
+- Extraction: 96% EXTRACTED · 4% INFERRED · 0% AMBIGUOUS · INFERRED: 63 edges (avg confidence: 0.87)
+- Token cost: 1,500 input · 800 output
 
 ## Graph Freshness
-- Built from commit: `08a3efd1`
+- Built from commit: `ac1a4b69`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
 ## Community Hubs (Navigation)
-- camcraft-protocol/src/lib.rs
-- Perfetto Trace Analysis & Profiling
-- Rust Media Sink & Decode
-- CameraX Core & Spatial Mapping
-- Project Specs & Agent Workflow
-- CCFT v1 Protocol & Control
-- Perfetto Trace Processor Script
-- USB ADB & Wi-Fi Transport
-- Capabilities
-- camcraft-core/src/lib.rs
-- Foldables Camera Posture Support
-- Android UI & Screen Automation
-- Monorepo Scaffolding & Execution Plan
-- CamCraft MVP v0.1 Scope
-- Android MVVM Data Flow
-- CamCraft Project Overview
-- End-to-End Media Pipeline
-- CamCraft Vibecoding Toolchain
-- ScaffoldingSmokeTest.kt
-- Camera2Interop.Extender
-- v4l2loopback Output Sink (vcam)
-- interface
-- interface
-- Foldables Camera Guide
-- ADB Shell Input & Interaction Rules
-- Tahap 0: Monorepo Scaffolding & Graphify Baseline
-- gradlew
-- CameraStreamManager
-- Wear OS Remote Viewfinder Guide
-- app/build.gradle.kts
-- CameraController.kt
-- StreamConnectionService.kt
-- CamCraft MVP v0.1 Vision
-- Android MVVM Unidirectional Data Flow
-- CamCraft Project
-- android/build.gradle.kts
-- End-to-End Video & Audio Pipeline
-- FR-01: High-Resolution Video Streaming
-- CamCraft Vibecoding Toolchain
-- ControlAck
-- ControlCmd
-- ControlHello
-- End-to-End Video & Audio Pipeline
-- StreamConnectionService.kt
-- CamCraft MVP v0.1 Vision
-- CamCraft Project
-- End-to-End Video & Audio Pipeline
-- FR-01: High-Resolution Video Streaming
-- CamCraft Vibecoding Toolchain
+- Android Camera Enumeration
+- Android CCFT Packet Framing
+- Rust H.264 Video Decoder
+- Android CameraX Stream Manager
+- Android CLI & Profiling Tools
+- Rust CCFT Serde & Models
+- CCFT Frame Flags Bitmask
+- Android Jetpack Compose UI
+- Linux V4L2 Virtual Camera Sink
+- Android Protocol Constants
+- Android MediaCodec H.264 Encoder
+- ControlModels.kt
+- Architecture Review Guidelines
+- Desktop Native GUI Preview
+- client.rs
+- Subsystem 15
+- Subsystem 16
+- vcam.rs
+- Subsystem 19
+- Subsystem 20
+- Subsystem 21
+- Subsystem 22
+- Subsystem 23
+- Subsystem 25
+- Subsystem 26
+- Subsystem 27
+- Subsystem 28
+- Subsystem 30
+- Subsystem 31
+- Subsystem 32
+- Subsystem 33
+- Subsystem 34
+- Subsystem 35
+- Subsystem 37
+- Subsystem 38
+- Subsystem 39
+- Subsystem 40
+- Subsystem 41
+- Subsystem 42
+- Subsystem 43
+- Subsystem 44
+- Subsystem 45
+- Subsystem 46
+- Subsystem 47
+- Subsystem 48
+- Subsystem 49
+- Subsystem 50
+- Subsystem 51
+- Subsystem 52
+- Subsystem 53
+- Subsystem 54
+- Subsystem 56
+- Subsystem 57
+- Subsystem 58
+- Subsystem 59
+- Subsystem 61
+- Subsystem 63
+- Subsystem 65
+- Subsystem 75
+- Subsystem 76
+- Subsystem 77
 
 ## God Nodes (most connected - your core abstractions)
 1. `FrameFlags` - 35 edges
 2. `CamCraftStreamService` - 31 edges
 3. `CameraStreamManager` - 29 edges
 4. `CcftPacket` - 23 edges
-5. `Packet` - 20 edges
-6. `PacketType` - 17 edges
-7. `ProtocolError` - 17 edges
-8. `H264SurfaceEncoder` - 16 edges
-9. `CameraX Skill Guide` - 16 edges
-10. `ClientEvent` - 15 edges
+5. `VcamError` - 21 edges
+6. `DecoderError` - 20 edges
+7. `Packet` - 20 edges
+8. `PacketType` - 17 edges
+9. `PacketType` - 17 edges
+10. `ProtocolError` - 17 edges
 
 ## Surprising Connections (you probably didn't know these)
 - `Rust Unsafe FFI Invariant Rule` --conceptually_related_to--> `v4l2loopback Output Sink (vcam)`  [INFERRED]
   AGENTS.md → docs/DESIGN.md
 - `Rust Zero Panic Production Rule` --conceptually_related_to--> `crates/camcraft-core`  [INFERRED]
   AGENTS.md → docs/DESIGN.md
+- `V4l2LoopbackSink` --references--> `Device`  [INFERRED]
+  desktop/crates/camcraft-core/src/vcam.rs → desktop/crates/camcraft-core/src/adb.rs
 - `Android Foreground Service Lifecycle Management` --rationale_for--> `StreamConnectionService (Android network/)`  [INFERRED]
   AGENTS.md → docs/DESIGN.md
 - `Android CameraX-to-MediaCodec Surface Pipeline` --rationale_for--> `HardwareVideoEncoder (Android encoder/)`  [INFERRED]
-  AGENTS.md → docs/DESIGN.md
-- `Rust Zero-Copy Hot Loop & Thread Isolation` --rationale_for--> `Bounded Video Queue Frame-Drop Strategy`  [INFERRED]
   AGENTS.md → docs/DESIGN.md
 
 ## Import Cycles
@@ -104,175 +116,203 @@
 - **Camera2Interop Low-Level Hardware Control Pattern** — _agents_skills_camerax_skill_camera2interop, _agents_skills_camerax_references_camera2_to_camerax_camera2interop_extender, _agents_skills_camerax_references_expert_blueprints_manual_controls_blueprint, _agents_skills_camerax_references_thermals_streamusecase [INFERRED 0.95]
 - **Two-Way Camera Control & State Sync Loop** — docs_design_camcraft_gui_crate, docs_protocol_control_cmd, docs_protocol_control_ack, docs_design_cameracontroller [INFERRED 0.95]
 
-## Communities (60 total, 23 thin omitted)
+## Communities (77 total, 33 thin omitted)
 
-### Community 0 - "camcraft-protocol/src/lib.rs"
+### Community 0 - "Android Camera Enumeration"
 Cohesion: 0.05
-Nodes (31): Cli, Command, Connect, Status, main(), print_device_banner(), print_stats(), run_connect() (+23 more)
-
-### Community 1 - "Perfetto Trace Analysis & Profiling"
-Cohesion: 0.07
-Nodes (12): CcftHeader, PacketType, AUDIO_CONFIG, AUDIO_FRAME, CONTROL_ACK, CONTROL_CMD, CONTROL_HELLO, HEARTBEAT_PING (+4 more)
-
-### Community 2 - "Rust Media Sink & Decode"
-Cohesion: 0.06
-Nodes (32): AdbDevice, AdbDeviceState, Connecting, Device, Offline, Other, Unauthorized, AdbError (+24 more)
-
-### Community 3 - "CameraX Core & Spatial Mapping"
-Cohesion: 0.06
 Nodes (4): CamCraftStreamService, defaultActiveCameraState(), StreamServiceState, CamCraftStreamServiceTest
 
-### Community 4 - "Project Specs & Agent Workflow"
+### Community 1 - "Android CCFT Packet Framing"
 Cohesion: 0.06
-Nodes (6): H264SurfaceEncoder, CcftFlags, CcftProtocolConstants, H264SurfaceEncoderTest, CcftProtocolTest, ScaffoldingSmokeTest
+Nodes (14): CcftHeader, PacketType, AUDIO_CONFIG, AUDIO_FRAME, CONTROL_ACK, CONTROL_CMD, CONTROL_HELLO, HEARTBEAT_PING (+6 more)
 
-### Community 5 - "CCFT v1 Protocol & Control"
+### Community 2 - "Rust H.264 Video Decoder"
+Cohesion: 0.08
+Nodes (22): bounded_video_channel(), DecodedFrame, DECODER_QUEUE_CAPACITY, DecoderCommand, Config, Flush, Frame, Stop (+14 more)
+
+### Community 4 - "Android CLI & Profiling Tools"
 Cohesion: 0.08
 Nodes (24): android CLI, android-cli Skill, android profiler CLI Subcommand, Analysis Orchestrator, PerfettoSQL Query Workflow, Perfetto Trace Analysis Workflow, CPU Scheduling & Frequency Hints, Graphics & UI Jank Hints (+16 more)
 
-### Community 6 - "Perfetto Trace Processor Script"
+### Community 5 - "Rust CCFT Serde & Models"
 Cohesion: 0.07
 Nodes (25): ActiveCameraState, AudioConfigPayload, CameraInfo, CANONICAL_TEST_FRAME, control_ack_json_schema_matches_spec(), ControlAck, ControlCommand, ControlHello (+17 more)
 
-### Community 7 - "USB ADB & Wi-Fi Transport"
+### Community 6 - "CCFT Frame Flags Bitmask"
 Cohesion: 0.08
 Nodes (10): frame_flags_operations_and_rotations(), FrameFlags, .CODEC_HEVC, .KEYFRAME, .MIRROR_H, .NONE, .ROTATE_180, .ROTATE_270 (+2 more)
 
-### Community 9 - "camcraft-core/src/lib.rs"
-Cohesion: 0.13
+### Community 8 - "Linux V4L2 Virtual Camera Sink"
+Cohesion: 0.12
+Nodes (10): test_v4l2_loopback_sink_lifecycle(), V4l2LoopbackSink, VcamError, DeviceOpen, FormatError, InvalidCapabilities, Io, NotOpen (+2 more)
+
+### Community 11 - "ControlModels.kt"
+Cohesion: 0.15
 Nodes (12): CameraEnumerator, ActiveCameraState, AudioConfigPayload, CameraInfo, ConfigureStream, ControlAck, ControlCmd, ControlHello (+4 more)
 
-### Community 10 - "Foldables Camera Posture Support"
+### Community 12 - "Architecture Review Guidelines"
 Cohesion: 0.10
-Nodes (18): Call-graph collapse, Candidate card, Cross-section (good for layered shallowness), Diagram patterns, Hand-built boxes-and-arrows (when Mermaid's layout fights you), Header, HTML Report Format, Mass diagram (good for "interface as wide as implementation") (+10 more)
+Nodes (11): Grill Me Skill, Relentless Grilling Interview, HTML Report Format Guide, Candidate Card Specification, Self-Contained HTML Architecture Report Scaffold, Improve Codebase Architecture Skill, Module Deepening Opportunities, Candidate Grilling Decision Loop (+3 more)
 
-### Community 11 - "Android UI & Screen Automation"
-Cohesion: 0.10
-Nodes (19): Async Programming & Concurrency, Behavioral Traits, Capabilities, Do not use this skill when, Error Handling & Safety, Example Interactions, Instructions, Knowledge Base (+11 more)
+### Community 13 - "Desktop Native GUI Preview"
+Cohesion: 0.14
+Nodes (9): apply_artcraft_dark_theme(), CamCraftApp, COLOR_ACCENT_BLUE, COLOR_BG_CARBON, COLOR_STATUS_EMERALD, COLOR_SURFACE_CARD, COLOR_TEXT_MUTED, COLOR_TEXT_PRIMARY (+1 more)
 
-### Community 12 - "Monorepo Scaffolding & Execution Plan"
+### Community 14 - "client.rs"
+Cohesion: 0.08
+Nodes (24): print_stats(), ClientConfig, ClientError, Channel, ConnectionClosed, Io, Json, Protocol (+16 more)
+
+### Community 15 - "Subsystem 15"
 Cohesion: 0.09
-Nodes (10): CameraController, apply_artcraft_dark_theme(), CamCraftApp, COLOR_ACCENT_BLUE, COLOR_BG_CARBON, COLOR_STATUS_EMERALD, COLOR_SURFACE_CARD, COLOR_TEXT_MUTED (+2 more)
+Nodes (8): Cli, Command, Connect, Status, ConnectArgs, main(), print_device_banner(), run_connect()
 
-### Community 13 - "CamCraft MVP v0.1 Scope"
+### Community 16 - "Subsystem 16"
+Cohesion: 0.09
+Nodes (23): AdbDevice, AdbDeviceState, Connecting, Device, Offline, Other, Unauthorized, AdbError (+15 more)
+
+### Community 17 - "vcam.rs"
+Cohesion: 0.20
+Nodes (5): find_camcraft_v4l2_device(), generate_standby_frame(), test_auto_detect_device(), test_standby_frame_size(), test_standby_pattern_generation()
+
+### Community 19 - "Subsystem 19"
 Cohesion: 0.15
 Nodes (12): PacketHeader, PacketType, AudioConfig, AudioFrame, ControlAck, ControlCmd, ControlHello, HeartbeatPing (+4 more)
 
-### Community 14 - "Android MVVM Data Flow"
-Cohesion: 0.27
-Nodes (5): Vibecoding Agent Workflow Loop, ADB Port Forwarding, Justfile Task Runner, v4l2loopback Driver, setup-fedora-dev.sh script
-
-### Community 15 - "CamCraft Project Overview"
+### Community 20 - "Subsystem 20"
 Cohesion: 0.29
 Nodes (3): control_hello_json_schema_matches_spec(), multiple_packets_in_single_buffer(), Packet
 
-### Community 16 - "End-to-End Media Pipeline"
+### Community 21 - "Subsystem 21"
+Cohesion: 0.15
+Nodes (9): Rust Patterns Skill, Rust Anti-Pattern Catalog, Cargo Multi-Crate Workspace Architecture, Option Type & Combinator Idioms, Unit, Integration & Property Testing Discipline, Rust Pro (2024 Edition) Skill, Modern Rust 2024 Language Features, Production Error Handling Architecture (+1 more)
+
+### Community 22 - "Subsystem 22"
+Cohesion: 0.27
+Nodes (5): Vibecoding Agent Workflow Loop, ADB Port Forwarding, Justfile Task Runner, v4l2loopback Driver, setup-fedora-dev.sh script
+
+### Community 23 - "Subsystem 23"
 Cohesion: 0.18
 Nodes (11): Media3Effect Pipeline, RAW and JPEG Capture (DngCreator), Structural Blueprinting, AE-Mode Low Light Boost, Low-Light Capture Guide, Night Mode Extension (ExtensionSessionConfig), Google Play Services Low Light Boost (SurfaceProcessor), CameraControl Zoom APIs (+3 more)
 
-### Community 18 - "CamCraft Vibecoding Toolchain"
+### Community 25 - "Subsystem 25"
 Cohesion: 0.26
 Nodes (7): ProtocolError, BufferTooShort, InvalidMagic, Json, PayloadTooLarge, UnknownPacketType, UnsupportedVersion
 
-### Community 20 - "ScaffoldingSmokeTest.kt"
-Cohesion: 0.19
-Nodes (12): crates/camcraft-protocol, Tahap 1: CCFT v1 Protocol Implementation, Tahap 5: Desktop GUI & Two-Way Camera Control, CCFT v1 Binary Header (20 Bytes Big-Endian), CONTROL_ACK (0x12) JSON Schema, CONTROL_CMD (0x11) Tagged Enum JSON, CONTROL_HELLO (0x10) JSON Schema, FrameFlags Bitmask (u16) (+4 more)
+### Community 27 - "Subsystem 27"
+Cohesion: 0.18
+Nodes (9): CoreError, Adb, Client, Decoder, Io, Protocol, Unimplemented, Vcam (+1 more)
 
-### Community 21 - "Camera2Interop.Extender"
+### Community 28 - "Subsystem 28"
+Cohesion: 0.24
+Nodes (10): crates/camcraft-protocol, Tahap 1: CCFT v1 Protocol Implementation, CCFT v1 Binary Header (20 Bytes Big-Endian), CONTROL_ACK (0x12) JSON Schema, CONTROL_CMD (0x11) Tagged Enum JSON, CONTROL_HELLO (0x10) JSON Schema, FrameFlags Bitmask (u16), HEARTBEAT_PING (0xFE) / PONG (0xFF) (+2 more)
+
+### Community 31 - "Subsystem 31"
 Cohesion: 0.25
 Nodes (7): Camera1 to CameraX Migration Guide, CameraXViewfinder, ImageCapture, PreviewView, ProcessCameraProvider, Camera2 to CameraX Migration Guide, ImageAnalysis
 
-### Community 22 - "v4l2loopback Output Sink (vcam)"
-Cohesion: 0.06
-Nodes (30): AudioCaptureEngine (Android encoder/), crates/camcraft-cli, crates/camcraft-core, crates/camcraft-gui (ArtCraft Studio Dark UI), CameraController (Android camera/), Video Decode Worker (ffmpeg-next / VA-API), HardwareVideoEncoder (Android encoder/), PipeWire Virtual Audio Sink (vmic) (+22 more)
-
-### Community 23 - "interface"
+### Community 32 - "Subsystem 32"
 Cohesion: 0.22
-Nodes (8): 1. Ownership and Borrowing, 2. Error Handling, 3. Option Patterns, 4. Unsafe Guidelines, 5. Testing, 6. Crate Organization, 7. Anti-Pattern Catalog, Rust Patterns
+Nodes (8): crates/camcraft-cli, StreamConnectionService (Android network/), Tahap 2: USB ADB Tunnel & Synthetic Ping-Pong, Tahap 6: Wi-Fi & mDNS Service Discovery, FR-02: USB ADB Ultra-Low Latency Connection, FR-03: Wi-Fi LAN & mDNS Discovery, Prompt 2.1: USB ADB Tunnel & Synthetic Streamer, Prompt 6.1: Wi-Fi mDNS Discovery & Keyframe Recovery
 
-### Community 24 - "interface"
-Cohesion: 0.22
-Nodes (8): Further Notes, Implementation Decisions, Out of Scope, Problem Statement, Process, Solution, Testing Decisions, User Stories
-
-### Community 25 - "Foldables Camera Guide"
+### Community 33 - "Subsystem 33"
 Cohesion: 0.25
 Nodes (6): BufferTooShort, CcftProtocolException, InvalidMagic, PayloadTooLarge, UnknownPacketType, UnsupportedVersion
 
-### Community 26 - "ADB Shell Input & Interaction Rules"
+### Community 34 - "Subsystem 34"
 Cohesion: 0.28
 Nodes (6): control_cmd_variants_serialize_and_deserialize(), ControlCmd, ConfigureStream, RequestKeyframe, SetAudioState, SetCameraParams
 
-### Community 27 - "Tahap 0: Monorepo Scaffolding & Graphify Baseline"
+### Community 35 - "Subsystem 35"
 Cohesion: 0.25
 Nodes (5): MeteringPointFactory, ML Kit Spatial Analysis & Coordinate Mapping, MlKitAnalyzer (COORDINATE_SYSTEM_VIEW_REFERENCED), Spatial SDKs (ARCore / OpenXR / OEM Passthrough), XR, AR, and VR Camera Guide
 
-### Community 28 - "gradlew"
+### Community 37 - "Subsystem 37"
 Cohesion: 0.33
 Nodes (3): PendingRecording, Recorder.Builder, CameraX Skill Guide
 
-### Community 31 - "Wear OS Remote Viewfinder Guide"
+### Community 38 - "Subsystem 38"
+Cohesion: 0.33
+Nodes (5): CameraController (Android camera/), HardwareVideoEncoder (Android encoder/), Tahap 3: CameraX + MediaCodec H.264 Pipeline, Non-Functional Performance & Stability Targets, Prompt 3.1: CameraX & MediaCodec H.264 Surface Encoder
+
+### Community 39 - "Subsystem 39"
+Cohesion: 0.29
+Nodes (6): v4l2loopback Output Sink (vcam), Tahap 8: OLED Saver, Auto-Reconnect & v0.1 Polish, FR-04: Linux Virtual Camera (v4l2loopback), FR-07: OLED Battery Saver / Dim Screen, FR-08: Auto-Reconnect & Heartbeat, Prompt 8.1: OLED Battery Saver, Auto-Reconnect & Audit
+
+### Community 41 - "Subsystem 41"
 Cohesion: 0.38
 Nodes (5): canonical_hex_vector_decode_and_encode(), decode(), encode(), partial_tcp_stream_chunking_byte_by_byte(), protocol_header_error_cases()
 
-### Community 33 - "app/build.gradle.kts"
+### Community 42 - "Subsystem 42"
+Cohesion: 0.29
+Nodes (7): crates/camcraft-gui (ArtCraft Studio Dark UI), Video Decode Worker (ffmpeg-next / VA-API), Tahap 4: H.264 Decode & v4l2loopback Injection, Tahap 5: Desktop GUI & Two-Way Camera Control, FR-05: Two-Way Camera Controls, Prompt 4.1: H.264 Decoder & v4l2loopback Sink, Prompt 5.1: Desktop GUI & Two-Way Camera Control
+
+### Community 43 - "Subsystem 43"
 Cohesion: 0.33
 Nodes (4): Camera2Interop.Extender, StreamUseCase Optimization, Camera Thermal & Power Management Strategy, Camera2Interop
 
-### Community 34 - "CameraController.kt"
+### Community 44 - "Subsystem 44"
 Cohesion: 0.33
 Nodes (5): interface, display_name, short_description, policy, allow_implicit_invocation
 
-### Community 35 - "StreamConnectionService.kt"
+### Community 45 - "Subsystem 45"
 Cohesion: 0.33
 Nodes (5): interface, display_name, short_description, policy, allow_implicit_invocation
 
-### Community 36 - "CamCraft MVP v0.1 Vision"
+### Community 46 - "Subsystem 46"
 Cohesion: 0.33
 Nodes (5): interface, display_name, short_description, policy, allow_implicit_invocation
 
-### Community 38 - "CamCraft Project"
+### Community 47 - "Subsystem 47"
+Cohesion: 0.33
+Nodes (5): Run Workflow Dynamic Agent Orchestration Skill, Stateful Conversational Agent Chains, Dynamic Python Workflow Scripting, Agent Orchestration Primitives (phase, agent, parallel, pipeline), Conversation Trajectory Step Inspection
+
+### Community 48 - "Subsystem 48"
 Cohesion: 0.40
 Nodes (5): Foldables Camera Guide, FoldingFeature Postures (FLAT, Tabletop, Book), Rear Display Mode (REAR_DISPLAY_STATE), ViewPort and UseCaseGroup Recalculation, ViewPort.Builder
 
-### Community 40 - "android/build.gradle.kts"
+### Community 51 - "Subsystem 51"
 Cohesion: 0.40
 Nodes (5): StreamConnectionStatus, CONNECTED, ERROR, LISTENING, STOPPED
 
-### Community 42 - "End-to-End Video & Audio Pipeline"
+### Community 52 - "Subsystem 52"
+Cohesion: 0.50
+Nodes (5): AudioCaptureEngine (Android encoder/), PipeWire Virtual Audio Sink (vmic), Tahap 7: Opus Audio Streaming & PipeWire Virtual Mic, FR-06: Audio Mic Forwarding & PipeWire Virtual Mic, Prompt 7.1: Audio Capture & PipeWire Virtual Mic
+
+### Community 53 - "Subsystem 53"
 Cohesion: 0.67
 Nodes (4): ADB Shell Input & Interaction Rules, android screen (Annotated Screenshot & Resolve), XML Journey Test Evaluation, android layout (UI Dump)
 
-### Community 43 - "FR-01: High-Resolution Video Streaming"
+### Community 54 - "Subsystem 54"
 Cohesion: 0.50
 Nodes (3): CamCraft Monorepo Structure, Tahap 0: Monorepo Scaffolding & Graphify Baseline, Prompt 0.1: Monorepo Scaffolding & Graphify Baseline
 
-### Community 46 - "ControlAck"
+### Community 56 - "Subsystem 56"
 Cohesion: 0.83
 Nodes (4): camcraft-cli, camcraft-core, camcraft-gui, camcraft-protocol
 
-### Community 48 - "ControlHello"
+### Community 58 - "Subsystem 58"
 Cohesion: 0.67
 Nodes (3): Circular Watch UI & Rotary Input, Wear OS Remote Viewfinder Guide, Wearable DataClient & MessageClient Sync
 
 ## Knowledge Gaps
-- **103 isolated node(s):** `STOPPED`, `LISTENING`, `CONNECTED`, `ERROR`, `Connect` (+98 more)
-  These have ≤1 connection - possible missing edges or undocumented components. (Counts symbols only; 363 node(s) total have ≤1 connection when file, concept and rationale nodes are included.)
-- **23 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **131 isolated node(s):** `STOPPED`, `LISTENING`, `CONNECTED`, `ERROR`, `Connect` (+126 more)
+  These have ≤1 connection - possible missing edges or undocumented components. (Counts symbols only; 385 node(s) total have ≤1 connection when file, concept and rationale nodes are included.)
+- **33 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `PacketHeader` connect `CamCraft MVP v0.1 Scope` to `camcraft-protocol/src/lib.rs`, `Perfetto Trace Processor Script`, `USB ADB & Wi-Fi Transport`, `CamCraft Project Overview`, `CamCraft Vibecoding Toolchain`?**
-  _High betweenness centrality (0.053) - this node is a cross-community bridge._
-- **What connects `STOPPED`, `LISTENING`, `CONNECTED` to the rest of the system?**
-  _103 weakly-connected nodes found - possible documentation gaps or missing edges._
-- **Should `camcraft-protocol/src/lib.rs` be split into smaller, more focused modules?**
-  _Cohesion score 0.052884615384615384 - nodes in this community are weakly interconnected._
-- **Why does `CcftPacket` connect `Perfetto Trace Analysis & Profiling` to `CameraX Core & Spatial Mapping`?**
-  _High betweenness centrality (0.053) - this node is a cross-community bridge._
-- **Should `Perfetto Trace Analysis & Profiling` be split into smaller, more focused modules?**
-  _Cohesion score 0.06918238993710692 - nodes in this community are weakly interconnected._
-- **Why does `CamCraftStreamService` connect `CameraX Core & Spatial Mapping` to `Perfetto Trace Analysis & Profiling`, `Android MVVM Unidirectional Data Flow`, `Capabilities`, `CamCraft Vibecoding Toolchain`, `CameraX Skill Guide`, `CameraStreamManager`?**
+- **Why does `PacketHeader` connect `Subsystem 19` to `Rust CCFT Serde & Models`, `CCFT Frame Flags Bitmask`, `client.rs`, `Subsystem 20`, `Subsystem 25`?**
   _High betweenness centrality (0.048) - this node is a cross-community bridge._
-- **Should `Rust Media Sink & Decode` be split into smaller, more focused modules?**
-  _Cohesion score 0.06028368794326241 - nodes in this community are weakly interconnected._
+- **What connects `STOPPED`, `LISTENING`, `CONNECTED` to the rest of the system?**
+  _131 weakly-connected nodes found - possible documentation gaps or missing edges._
+- **Should `Android Camera Enumeration` be split into smaller, more focused modules?**
+  _Cohesion score 0.05446853516657853 - nodes in this community are weakly interconnected._
+- **Why does `CcftPacket` connect `Android CCFT Packet Framing` to `Android Camera Enumeration`, `ControlModels.kt`?**
+  _High betweenness centrality (0.045) - this node is a cross-community bridge._
+- **Should `Android CCFT Packet Framing` be split into smaller, more focused modules?**
+  _Cohesion score 0.06041986687147977 - nodes in this community are weakly interconnected._
+- **Why does `CamCraftStreamService` connect `Android Camera Enumeration` to `Android CameraX Stream Manager`, `Android Jetpack Compose UI`, `Subsystem 40`, `ControlModels.kt`, `Subsystem 50`, `Subsystem 29`?**
+  _High betweenness centrality (0.045) - this node is a cross-community bridge._
+- **Should `Rust H.264 Video Decoder` be split into smaller, more focused modules?**
+  _Cohesion score 0.07982583454281568 - nodes in this community are weakly interconnected._

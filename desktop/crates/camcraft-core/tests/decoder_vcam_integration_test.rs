@@ -1,0 +1,229 @@
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use bytes::Bytes;
+use camcraft_core::decoder::{DecodedFrame, DecoderSender, spawn_decoder_worker};
+use camcraft_core::vcam::{VcamError, VirtualCameraSink, generate_standby_frame};
+
+const SPS_PPS_64X64: &[u8] = &[
+    0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xc0, 0x0a, 0xda, 0x10, 0x9b, 0x01, 0x10, 0x00, 0x00, 0x03,
+    0x00, 0x10, 0x00, 0x00, 0x03, 0x03, 0x20, 0xf1, 0x22, 0x6a, 0x00, 0x00, 0x00, 0x01, 0x68, 0xce,
+    0x0f, 0x2c, 0x80,
+];
+const IDR_64X64_RED: &[u8] = &[
+    0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x04, 0xbc, 0x46, 0x28, 0x00, 0x0a, 0x8b, 0xc7, 0x00, 0x01,
+    0x28, 0xd8, 0xe0, 0x00, 0x2f, 0xad, 0x27, 0x27, 0x27, 0x5d, 0x75, 0xd7, 0x5d, 0x75, 0xd7, 0x5d,
+    0x75, 0xd7, 0x80,
+];
+const SPS_PPS_32X32: &[u8] = &[
+    0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xc0, 0x0a, 0xda, 0x25, 0xb0, 0x11, 0x00, 0x00, 0x03, 0x00,
+    0x01, 0x00, 0x00, 0x03, 0x00, 0x32, 0x0f, 0x12, 0x26, 0xa0, 0x00, 0x00, 0x00, 0x01, 0x68, 0xce,
+    0x0f, 0x2c, 0x80,
+];
+const IDR_32X32_BLUE: &[u8] = &[
+    0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x04, 0xbc, 0x46, 0x28, 0x00, 0x0c, 0xc4, 0xc7, 0x00, 0x01,
+    0x7d, 0x68, 0xe0, 0x00, 0x22, 0x43, 0x27, 0x5d, 0x78,
+];
+
+/// Mock virtual camera sink recording frame counts and dimension history.
+struct MockCameraSink {
+    open_called: bool,
+    frame_count: Arc<AtomicUsize>,
+    last_dimensions: Arc<Mutex<(u32, u32)>>,
+    recorded_dimensions: Arc<Mutex<Vec<(u32, u32)>>>,
+    path: PathBuf,
+}
+
+impl MockCameraSink {
+    fn new(
+        frame_count: Arc<AtomicUsize>,
+        last_dimensions: Arc<Mutex<(u32, u32)>>,
+        recorded_dimensions: Arc<Mutex<Vec<(u32, u32)>>>,
+    ) -> Self {
+        Self {
+            open_called: false,
+            frame_count,
+            last_dimensions,
+            recorded_dimensions,
+            path: PathBuf::from("/dev/mock_video0"),
+        }
+    }
+}
+
+impl VirtualCameraSink for MockCameraSink {
+    fn open(&mut self) -> Result<(), VcamError> {
+        self.open_called = true;
+        Ok(())
+    }
+
+    fn write_frame(&mut self, width: u32, height: u32, data: &[u8]) -> Result<(), VcamError> {
+        assert_eq!(data.len(), (width * height * 3 / 2) as usize);
+        self.frame_count.fetch_add(1, Ordering::SeqCst);
+        let mut dims = self.last_dimensions.lock().unwrap();
+        *dims = (width, height);
+        self.recorded_dimensions
+            .lock()
+            .unwrap()
+            .push((width, height));
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<(), VcamError> {
+        self.open_called = false;
+        Ok(())
+    }
+
+    fn is_open(&self) -> bool {
+        self.open_called
+    }
+
+    fn device_path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[test]
+fn test_decoder_worker_lifecycle_with_virtual_camera_sink() {
+    let frame_count = Arc::new(AtomicUsize::new(0));
+    let last_dimensions = Arc::new(Mutex::new((0, 0)));
+    let recorded_dimensions = Arc::new(Mutex::new(Vec::new()));
+
+    let mut mock_sink = MockCameraSink::new(
+        frame_count.clone(),
+        last_dimensions.clone(),
+        recorded_dimensions,
+    );
+
+    // Write standby frame before stream starts (simulating OBS initialization)
+    let standby_res = mock_sink.write_standby_frame(1280, 720);
+    assert!(standby_res.is_ok());
+    assert_eq!(frame_count.load(Ordering::SeqCst), 1);
+    assert_eq!(*last_dimensions.lock().unwrap(), (1280, 720));
+
+    // Spawn decoder worker with mock sink
+    let (decoder_sender, decoder_rx) = DecoderSender::new_bounded();
+    let running = Arc::new(AtomicBool::new(true));
+
+    let handle = spawn_decoder_worker(
+        decoder_rx,
+        Some(Box::new(mock_sink)),
+        None,
+        false,
+        running.clone(),
+    )
+    .expect("Worker thread should spawn successfully");
+
+    // Push dummy config and frames (non-decodable synthetic bytes will be safely discarded by FFmpeg)
+    let config_res =
+        decoder_sender.push_config(0, Bytes::from_static(&[0x00, 0x00, 0x00, 0x01, 0x67]));
+    assert!(config_res.is_ok());
+
+    let frame_res = decoder_sender.push_frame(
+        16_666,
+        true,
+        Bytes::from_static(&[0x00, 0x00, 0x00, 0x01, 0x65]),
+    );
+    assert!(frame_res.is_ok());
+
+    // Give worker time to process
+    std::thread::sleep(Duration::from_millis(50));
+
+    // Clean shutdown
+    decoder_sender.stop();
+    running.store(false, Ordering::Relaxed);
+
+    let join_res = handle.join();
+    assert!(join_res.is_ok());
+}
+
+#[test]
+fn test_standby_pattern_generation() {
+    let frame = generate_standby_frame(1920, 1080);
+    // YUV420P: Y plane (1920*1080) + U plane (960*540) + V plane (960*540)
+    assert_eq!(frame.len(), 1920 * 1080 * 3 / 2);
+
+    // Verify Y background (32) and UV neutral (128)
+    assert_eq!(frame[0], 32);
+    let u_start = 1920 * 1080;
+    assert_eq!(frame[u_start], 128);
+}
+
+#[test]
+fn test_decoder_worker_decodes_real_h264_and_resizes_in_vcam() {
+    let frame_count = Arc::new(AtomicUsize::new(0));
+    let last_dimensions = Arc::new(Mutex::new((0, 0)));
+    let recorded_dimensions = Arc::new(Mutex::new(Vec::new()));
+
+    let mock_sink = MockCameraSink::new(
+        frame_count.clone(),
+        last_dimensions.clone(),
+        recorded_dimensions.clone(),
+    );
+
+    let (decoder_sender, decoder_rx) = DecoderSender::new_bounded();
+    let (frame_tx, frame_rx) = crossbeam_channel::bounded::<DecodedFrame>(4);
+    let running = Arc::new(AtomicBool::new(true));
+
+    let handle = spawn_decoder_worker(
+        decoder_rx,
+        Some(Box::new(mock_sink)),
+        Some(frame_tx),
+        true,
+        running.clone(),
+    )
+    .expect("Worker thread should spawn successfully");
+
+    // 1. Send 64x64 red H.264 stream
+    decoder_sender
+        .push_config(1_000, Bytes::from_static(SPS_PPS_64X64))
+        .unwrap();
+    assert!(
+        decoder_sender
+            .push_frame(1_000, true, Bytes::from_static(IDR_64X64_RED))
+            .unwrap()
+    );
+
+    let frame_1 = frame_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("Should decode 64x64 frame");
+    assert_eq!(frame_1.width, 64);
+    assert_eq!(frame_1.height, 64);
+    assert_eq!(frame_1.yuv420p.len(), 64 * 64 * 3 / 2);
+    let rgba_1 = frame_1.rgba.expect("RGBA output must be populated");
+    assert_eq!(rgba_1.len(), 64 * 64 * 4);
+    assert!(rgba_1[0] > 200 && rgba_1[1] < 30 && rgba_1[2] < 30 && rgba_1[3] == 255);
+
+    // 2. Switch resolution dynamically to 32x32 blue H.264 stream
+    decoder_sender
+        .push_config(2_000, Bytes::from_static(SPS_PPS_32X32))
+        .unwrap();
+    assert!(
+        decoder_sender
+            .push_frame(2_000, true, Bytes::from_static(IDR_32X32_BLUE))
+            .unwrap()
+    );
+
+    let frame_2 = frame_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("Should decode 32x32 frame");
+    assert_eq!(frame_2.width, 32);
+    assert_eq!(frame_2.height, 32);
+    assert_eq!(frame_2.yuv420p.len(), 32 * 32 * 3 / 2);
+    let rgba_2 = frame_2.rgba.expect("RGBA output must be populated");
+    assert_eq!(rgba_2.len(), 32 * 32 * 4);
+    assert!(rgba_2[0] < 30 && rgba_2[1] < 30 && rgba_2[2] > 200 && rgba_2[3] == 255);
+
+    assert_eq!(frame_count.load(Ordering::SeqCst), 2);
+    assert_eq!(*last_dimensions.lock().unwrap(), (32, 32));
+    assert_eq!(
+        *recorded_dimensions.lock().unwrap(),
+        vec![(64, 64), (32, 32)]
+    );
+
+    decoder_sender.stop();
+    running.store(false, Ordering::Relaxed);
+    let join_res = handle.join().expect("Worker thread should join");
+    assert!(join_res.is_ok());
+}
