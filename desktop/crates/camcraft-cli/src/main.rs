@@ -15,6 +15,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use camcraft_core::AudioOutputSink;
 use camcraft_core::adb;
 use camcraft_core::client::{self, ClientConfig, ClientEvent, ClientSender, StreamStats};
 use camcraft_core::decoder::{
@@ -23,6 +24,9 @@ use camcraft_core::decoder::{
 };
 use camcraft_core::discovery::{DiscoveredDevice, DiscoveryEvent, MdnsScanner};
 use camcraft_core::vcam::{V4l2LoopbackSink, VirtualCameraSink, find_camcraft_v4l2_device};
+use camcraft_core::vmic::{
+    AudioWorkerSender, VirtualMicSink, ensure_virtual_mic, spawn_audio_worker,
+};
 use camcraft_protocol::{ControlCmd, ControlHello};
 
 #[derive(Debug, Parser)]
@@ -79,6 +83,14 @@ struct ConnectArgs {
     #[arg(long)]
     no_vcam: bool,
 
+    /// Disable virtual microphone output to PipeWire.
+    #[arg(long)]
+    no_vmic: bool,
+
+    /// Start audio forwarding muted.
+    #[arg(long)]
+    mute_mic: bool,
+
     /// Target TCP port.
     #[arg(long, default_value_t = camcraft_protocol::DEFAULT_PORT)]
     port: u16,
@@ -110,7 +122,7 @@ async fn main() -> Result<()> {
             info!(
                 protocol_version = camcraft_protocol::PROTOCOL_VERSION,
                 default_port = camcraft_protocol::DEFAULT_PORT,
-                "CamCraft CLI receiver ready (Stage 6: Wi-Fi mDNS Discovery & Resilience)"
+                "CamCraft CLI receiver ready (Stage 7: Audio Streaming & PipeWire Virtual Mic)"
             );
         }
     }
@@ -212,6 +224,46 @@ async fn run_connect(args: ConnectArgs) -> Result<()> {
     )
     .context("Failed to spawn video decoder worker thread")?;
 
+    // Initialize PipeWire virtual microphone sink and worker (unless disabled)
+    let audio_sink: Option<Box<dyn AudioOutputSink>> = if args.no_vmic {
+        info!("Virtual microphone output disabled via --no-vmic");
+        None
+    } else {
+        match ensure_virtual_mic() {
+            Ok(info) => {
+                info!(
+                    sink = %info.sink_name,
+                    source = %info.source_name,
+                    description = %info.description,
+                    "Initialized PipeWire virtual microphone sink"
+                );
+                Some(Box::new(VirtualMicSink::from_info(&info)))
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "PipeWire virtual microphone unavailable; continuing without virtual mic output"
+                );
+                None
+            }
+        }
+    };
+
+    let audio_running = Arc::new(AtomicBool::new(true));
+    let audio_enabled = Arc::new(AtomicBool::new(!args.no_vmic));
+    let audio_muted = Arc::new(AtomicBool::new(args.mute_mic));
+    let (audio_sender, audio_rx) =
+        AudioWorkerSender::new_bounded(audio_enabled.clone(), audio_muted.clone());
+    let audio_handle = spawn_audio_worker(
+        audio_rx,
+        audio_sink,
+        None,
+        audio_running.clone(),
+        audio_enabled,
+        audio_muted,
+    )
+    .context("Failed to spawn audio worker thread")?;
+
     let config = ClientConfig::new(&endpoint);
     let (event_tx, mut event_rx) = mpsc::channel::<ClientEvent>(64);
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -255,9 +307,28 @@ async fn run_connect(args: ConnectArgs) -> Result<()> {
                 };
                 match event {
                     ClientEvent::Connected(sender) => {
+                        if args.mute_mic {
+                            let s = sender.clone();
+                            let enabled = !args.no_vmic;
+                            tokio::spawn(async move {
+                                if let Err(e) = s
+                                    .send_cmd(ControlCmd::SetAudioState {
+                                        enabled,
+                                        muted: true,
+                                    })
+                                    .await
+                                {
+                                    warn!(error = %e, "Failed to send initial mute state command");
+                                }
+                            });
+                        }
                         active_sender = Some(sender);
                     }
                     ClientEvent::Hello(hello) => {
+                        if !args.no_vmic {
+                            let muted = args.mute_mic || hello.active_state.audio_muted;
+                            audio_sender.set_state(hello.active_state.audio_enabled, muted);
+                        }
                         print_device_banner(&hello);
                     }
                     ClientEvent::Stats(stats) => {
@@ -303,8 +374,24 @@ async fn run_connect(args: ConnectArgs) -> Result<()> {
                             }
                         }
                     }
-                    ClientEvent::AudioConfig { .. } | ClientEvent::AudioFrame { .. } => {}
+                    ClientEvent::AudioConfig { config, .. } => {
+                        if let Err(e) = audio_sender.push_config(config) {
+                            warn!(error = %e, "Failed to push AUDIO_CONFIG to audio worker");
+                        }
+                    }
+                    ClientEvent::AudioFrame {
+                        header, payload, ..
+                    } => {
+                        if let Err(e) = audio_sender.push_frame(header.pts_us, payload) {
+                            warn!(error = %e, "Failed to push AUDIO_FRAME to audio worker");
+                        }
+                    }
                     ClientEvent::ControlAck(ack) => {
+                        if let Some(ref st) = ack.active_state
+                            && !args.no_vmic
+                        {
+                            audio_sender.set_state(st.audio_enabled, st.audio_muted);
+                        }
                         if ack.ok {
                             info!("Camera control acknowledged by device");
                         } else {
@@ -330,11 +417,16 @@ async fn run_connect(args: ConnectArgs) -> Result<()> {
     shutdown.store(true, Ordering::Relaxed);
     let _ = client_handle.await;
 
-    // Gracefully terminate decoder worker thread
+    // Gracefully terminate decoder and audio worker threads
     decoder_sender.stop();
     decoder_running.store(false, Ordering::Relaxed);
     if let Err(e) = decoder_handle.join() {
         warn!("Decoder worker thread join error: {:?}", e);
+    }
+    audio_running.store(false, Ordering::Relaxed);
+    audio_sender.stop();
+    if let Err(e) = audio_handle.join() {
+        warn!("Audio worker thread join error: {:?}", e);
     }
     if let Some(handle) = kf_bridge {
         let _ = handle.join();

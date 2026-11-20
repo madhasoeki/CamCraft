@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use camcraft_core::client::StreamStats;
 use camcraft_core::discovery::{DiscoveredDevice, DiscoveryEvent};
+use camcraft_core::vmic::{AudioLevelMetrics, DEFAULT_SOURCE_DESCRIPTION};
 use camcraft_protocol::{ActiveCameraState, CameraInfo, ControlCmd, ControlHello, DEFAULT_PORT};
 use eframe::egui;
 use session::{ConnectionMode, GuiCommand, GuiSession, GuiUpdate};
@@ -93,6 +94,16 @@ struct CamCraftApp {
     mirror_horizontal: bool,
     rotation_deg: i32,
 
+    // Audio forwarding & virtual microphone state
+    audio_enabled: bool,
+    audio_muted: bool,
+    vmic_active: bool,
+    vmic_name: String,
+    vmic_error: Option<String>,
+    audio_level: AudioLevelMetrics,
+    smoothed_level_norm: f32,
+    peak_hold_norm: f32,
+
     // 50ms debounce tracking for live image adjustments
     params_dirty: bool,
     last_params_edit: Instant,
@@ -131,6 +142,14 @@ impl CamCraftApp {
             torch_on: false,
             mirror_horizontal: false,
             rotation_deg: 0,
+            audio_enabled: true,
+            audio_muted: false,
+            vmic_active: false,
+            vmic_name: DEFAULT_SOURCE_DESCRIPTION.to_owned(),
+            vmic_error: None,
+            audio_level: AudioLevelMetrics::silence(false),
+            smoothed_level_norm: 0.0,
+            peak_hold_norm: 0.0,
             params_dirty: false,
             last_params_edit: Instant::now(),
             preview_texture: None,
@@ -156,12 +175,15 @@ impl CamCraftApp {
                     self.apply_hello(hello);
                 }
                 GuiUpdate::ControlAck(ack) => {
-                    if ack.ok {
-                        if let Some(state) = ack.active_state
-                            && !self.params_dirty
-                        {
+                    if let Some(state) = ack.active_state {
+                        if ack.ok && !self.params_dirty {
                             self.sync_from_active_state(&state);
+                        } else if !ack.ok {
+                            self.audio_enabled = state.audio_enabled;
+                            self.audio_muted = state.audio_muted;
                         }
+                    }
+                    if ack.ok {
                         self.status_message = None;
                     } else if let Some(err) = ack.error {
                         self.status_message = Some(format!("Control error: {err}"));
@@ -190,9 +212,28 @@ impl CamCraftApp {
                         self.status_message = Some(format!("Virtual camera inactive: {err}"));
                     }
                 }
+                GuiUpdate::VmicStatus {
+                    source_name,
+                    description,
+                    active,
+                    error,
+                } => {
+                    if !description.is_empty() && !source_name.is_empty() {
+                        self.vmic_name = format!("{description} ({source_name})");
+                    } else if !description.is_empty() {
+                        self.vmic_name = description;
+                    }
+                    self.vmic_active = active;
+                    self.vmic_error = error;
+                }
                 GuiUpdate::Disconnected(reason) => {
                     self.status = ConnectionStatus::Disconnected;
                     self.vcam_active = false;
+                    self.vmic_active = false;
+                    self.vmic_error = None;
+                    self.audio_level = AudioLevelMetrics::silence(false);
+                    self.smoothed_level_norm = 0.0;
+                    self.peak_hold_norm = 0.0;
                     self.stats = StreamStats::default();
                     self.decode_time_ms = 0.0;
                     self.status_message = Some(reason);
@@ -201,6 +242,11 @@ impl CamCraftApp {
                     if matches!(self.status, ConnectionStatus::Connecting(_)) {
                         self.status = ConnectionStatus::Disconnected;
                         self.vcam_active = false;
+                        self.vmic_active = false;
+                        self.vmic_error = None;
+                        self.audio_level = AudioLevelMetrics::silence(false);
+                        self.smoothed_level_norm = 0.0;
+                        self.peak_hold_norm = 0.0;
                     }
                     self.status_message = Some(err);
                 }
@@ -231,6 +277,35 @@ impl CamCraftApp {
                 }
             }
         }
+
+        let dt = ctx.input(|i| i.stable_dt).clamp(0.001, 0.1);
+        if let Some(level) = self.session.take_latest_audio_level() {
+            self.audio_level = level;
+            let target = if self.audio_enabled && !self.audio_muted {
+                level.normalized
+            } else {
+                0.0
+            };
+            if target >= self.smoothed_level_norm {
+                self.smoothed_level_norm = target;
+            } else {
+                let decay = (dt * 6.0).min(1.0);
+                self.smoothed_level_norm = (self.smoothed_level_norm - decay * 0.5).max(target);
+            }
+            if target >= self.peak_hold_norm {
+                self.peak_hold_norm = target;
+            } else {
+                self.peak_hold_norm =
+                    (self.peak_hold_norm - dt * 0.35).max(self.smoothed_level_norm);
+            }
+        } else if !self.is_connected() || !self.audio_enabled || self.audio_muted {
+            self.audio_level = AudioLevelMetrics::silence(self.audio_muted);
+            self.smoothed_level_norm = 0.0;
+            self.peak_hold_norm = 0.0;
+        } else {
+            self.smoothed_level_norm = (self.smoothed_level_norm - dt * 1.5).max(0.0);
+            self.peak_hold_norm = (self.peak_hold_norm - dt * 0.4).max(self.smoothed_level_norm);
+        }
     }
 
     fn apply_hello(&mut self, hello: ControlHello) {
@@ -251,6 +326,8 @@ impl CamCraftApp {
         self.torch_on = state.torch_on;
         self.mirror_horizontal = state.mirror_horizontal;
         self.rotation_deg = state.rotation_deg;
+        self.audio_enabled = state.audio_enabled;
+        self.audio_muted = state.audio_muted;
     }
 
     fn active_camera_info(&self) -> Option<&CameraInfo> {
@@ -379,6 +456,19 @@ impl CamCraftApp {
                     COLOR_TEXT_MUTED
                 };
                 ui.label(egui::RichText::new(vcam_label).color(vcam_color).strong());
+
+                separator_dot(ui);
+
+                let (mic_label, mic_color) = if !self.is_connected() || !self.vmic_active {
+                    ("Mic Standby", COLOR_TEXT_MUTED)
+                } else if !self.audio_enabled {
+                    ("Mic OFF", COLOR_TEXT_MUTED)
+                } else if self.audio_muted {
+                    ("Mic Muted", COLOR_STATUS_ROSE)
+                } else {
+                    ("Mic Active", COLOR_STATUS_EMERALD)
+                };
+                ui.label(egui::RichText::new(mic_label).color(mic_color).strong());
             });
 
             if let Some(ref msg) = self.status_message {
@@ -851,6 +941,214 @@ impl CamCraftApp {
             });
         });
     }
+
+    fn render_audio_card(&mut self, ui: &mut egui::Ui) {
+        let connected = self.is_connected();
+
+        card_frame().show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                section_title(ui, "Audio & Virtual Microphone");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let (badge_text, badge_color) = if connected && self.vmic_active {
+                        ("Active", COLOR_STATUS_EMERALD)
+                    } else {
+                        ("Standby", COLOR_TEXT_MUTED)
+                    };
+                    ui.label(
+                        egui::RichText::new(badge_text)
+                            .color(badge_color)
+                            .small()
+                            .strong(),
+                    );
+                });
+            });
+
+            ui.label(
+                egui::RichText::new(format!("PipeWire Source: {}", self.vmic_name))
+                    .color(COLOR_TEXT_MUTED)
+                    .small(),
+            );
+            if let Some(ref err) = self.vmic_error {
+                ui.label(
+                    egui::RichText::new(format!("Virtual mic unavailable: {err}"))
+                        .color(COLOR_STATUS_AMBER)
+                        .small(),
+                );
+            }
+            ui.add_space(8.0);
+
+            ui.add_enabled_ui(connected, |ui| {
+                if ui
+                    .checkbox(&mut self.audio_enabled, "Enable Audio Forwarding")
+                    .changed()
+                {
+                    self.session.send(GuiCommand::SetAudioState {
+                        enabled: self.audio_enabled,
+                        muted: self.audio_muted,
+                    });
+                }
+
+                ui.add_space(6.0);
+
+                let can_mute = connected && self.audio_enabled;
+                let mute_text = if self.audio_muted {
+                    "Mic Muted (Click to Unmute)"
+                } else {
+                    "Mute Mic"
+                };
+                let mute_fill = if self.audio_muted {
+                    COLOR_STATUS_ROSE
+                } else {
+                    COLOR_SURFACE_ELEVATED
+                };
+                let mute_btn =
+                    egui::Button::new(egui::RichText::new(mute_text).color(COLOR_TEXT_PRIMARY))
+                        .fill(mute_fill);
+                if ui
+                    .add_enabled_ui(can_mute, |ui| {
+                        ui.add_sized([ui.available_width(), 28.0], mute_btn)
+                    })
+                    .inner
+                    .clicked()
+                {
+                    self.audio_muted = !self.audio_muted;
+                    self.session.send(GuiCommand::SetAudioState {
+                        enabled: self.audio_enabled,
+                        muted: self.audio_muted,
+                    });
+                }
+            });
+
+            ui.add_space(10.0);
+
+            // Volume Level Meter (dB bar)
+            let level = if connected && self.audio_enabled && !self.audio_muted {
+                self.smoothed_level_norm.clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let peak = if connected && self.audio_enabled && !self.audio_muted {
+                self.peak_hold_norm.clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+
+            let (db_text, db_color) = if !connected || !self.audio_enabled {
+                ("OFF".to_owned(), COLOR_TEXT_MUTED)
+            } else if self.audio_muted {
+                ("MUTED".to_owned(), COLOR_STATUS_ROSE)
+            } else if self.audio_level.clipping {
+                (
+                    format!("{:.1} dB", self.audio_level.rms_db),
+                    COLOR_STATUS_ROSE,
+                )
+            } else {
+                (
+                    format!("{:.1} dB", self.audio_level.rms_db),
+                    COLOR_TEXT_PRIMARY,
+                )
+            };
+
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Volume Level")
+                        .color(COLOR_TEXT_MUTED)
+                        .small(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(db_text)
+                            .color(db_color)
+                            .monospace()
+                            .small(),
+                    );
+                });
+            });
+
+            let meter_width = ui.available_width().max(60.0);
+            let (meter_rect, _) =
+                ui.allocate_exact_size(egui::vec2(meter_width, 14.0), egui::Sense::hover());
+            let painter = ui.painter();
+            painter.rect_filled(meter_rect, egui::CornerRadius::same(4), COLOR_BG_CARBON);
+
+            let zones = [
+                (0.0_f32, 0.70_f32, COLOR_STATUS_EMERALD),
+                (0.70_f32, 0.90_f32, COLOR_STATUS_AMBER),
+                (0.90_f32, 1.0_f32, COLOR_STATUS_ROSE),
+            ];
+            for (z_start, z_end, color) in zones {
+                if level > z_start {
+                    let seg_end = level.min(z_end);
+                    let x0 = meter_rect.min.x + meter_rect.width() * z_start;
+                    let x1 = meter_rect.min.x + meter_rect.width() * seg_end;
+                    let seg_rect = egui::Rect::from_min_max(
+                        egui::pos2(x0, meter_rect.min.y),
+                        egui::pos2(x1, meter_rect.max.y),
+                    );
+                    let radius = if z_start == 0.0 && seg_end >= 0.99 {
+                        egui::CornerRadius::same(4)
+                    } else if z_start == 0.0 {
+                        egui::CornerRadius {
+                            nw: 4,
+                            sw: 4,
+                            ne: 0,
+                            se: 0,
+                        }
+                    } else if seg_end >= 0.99 {
+                        egui::CornerRadius {
+                            nw: 0,
+                            sw: 0,
+                            ne: 4,
+                            se: 4,
+                        }
+                    } else {
+                        egui::CornerRadius::ZERO
+                    };
+                    painter.rect_filled(seg_rect, radius, color);
+                }
+            }
+
+            if peak > 0.01 {
+                let peak_x =
+                    (meter_rect.min.x + meter_rect.width() * peak).min(meter_rect.max.x - 1.0);
+                let peak_color = if peak >= 0.90 {
+                    COLOR_STATUS_ROSE
+                } else if peak >= 0.70 {
+                    COLOR_STATUS_AMBER
+                } else {
+                    COLOR_TEXT_PRIMARY
+                };
+                painter.line_segment(
+                    [
+                        egui::pos2(peak_x, meter_rect.min.y + 1.0),
+                        egui::pos2(peak_x, meter_rect.max.y - 1.0),
+                    ],
+                    egui::Stroke::new(2.0, peak_color),
+                );
+            }
+
+            let (scale_rect, _) =
+                ui.allocate_exact_size(egui::vec2(meter_width, 13.0), egui::Sense::hover());
+            let font = egui::FontId::monospace(9.5);
+            for (frac, align, label) in [
+                (0.0_f32, egui::Align2::LEFT_TOP, "-60"),
+                (0.40_f32, egui::Align2::CENTER_TOP, "-36"),
+                (0.70_f32, egui::Align2::CENTER_TOP, "-18"),
+                (0.90_f32, egui::Align2::CENTER_TOP, "-6"),
+                (1.0_f32, egui::Align2::RIGHT_TOP, "0 dB"),
+            ] {
+                let x = scale_rect.min.x + scale_rect.width() * frac;
+                ui.painter().text(
+                    egui::pos2(x, scale_rect.min.y + 1.0),
+                    align,
+                    label,
+                    font.clone(),
+                    COLOR_TEXT_MUTED,
+                );
+            }
+        });
+    }
 }
 
 impl eframe::App for CamCraftApp {
@@ -883,6 +1181,8 @@ impl eframe::App for CamCraftApp {
                         self.render_stream_preset_card(ui);
                         ui.add_space(10.0);
                         self.render_live_adjustments_card(ui);
+                        ui.add_space(10.0);
+                        self.render_audio_card(ui);
                     });
             });
 

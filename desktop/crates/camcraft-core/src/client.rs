@@ -11,7 +11,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
 use camcraft_protocol::{
-    ControlAck, ControlCmd, ControlHello, Packet, PacketHeader, PacketType, ProtocolError,
+    AudioConfigPayload, ControlAck, ControlCmd, ControlHello, Packet, PacketHeader, PacketType,
+    ProtocolError,
 };
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -94,15 +95,17 @@ pub enum ClientEvent {
         payload_len: usize,
         payload: Bytes,
     },
-    /// Audio stream configuration.
+    /// Audio stream configuration (`0x03`).
     AudioConfig {
         header: PacketHeader,
         payload_len: usize,
+        config: AudioConfigPayload,
     },
-    /// Audio sample packet.
+    /// Audio sample packet (`0x04`).
     AudioFrame {
         header: PacketHeader,
         payload_len: usize,
+        payload: Bytes,
     },
     /// Control command acknowledgment.
     ControlAck(ControlAck),
@@ -371,22 +374,30 @@ pub async fn run_client_loop(
                             .await;
                     }
                     PacketType::AudioConfig => {
+                        let config: AudioConfigPayload = packet.decode_json()?;
                         info!(
                             payload_len = packet.payload.len(),
+                            codec = %config.codec,
+                            sample_rate = config.sample_rate,
+                            channels = config.channels,
                             "Received AUDIO_CONFIG"
                         );
                         let _ = event_tx
                             .send(ClientEvent::AudioConfig {
                                 header: packet.header,
                                 payload_len: packet.payload.len(),
+                                config,
                             })
                             .await;
                     }
                     PacketType::AudioFrame => {
+                        let payload_len = packet.payload.len();
+                        interval_bytes += payload_len as u64;
                         let _ = event_tx
                             .send(ClientEvent::AudioFrame {
                                 header: packet.header,
-                                payload_len: packet.payload.len(),
+                                payload_len,
+                                payload: packet.payload,
                             })
                             .await;
                     }

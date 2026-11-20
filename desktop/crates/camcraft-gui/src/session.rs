@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
+use camcraft_core::AudioOutputSink;
 use camcraft_core::adb;
 use camcraft_core::client::{
     self, ClientConfig, ClientError, ClientEvent, ClientSender, StreamStats,
@@ -17,6 +18,10 @@ use camcraft_core::decoder::{
 };
 use camcraft_core::discovery::{DiscoveryEvent, MdnsScanner};
 use camcraft_core::vcam::{V4l2LoopbackSink, VirtualCameraSink, find_camcraft_v4l2_device};
+use camcraft_core::vmic::{
+    AudioLevelMetrics, AudioWorkerSender, DEFAULT_SOURCE_DESCRIPTION, VirtualMicSink,
+    ensure_virtual_mic, run_audio_worker_loop,
+};
 use camcraft_protocol::{ControlAck, ControlCmd, ControlHello, DEFAULT_PORT};
 use crossbeam_channel::{Receiver, Sender};
 use eframe::egui;
@@ -54,6 +59,10 @@ pub enum GuiCommand {
     RefreshWifiDiscovery,
     Disconnect,
     SendControlCmd(ControlCmd),
+    SetAudioState {
+        enabled: bool,
+        muted: bool,
+    },
 }
 
 /// Status updates sent from the background session worker to the UI thread.
@@ -73,6 +82,12 @@ pub enum GuiUpdate {
         active: bool,
         error: Option<String>,
     },
+    VmicStatus {
+        source_name: String,
+        description: String,
+        active: bool,
+        error: Option<String>,
+    },
     Disconnected(String),
     Error(String),
 }
@@ -82,6 +97,7 @@ pub struct GuiSession {
     cmd_tx: mpsc::UnboundedSender<GuiCommand>,
     update_rx: Receiver<GuiUpdate>,
     frame_rx: Receiver<DecodedFrame>,
+    audio_level_rx: Receiver<AudioLevelMetrics>,
     _runtime_thread: Option<JoinHandle<()>>,
 }
 
@@ -92,6 +108,7 @@ impl GuiSession {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<GuiCommand>();
         let (update_tx, update_rx) = crossbeam_channel::unbounded::<GuiUpdate>();
         let (frame_tx, frame_rx) = crossbeam_channel::bounded::<DecodedFrame>(2);
+        let (audio_level_tx, audio_level_rx) = crossbeam_channel::bounded::<AudioLevelMetrics>(4);
 
         let runtime_thread = std::thread::Builder::new()
             .name("camcraft-gui-rt".to_owned())
@@ -111,7 +128,13 @@ impl GuiSession {
                     }
                 };
 
-                rt.block_on(run_session_supervisor(cmd_rx, update_tx, frame_tx, ctx));
+                rt.block_on(run_session_supervisor(
+                    cmd_rx,
+                    update_tx,
+                    frame_tx,
+                    audio_level_tx,
+                    ctx,
+                ));
             })
             .ok();
 
@@ -119,6 +142,7 @@ impl GuiSession {
             cmd_tx,
             update_rx,
             frame_rx,
+            audio_level_rx,
             _runtime_thread: runtime_thread,
         }
     }
@@ -148,6 +172,16 @@ impl GuiSession {
         }
         latest
     }
+
+    /// Drains the audio level channel and returns only the newest volume reading.
+    #[must_use]
+    pub fn take_latest_audio_level(&self) -> Option<AudioLevelMetrics> {
+        let mut latest = None;
+        while let Ok(level) = self.audio_level_rx.try_recv() {
+            latest = Some(level);
+        }
+        latest
+    }
 }
 
 impl Drop for GuiSession {
@@ -161,6 +195,9 @@ struct ActiveConnection {
     decoder_running: Arc<AtomicBool>,
     decoder_tx: DecoderSender,
     decoder_thread: Option<JoinHandle<Result<(), camcraft_core::decoder::DecoderError>>>,
+    audio_running: Arc<AtomicBool>,
+    audio_tx: AudioWorkerSender,
+    audio_thread: Option<JoinHandle<()>>,
     kf_bridge_thread: Option<JoinHandle<()>>,
     client_task: tokio::task::JoinHandle<()>,
     sender: Option<ClientSender>,
@@ -170,10 +207,15 @@ struct ActiveConnection {
 impl ActiveConnection {
     fn stop(mut self) {
         self.decoder_running.store(false, Ordering::Relaxed);
+        self.audio_running.store(false, Ordering::Relaxed);
         self.shutdown.store(true, Ordering::Relaxed);
         self.decoder_tx.stop();
+        self.audio_tx.stop();
         self.client_task.abort();
         if let Some(handle) = self.decoder_thread.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.audio_thread.take() {
             let _ = handle.join();
         }
         if let Some(handle) = self.kf_bridge_thread.take() {
@@ -186,6 +228,7 @@ async fn run_session_supervisor(
     mut cmd_rx: mpsc::UnboundedReceiver<GuiCommand>,
     update_tx: Sender<GuiUpdate>,
     frame_tx: Sender<DecodedFrame>,
+    audio_level_tx: Sender<AudioLevelMetrics>,
     ctx: egui::Context,
 ) {
     let mut active: Option<ActiveConnection> = None;
@@ -235,6 +278,14 @@ async fn run_session_supervisor(
                             adb::setup_adb_forward(None, port, port)
                         }).await;
 
+                        let channels = SessionChannels {
+                            update_tx: &update_tx,
+                            frame_tx: &frame_tx,
+                            audio_level_tx: &audio_level_tx,
+                            internal_tx: &internal_tx,
+                            ctx: &ctx,
+                        };
+
                         match fwd_res {
                             Ok(Ok(device)) => {
                                 info!(serial = %device.serial, model = ?device.model, "ADB forward established");
@@ -242,10 +293,7 @@ async fn run_session_supervisor(
                                     ConnectionMode::Usb,
                                     endpoint,
                                     vcam_device,
-                                    &update_tx,
-                                    &frame_tx,
-                                    &internal_tx,
-                                    &ctx,
+                                    &channels,
                                 );
                             }
                             Ok(Err(e)) => {
@@ -265,14 +313,18 @@ async fn run_session_supervisor(
                             mode: ConnectionMode::Wifi,
                             endpoint: normalized.clone(),
                         });
+                        let channels = SessionChannels {
+                            update_tx: &update_tx,
+                            frame_tx: &frame_tx,
+                            audio_level_tx: &audio_level_tx,
+                            internal_tx: &internal_tx,
+                            ctx: &ctx,
+                        };
                         active = start_connection(
                             ConnectionMode::Wifi,
                             normalized,
                             vcam_device,
-                            &update_tx,
-                            &frame_tx,
-                            &internal_tx,
-                            &ctx,
+                            &channels,
                         );
                     }
                     GuiCommand::RefreshWifiDiscovery => {
@@ -287,6 +339,12 @@ async fn run_session_supervisor(
                         }
                         emit(&update_tx, &ctx, GuiUpdate::VcamStatus {
                             path: String::new(),
+                            active: false,
+                            error: None,
+                        });
+                        emit(&update_tx, &ctx, GuiUpdate::VmicStatus {
+                            source_name: String::new(),
+                            description: DEFAULT_SOURCE_DESCRIPTION.to_owned(),
                             active: false,
                             error: None,
                         });
@@ -305,6 +363,30 @@ async fn run_session_supervisor(
                                     )));
                                 }
                             });
+                        }
+                    }
+                    GuiCommand::SetAudioState { enabled, muted } => {
+                        if let Some(ref conn) = active {
+                            conn.audio_tx.set_state(enabled, muted);
+                            if let Some(ref sender) = conn.sender {
+                                let sender = sender.clone();
+                                let update_tx_clone = update_tx.clone();
+                                let ctx_clone = ctx.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = sender
+                                        .send_cmd(ControlCmd::SetAudioState { enabled, muted })
+                                        .await
+                                    {
+                                        emit(
+                                            &update_tx_clone,
+                                            &ctx_clone,
+                                            GuiUpdate::Error(format!(
+                                                "Failed to send audio state command: {e}"
+                                            )),
+                                        );
+                                    }
+                                });
+                            }
                         }
                     }
                 }
@@ -363,15 +445,25 @@ enum InternalEvent {
     SessionEnded,
 }
 
+struct SessionChannels<'a> {
+    update_tx: &'a Sender<GuiUpdate>,
+    frame_tx: &'a Sender<DecodedFrame>,
+    audio_level_tx: &'a Sender<AudioLevelMetrics>,
+    internal_tx: &'a mpsc::Sender<InternalEvent>,
+    ctx: &'a egui::Context,
+}
+
 fn start_connection(
     mode: ConnectionMode,
     endpoint: String,
     vcam_device: String,
-    update_tx: &Sender<GuiUpdate>,
-    frame_tx: &Sender<DecodedFrame>,
-    internal_tx: &mpsc::Sender<InternalEvent>,
-    ctx: &egui::Context,
+    channels: &SessionChannels<'_>,
 ) -> Option<ActiveConnection> {
+    let update_tx = channels.update_tx;
+    let frame_tx = channels.frame_tx;
+    let audio_level_tx = channels.audio_level_tx;
+    let internal_tx = channels.internal_tx;
+    let ctx = channels.ctx;
     let shutdown = Arc::new(AtomicBool::new(false));
     let decoder_running = Arc::new(AtomicBool::new(true));
     let (decoder_tx, decoder_rx) = DecoderSender::new_bounded();
@@ -449,10 +541,70 @@ fn start_connection(
         }
     };
 
+    let audio_running = Arc::new(AtomicBool::new(true));
+    let audio_enabled = Arc::new(AtomicBool::new(true));
+    let audio_muted = Arc::new(AtomicBool::new(false));
+    let (audio_tx, audio_rx) =
+        AudioWorkerSender::new_bounded(audio_enabled.clone(), audio_muted.clone());
+
+    let audio_running_c = audio_running.clone();
+    let audio_level_tx_c = audio_level_tx.clone();
+    let update_tx_vmic = update_tx.clone();
+    let ctx_vmic = ctx.clone();
+    let audio_thread = match std::thread::Builder::new()
+        .name("camcraft-vmic".to_owned())
+        .spawn(move || {
+            let sink: Option<Box<dyn AudioOutputSink>> = match ensure_virtual_mic() {
+                Ok(info) => {
+                    emit(
+                        &update_tx_vmic,
+                        &ctx_vmic,
+                        GuiUpdate::VmicStatus {
+                            source_name: info.source_name.clone(),
+                            description: info.description.clone(),
+                            active: true,
+                            error: None,
+                        },
+                    );
+                    Some(Box::new(VirtualMicSink::from_info(&info)))
+                }
+                Err(e) => {
+                    warn!(error = %e, "PipeWire virtual microphone unavailable; running in meter-only audio mode");
+                    emit(
+                        &update_tx_vmic,
+                        &ctx_vmic,
+                        GuiUpdate::VmicStatus {
+                            source_name: String::new(),
+                            description: DEFAULT_SOURCE_DESCRIPTION.to_owned(),
+                            active: false,
+                            error: Some(e.to_string()),
+                        },
+                    );
+                    None
+                }
+            };
+
+            run_audio_worker_loop(
+                audio_rx,
+                sink,
+                Some(audio_level_tx_c),
+                audio_running_c,
+                audio_enabled,
+                audio_muted,
+            );
+        }) {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            warn!(error = %e, "Failed to spawn camcraft-vmic audio worker thread");
+            None
+        }
+    };
+
     let update_tx_c = update_tx.clone();
     let ctx_c = ctx.clone();
     let shutdown_c = shutdown.clone();
     let decoder_tx_c = decoder_tx.clone();
+    let audio_tx_c = audio_tx.clone();
     let internal_tx_c = internal_tx.clone();
 
     let client_task = tokio::spawn(async move {
@@ -473,9 +625,16 @@ fn start_connection(
                     emit(&update_tx_c, &ctx_c, GuiUpdate::Connected(mode));
                 }
                 ClientEvent::Hello(hello) => {
+                    audio_tx_c.set_state(
+                        hello.active_state.audio_enabled,
+                        hello.active_state.audio_muted,
+                    );
                     emit(&update_tx_c, &ctx_c, GuiUpdate::Hello(hello));
                 }
                 ClientEvent::ControlAck(ack) => {
+                    if let Some(ref st) = ack.active_state {
+                        audio_tx_c.set_state(st.audio_enabled, st.audio_muted);
+                    }
                     emit(&update_tx_c, &ctx_c, GuiUpdate::ControlAck(ack));
                 }
                 ClientEvent::Stats(stats) => {
@@ -507,7 +666,18 @@ fn start_connection(
                         }
                     }
                 }
-                ClientEvent::AudioConfig { .. } | ClientEvent::AudioFrame { .. } => {}
+                ClientEvent::AudioConfig { config, .. } => {
+                    if let Err(e) = audio_tx_c.push_config(config) {
+                        warn!(error = %e, "Failed to queue AUDIO_CONFIG");
+                    }
+                }
+                ClientEvent::AudioFrame {
+                    header, payload, ..
+                } => {
+                    if let Err(e) = audio_tx_c.push_frame(header.pts_us, payload) {
+                        warn!(error = %e, "Failed to queue AUDIO_FRAME");
+                    }
+                }
                 ClientEvent::Disconnected(reason) => {
                     disconnected_emitted = true;
                     emit(
@@ -551,6 +721,9 @@ fn start_connection(
         decoder_running,
         decoder_tx,
         decoder_thread,
+        audio_running,
+        audio_tx,
+        audio_thread,
         kf_bridge_thread,
         client_task,
         sender: None,

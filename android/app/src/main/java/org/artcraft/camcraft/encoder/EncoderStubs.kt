@@ -6,6 +6,6 @@ package org.artcraft.camcraft.encoder
 typealias HardwareVideoEncoder = H264SurfaceEncoder
 
 /**
- * Stage 0 stub for AudioRecord Opus/PCM audio capture and encoding (Stage 7).
+ * AudioRecord PCM microphone capture engine (Stage 7).
  */
-class AudioCaptureEngine
+typealias AudioCaptureEngine = AudioStreamEngine

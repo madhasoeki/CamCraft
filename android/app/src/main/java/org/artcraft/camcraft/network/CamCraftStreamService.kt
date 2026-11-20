@@ -1,5 +1,6 @@
 package org.artcraft.camcraft.network
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -7,12 +8,14 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.camera.view.PreviewView
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.DataInputStream
@@ -39,6 +42,7 @@ import kotlinx.coroutines.launch
 import org.artcraft.camcraft.MainActivity
 import org.artcraft.camcraft.camera.CameraEnumerator
 import org.artcraft.camcraft.camera.CameraStreamManager
+import org.artcraft.camcraft.encoder.AudioStreamEngine
 import org.artcraft.camcraft.protocol.ActiveCameraState
 import org.artcraft.camcraft.protocol.CameraInfo
 import org.artcraft.camcraft.protocol.CcftFlags
@@ -122,6 +126,7 @@ class CamCraftStreamService : Service() {
     private val lifecycleLock = Any()
 
     private var cameraStreamManager: CameraStreamManager? = null
+    private var audioStreamEngine: AudioStreamEngine? = null
     private var mdnsAdvertiser: MdnsAdvertiser? = null
     private var wifiNetworkMonitor: WifiNetworkMonitor? = null
 
@@ -179,6 +184,9 @@ class CamCraftStreamService : Service() {
                 handleVideoPacketFromEncoder(packetType, flags, ptsUs, payload)
             }
             cameraStreamManager = manager
+            audioStreamEngine = AudioStreamEngine(this) { packetType, ptsUs, payload, length ->
+                handleAudioPacketFromEngine(packetType, ptsUs, payload, length)
+            }
             activeInstance = this
             pendingPreviewView?.let { previewView ->
                 manager.attachPreviewView(previewView)
@@ -213,6 +221,8 @@ class CamCraftStreamService : Service() {
         mdnsAdvertiser = null
         wifiNetworkMonitor?.stop()
         wifiNetworkMonitor = null
+        audioStreamEngine?.release()
+        audioStreamEngine = null
         cameraStreamManager?.release()
         cameraStreamManager = null
         if (activeInstance == this) {
@@ -230,11 +240,20 @@ class CamCraftStreamService : Service() {
     private fun startInForeground() {
         val notification = buildNotification("Starting CamCraft Server...")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val hasMicPermission = ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.RECORD_AUDIO,
+            ) == PackageManager.PERMISSION_GRANTED
+            val serviceTypes = if (hasMicPermission) {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            } else {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+            }
             startForeground(
                 NOTIFICATION_ID,
                 notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE,
+                serviceTypes,
             )
         } else {
             startForeground(NOTIFICATION_ID, notification)
@@ -300,14 +319,16 @@ class CamCraftStreamService : Service() {
         }
     }
 
-    private fun handleVideoPacketFromEncoder(
+    private fun sendStreamPacket(
         packetType: PacketType,
         flags: Int,
         ptsUs: Long,
         payload: ByteArray,
-    ) {
-        val stream = activeClientOutputStream ?: return
-        try {
+        length: Int,
+        tagLabel: String,
+    ): Boolean {
+        val stream = activeClientOutputStream ?: return false
+        return try {
             synchronized(clientOutputLock) {
                 CcftPacket.writePacket(
                     output = stream,
@@ -316,14 +337,35 @@ class CamCraftStreamService : Service() {
                     ptsUs = ptsUs,
                     payload = payload,
                     offset = 0,
-                    length = payload.size,
+                    length = length,
                     flush = true,
                 )
             }
-            onFrameSent(packetType)
+            true
         } catch (e: IOException) {
-            Log.w(TAG, "Failed writing video packet to client: ${e.message}")
+            Log.w(TAG, "Failed writing $tagLabel packet to client: ${e.message}")
+            false
         }
+    }
+
+    private fun handleVideoPacketFromEncoder(
+        packetType: PacketType,
+        flags: Int,
+        ptsUs: Long,
+        payload: ByteArray,
+    ) {
+        if (sendStreamPacket(packetType, flags, ptsUs, payload, payload.size, "video")) {
+            onFrameSent(packetType)
+        }
+    }
+
+    private fun handleAudioPacketFromEngine(
+        packetType: PacketType,
+        ptsUs: Long,
+        payload: ByteArray,
+        length: Int,
+    ) {
+        sendStreamPacket(packetType, CcftFlags.NONE, ptsUs, payload, length, "audio")
     }
 
     private fun onFrameSent(packetType: PacketType) {
@@ -419,11 +461,25 @@ class CamCraftStreamService : Service() {
                 cameraStreamManager?.requestKeyFrame()
             }
 
-            // 5. Run reader loop to process incoming heartbeats and control commands
+            // 5. Start AudioStreamEngine if audio forwarding is enabled
+            if (activeState.audioEnabled) {
+                val audioStarted = audioStreamEngine?.start(initiallyMuted = activeState.audioMuted) ?: false
+                if (!audioStarted) {
+                    Log.w(TAG, "AudioStreamEngine failed to start (check RECORD_AUDIO permission)")
+                    val updatedAudioState = activeState.copy(audioEnabled = false)
+                    _serviceState.update { state ->
+                        state.copy(activeState = updatedAudioState)
+                    }
+                    sendControlAck(updatedAudioState, outputStream, clientOutputLock)
+                }
+            }
+
+            // 6. Run reader loop to process incoming heartbeats and control commands
             runPacketReader(inputStream, outputStream, clientOutputLock)
         } catch (e: Exception) {
             Log.w(TAG, "Client session terminated: ${e.message}")
         } finally {
+            audioStreamEngine?.stop()
             cameraStreamManager?.stopStream()
             activeClientOutputStream = null
             if (activeClientSocket === clientSocket) {
@@ -552,10 +608,42 @@ class CamCraftStreamService : Service() {
                     )
                 }
                 is ControlCmd.SetAudioState -> {
-                    current.copy(
-                        audioEnabled = cmd.enabled,
-                        audioMuted = cmd.muted,
-                    )
+                    if (cmd.enabled) {
+                        audioStreamEngine?.setMuted(cmd.muted)
+                        val engineActive = audioStreamEngine?.isActive == true ||
+                            (audioStreamEngine?.start(initiallyMuted = cmd.muted) == true)
+                        if (!engineActive) {
+                            val fallbackState = current.copy(
+                                audioEnabled = false,
+                                audioMuted = cmd.muted,
+                            )
+                            _serviceState.update {
+                                it.copy(activeState = fallbackState, bitrateKbps = fallbackState.bitrateKbps)
+                            }
+                            val errorAck = CcftPacket.controlAck(
+                                ptsUs = System.nanoTime() / 1_000L,
+                                ack = ControlAck(
+                                    ok = false,
+                                    error = "Microphone capture unavailable (grant RECORD_AUDIO permission on Android)",
+                                    activeState = fallbackState,
+                                ),
+                            )
+                            synchronized(outputLock) {
+                                errorAck.encodeTo(output, flush = true)
+                            }
+                            return
+                        }
+                        current.copy(
+                            audioEnabled = true,
+                            audioMuted = cmd.muted,
+                        )
+                    } else {
+                        audioStreamEngine?.stop()
+                        current.copy(
+                            audioEnabled = false,
+                            audioMuted = cmd.muted,
+                        )
+                    }
                 }
                 is ControlCmd.RequestKeyframe -> {
                     cameraStreamManager?.cachedConfig?.let { spsPps ->
@@ -664,6 +752,7 @@ class CamCraftStreamService : Service() {
     fun toggleMuteFromUi() {
         val current = _serviceState.value.activeState
         val updated = current.copy(audioMuted = !current.audioMuted)
+        audioStreamEngine?.setMuted(updated.audioMuted)
         _serviceState.update { it.copy(activeState = updated) }
         pushActiveStateToClient(updated)
     }

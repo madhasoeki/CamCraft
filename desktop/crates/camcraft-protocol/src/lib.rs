@@ -467,6 +467,23 @@ impl Packet {
         )
     }
 
+    /// Encodes an [`AudioConfigPayload`] message into an `AUDIO_CONFIG` (`0x03`) packet.
+    pub fn audio_config(pts_us: u64, config: &AudioConfigPayload) -> Result<Self, ProtocolError> {
+        let bytes = serde_json::to_vec(config)?;
+        Ok(Self::from_parts(
+            PacketType::AudioConfig,
+            FrameFlags::empty(),
+            pts_us,
+            Bytes::from(bytes),
+        ))
+    }
+
+    /// Creates an `AUDIO_FRAME` (`0x04`) packet from raw audio bytes (PCM S16LE or Opus).
+    #[must_use]
+    pub fn audio_frame(pts_us: u64, payload: Bytes) -> Self {
+        Self::from_parts(PacketType::AudioFrame, FrameFlags::empty(), pts_us, payload)
+    }
+
     /// Creates a heartbeat ping packet (zero-length payload).
     #[must_use]
     pub fn heartbeat_ping(pts_us: u64) -> Self {
@@ -1142,5 +1159,43 @@ mod tests {
         let json = serde_json::to_string(&payload).unwrap();
         let decoded: AudioConfigPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(payload, decoded);
+    }
+
+    #[test]
+    fn audio_config_and_frame_packets_roundtrip() {
+        let config = AudioConfigPayload {
+            sample_rate: 48_000,
+            channels: 1,
+            codec: "pcm_s16le".to_owned(),
+        };
+        let cfg_pkt = Packet::audio_config(12_345, &config).expect("encode AUDIO_CONFIG");
+        assert_eq!(cfg_pkt.header.packet_type, PacketType::AudioConfig);
+        assert_eq!(cfg_pkt.header.pts_us, 12_345);
+
+        let pcm_bytes = vec![0x34_u8; 1_920];
+        let frame_pkt = Packet::audio_frame(32_345, Bytes::from(pcm_bytes.clone()));
+        assert_eq!(frame_pkt.header.packet_type, PacketType::AudioFrame);
+        assert_eq!(frame_pkt.header.payload_len, 1_920);
+
+        let mut buf = BytesMut::new();
+        encode(&cfg_pkt, &mut buf);
+        encode(&frame_pkt, &mut buf);
+
+        let decoded_cfg = decode(&mut buf)
+            .expect("decode config header")
+            .expect("complete config packet");
+        assert_eq!(decoded_cfg.header.packet_type, PacketType::AudioConfig);
+        let parsed_cfg: AudioConfigPayload = decoded_cfg.decode_json().expect("parse JSON config");
+        assert_eq!(parsed_cfg.sample_rate, 48_000);
+        assert_eq!(parsed_cfg.channels, 1);
+        assert_eq!(parsed_cfg.codec, "pcm_s16le");
+
+        let decoded_frame = decode(&mut buf)
+            .expect("decode frame header")
+            .expect("complete frame packet");
+        assert_eq!(decoded_frame.header.packet_type, PacketType::AudioFrame);
+        assert_eq!(decoded_frame.header.pts_us, 32_345);
+        assert_eq!(decoded_frame.payload.as_ref(), pcm_bytes.as_slice());
+        assert!(buf.is_empty());
     }
 }

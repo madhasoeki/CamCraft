@@ -484,12 +484,12 @@ fun CamCraftScreen(
 
             Button(
                 onClick = onToggleMute,
-                enabled = isRunning,
+                enabled = isRunning && state.activeState.audioEnabled,
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = if (state.activeState.audioMuted) {
-                        ArtCraftColors.StatusRose
-                    } else {
-                        ArtCraftColors.SurfaceCardHighlight
+                    containerColor = when {
+                        !state.activeState.audioEnabled -> ArtCraftColors.SurfaceCard
+                        state.activeState.audioMuted -> ArtCraftColors.StatusRose
+                        else -> ArtCraftColors.SurfaceCardHighlight
                     },
                     disabledContainerColor = ArtCraftColors.SurfaceCard,
                 ),
@@ -497,8 +497,16 @@ fun CamCraftScreen(
                 modifier = Modifier.weight(1f),
             ) {
                 Text(
-                    text = if (state.activeState.audioMuted) "Muted" else "Mic ON",
-                    color = if (isRunning) ArtCraftColors.TextPrimary else ArtCraftColors.TextMuted,
+                    text = when {
+                        !state.activeState.audioEnabled -> "Mic OFF"
+                        state.activeState.audioMuted -> "Muted"
+                        else -> "Mic ON"
+                    },
+                    color = if (isRunning && state.activeState.audioEnabled) {
+                        ArtCraftColors.TextPrimary
+                    } else {
+                        ArtCraftColors.TextMuted
+                    },
                     fontSize = 12.sp,
                     fontWeight = FontWeight.SemiBold,
                 )

@@ -29,8 +29,8 @@ setup-vcam:
 # Buat PipeWire Virtual Microphone ("CamCraft Virtual Mic")
 setup-vmic:
     @echo "Membuat PipeWire Virtual Microphone (CamCraft Virtual Mic)..."
-    pactl load-module module-null-sink sink_name=camcraft_sink sink_properties=device.description="CamCraft_Audio_Sink" || true
-    pactl load-module module-remap-source master=camcraft_sink.monitor source_name=camcraft_mic source_properties=device.description="CamCraft_Virtual_Mic" || true
+    pactl load-module module-null-sink sink_name=camcraft_sink rate=48000 channels=1 channel_map=mono sink_properties='device.description="CamCraft Audio Sink"' || true
+    pactl load-module module-remap-source master=camcraft_sink.monitor source_name=camcraft_virtual_mic rate=48000 channels=1 channel_map=mono source_properties='device.description="CamCraft Virtual Mic"' || true
 
 # Buat tunnel USB ADB pada port 9876 (Android <-> Fedora PC)
 usb-tunnel:

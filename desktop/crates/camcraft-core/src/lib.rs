@@ -26,6 +26,9 @@ pub enum CoreError {
     #[error("virtual camera error: {0}")]
     Vcam(#[from] vcam::VcamError),
 
+    #[error("virtual microphone error: {0}")]
+    Vmic(#[from] vmic::VmicError),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -229,7 +232,7 @@ pub mod discovery;
 pub mod vcam;
 
 /// PipeWire / PulseAudio virtual microphone sink (Stage 7+).
-pub mod vmic {}
+pub mod vmic;
 
 #[cfg(test)]
 mod tests {

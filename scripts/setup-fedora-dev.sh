@@ -51,10 +51,10 @@ EOF
 echo "[3/4] Menyiapkan PipeWire Virtual Microphone ('CamCraft Virtual Mic')..."
 if command -v pactl >/dev/null 2>&1; then
     if ! pactl list short sinks | grep -q "camcraft_sink"; then
-        pactl load-module module-null-sink sink_name=camcraft_sink sink_properties=device.description="CamCraft_Audio_Sink" || true
+        pactl load-module module-null-sink sink_name=camcraft_sink rate=48000 channels=1 channel_map=mono sink_properties='device.description="CamCraft Audio Sink"' || true
     fi
-    if ! pactl list short sources | grep -q "camcraft_mic"; then
-        pactl load-module module-remap-source master=camcraft_sink.monitor source_name=camcraft_mic source_properties=device.description="CamCraft_Virtual_Mic" || true
+    if ! pactl list short sources | grep -qE "camcraft_virtual_mic|camcraft_mic"; then
+        pactl load-module module-remap-source master=camcraft_sink.monitor source_name=camcraft_virtual_mic rate=48000 channels=1 channel_map=mono source_properties='device.description="CamCraft Virtual Mic"' || true
     fi
 fi
 
