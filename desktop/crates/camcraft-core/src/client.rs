@@ -75,6 +75,8 @@ impl Default for StreamStats {
 /// Events dispatched by the client receiver loop.
 #[derive(Debug, Clone)]
 pub enum ClientEvent {
+    /// TCP connection established with an outbound command sender handle.
+    Connected(ClientSender),
     /// Initial device discovery message containing camera sensors and current state.
     Hello(ControlHello),
     /// Video frame packet received.
@@ -150,7 +152,7 @@ impl ClientConfig {
 }
 
 /// Asynchronous handle to send commands to the connected Android device.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ClientSender {
     tx: mpsc::Sender<Packet>,
 }
@@ -192,6 +194,9 @@ pub async fn run_client_loop(
     // Outbound packet channel
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<Packet>(32);
     let sender_handle = ClientSender { tx: cmd_tx.clone() };
+    let _ = event_tx
+        .send(ClientEvent::Connected(sender_handle.clone()))
+        .await;
 
     // Spawn outbound writer task
     let shutdown_writer = shutdown.clone();

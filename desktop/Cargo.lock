@@ -705,8 +705,10 @@ dependencies = [
  "anyhow",
  "camcraft-core",
  "camcraft-protocol",
+ "crossbeam-channel",
  "eframe",
  "egui",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]

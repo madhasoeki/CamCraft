@@ -58,6 +58,9 @@ class MainActivity : ComponentActivity() {
                             startServerWithPermissionCheck()
                         }
                     },
+                    onSwitchCamera = { CamCraftStreamService.switchCamera() },
+                    onToggleTorch = { CamCraftStreamService.toggleTorch() },
+                    onToggleMute = { CamCraftStreamService.toggleMute() },
                     modifier = Modifier.safeDrawingPadding(),
                 )
             }

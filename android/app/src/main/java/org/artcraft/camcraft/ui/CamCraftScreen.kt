@@ -69,10 +69,17 @@ fun CamCraftTheme(content: @Composable () -> Unit) {
 fun CamCraftScreen(
     state: StreamServiceState,
     onToggleServer: () -> Unit,
+    onSwitchCamera: () -> Unit = {},
+    onToggleTorch: () -> Unit = {},
+    onToggleMute: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val isRunning = state.status == StreamConnectionStatus.LISTENING ||
         state.status == StreamConnectionStatus.CONNECTED
+    val isConnected = state.status == StreamConnectionStatus.CONNECTED
+    val activeCamera = state.cameras.find { it.id == state.activeState.cameraId }
+    val activeCameraLabel = activeCamera?.label ?: "Camera ${state.activeState.cameraId}"
+    val hasFlash = activeCamera?.hasFlash ?: true
 
     Column(
         modifier = modifier
@@ -240,14 +247,14 @@ fun CamCraftScreen(
 
                             Column(horizontalAlignment = Alignment.End) {
                                 Text(
-                                    text = "${state.framesSent} frames",
+                                    text = "${state.framesSent} frames • ${String.format("%.1fx", state.activeState.zoomRatio)}",
                                     color = ArtCraftColors.TextPrimary,
                                     fontSize = 13.sp,
                                     fontWeight = FontWeight.SemiBold,
                                     fontFamily = FontFamily.Monospace,
                                 )
                                 Text(
-                                    text = "Camera ${state.activeState.cameraId}",
+                                    text = "$activeCameraLabel • EV ${String.format("%+.1f", state.activeState.exposureEv)}",
                                     color = ArtCraftColors.TextMuted,
                                     fontSize = 11.sp,
                                 )
@@ -316,6 +323,82 @@ fun CamCraftScreen(
                         }
                     }
                 }
+            }
+        }
+
+        // Quick Camera & Audio Controls (Two-Way Sync with PC)
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 10.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Button(
+                onClick = onSwitchCamera,
+                enabled = isConnected && state.cameras.size > 1,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = ArtCraftColors.SurfaceCardHighlight,
+                    disabledContainerColor = ArtCraftColors.SurfaceCard,
+                ),
+                shape = RoundedCornerShape(8.dp),
+                modifier = Modifier.weight(1f),
+            ) {
+                Text(
+                    text = "Switch Lens",
+                    color = if (isConnected) ArtCraftColors.TextPrimary else ArtCraftColors.TextMuted,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+
+            Button(
+                onClick = onToggleTorch,
+                enabled = isConnected && hasFlash,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (state.activeState.torchOn) {
+                        ArtCraftColors.StatusAmber
+                    } else {
+                        ArtCraftColors.SurfaceCardHighlight
+                    },
+                    disabledContainerColor = ArtCraftColors.SurfaceCard,
+                ),
+                shape = RoundedCornerShape(8.dp),
+                modifier = Modifier.weight(1f),
+            ) {
+                Text(
+                    text = if (state.activeState.torchOn) "Torch ON" else "Torch OFF",
+                    color = if (state.activeState.torchOn) {
+                        ArtCraftColors.BgCarbon
+                    } else if (isConnected && hasFlash) {
+                        ArtCraftColors.TextPrimary
+                    } else {
+                        ArtCraftColors.TextMuted
+                    },
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+
+            Button(
+                onClick = onToggleMute,
+                enabled = isRunning,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (state.activeState.audioMuted) {
+                        ArtCraftColors.StatusRose
+                    } else {
+                        ArtCraftColors.SurfaceCardHighlight
+                    },
+                    disabledContainerColor = ArtCraftColors.SurfaceCard,
+                ),
+                shape = RoundedCornerShape(8.dp),
+                modifier = Modifier.weight(1f),
+            ) {
+                Text(
+                    text = if (state.activeState.audioMuted) "Muted" else "Mic ON",
+                    color = if (isRunning) ArtCraftColors.TextPrimary else ArtCraftColors.TextMuted,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                )
             }
         }
 

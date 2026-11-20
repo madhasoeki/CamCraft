@@ -66,6 +66,8 @@ pub struct DecodedFrame {
     pub pts_us: u64,
     /// True if this frame is an IDR keyframe.
     pub is_keyframe: bool,
+    /// Time spent decoding and converting this frame in milliseconds.
+    pub decode_time_ms: f32,
     /// Contiguous YUV420P (YU12) byte buffer ready for V4L2 loopback.
     pub yuv420p: Vec<u8>,
     /// Optional RGBA byte buffer (populated only if GUI preview is enabled).
@@ -83,6 +85,8 @@ pub struct DecodedFrameRef<'a> {
     pub pts_us: u64,
     /// True if this frame is an IDR keyframe.
     pub is_keyframe: bool,
+    /// Time spent decoding and converting this frame in milliseconds.
+    pub decode_time_ms: f32,
     /// Contiguous YUV420P (YU12) byte slice ready for V4L2 loopback.
     pub yuv420p: &'a [u8],
     /// Optional contiguous RGBA byte slice (populated only if GUI preview is enabled).
@@ -98,6 +102,7 @@ impl DecodedFrameRef<'_> {
             height: self.height,
             pts_us: self.pts_us,
             is_keyframe: self.is_keyframe,
+            decode_time_ms: self.decode_time_ms,
             yuv420p: self.yuv420p.to_vec(),
             rgba: self.rgba.map(<[u8]>::to_vec),
         }
@@ -154,6 +159,7 @@ impl FrameConverter {
         raw: &VideoFrame,
         pts_us: u64,
         is_keyframe: bool,
+        decode_time_ms: f32,
     ) -> Result<DecodedFrameRef<'_>, DecoderError> {
         let width = raw.width();
         let height = raw.height();
@@ -204,6 +210,7 @@ impl FrameConverter {
             height,
             pts_us,
             is_keyframe,
+            decode_time_ms,
             yuv420p: self.yuv_scratch.as_slice(),
             rgba,
         })
@@ -335,6 +342,7 @@ impl H264Decoder {
             return Ok(());
         }
 
+        let decode_start = std::time::Instant::now();
         self.last_pts_us = pts_us;
         self.last_is_keyframe = is_keyframe;
 
@@ -363,9 +371,13 @@ impl H264Decoder {
                         .pts()
                         .and_then(|p| u64::try_from(p).ok())
                         .unwrap_or(pts_us);
-                    let decoded =
-                        self.converter
-                            .convert(&self.raw_frame, frame_pts_us, is_keyframe)?;
+                    let decode_time_ms = decode_start.elapsed().as_secs_f32() * 1000.0;
+                    let decoded = self.converter.convert(
+                        &self.raw_frame,
+                        frame_pts_us,
+                        is_keyframe,
+                        decode_time_ms,
+                    )?;
                     on_frame(decoded);
                 }
                 Err(ffmpeg_next::Error::Other { errno }) if errno == EAGAIN => {
@@ -412,9 +424,12 @@ impl H264Decoder {
                 .pts()
                 .and_then(|p| u64::try_from(p).ok())
                 .unwrap_or(self.last_pts_us);
-            let decoded =
-                self.converter
-                    .convert(&self.raw_frame, frame_pts_us, self.last_is_keyframe)?;
+            let decoded = self.converter.convert(
+                &self.raw_frame,
+                frame_pts_us,
+                self.last_is_keyframe,
+                0.0,
+            )?;
             on_frame(decoded);
         }
 

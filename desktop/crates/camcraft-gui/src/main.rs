@@ -1,15 +1,33 @@
-//! Native Fedora desktop GUI shell for CamCraft (ArtCraft Studio Dark Theme).
+//! Native Fedora desktop GUI for CamCraft (ArtCraft Studio Dark Theme).
+
+mod session;
+
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
+use camcraft_core::client::StreamStats;
+use camcraft_protocol::{ActiveCameraState, CameraInfo, ControlCmd, ControlHello, DEFAULT_PORT};
 use eframe::egui;
+use session::{ConnectionMode, GuiCommand, GuiSession, GuiUpdate};
 use tracing::info;
 
 const COLOR_BG_CARBON: egui::Color32 = egui::Color32::from_rgb(0x11, 0x13, 0x18);
 const COLOR_SURFACE_CARD: egui::Color32 = egui::Color32::from_rgb(0x1C, 0x20, 0x26);
+const COLOR_SURFACE_ELEVATED: egui::Color32 = egui::Color32::from_rgb(0x26, 0x2B, 0x33);
 const COLOR_ACCENT_BLUE: egui::Color32 = egui::Color32::from_rgb(0x3B, 0x82, 0xF6);
 const COLOR_STATUS_EMERALD: egui::Color32 = egui::Color32::from_rgb(0x10, 0xB9, 0x81);
+const COLOR_STATUS_AMBER: egui::Color32 = egui::Color32::from_rgb(0xF5, 0x9E, 0x0B);
+const COLOR_STATUS_ROSE: egui::Color32 = egui::Color32::from_rgb(0xEF, 0x44, 0x44);
 const COLOR_TEXT_PRIMARY: egui::Color32 = egui::Color32::from_rgb(0xF3, 0xF4, 0xF6);
 const COLOR_TEXT_MUTED: egui::Color32 = egui::Color32::from_rgb(0x9C, 0xA3, 0xAF);
+
+const DEBOUNCE_DURATION: Duration = Duration::from_millis(50);
+
+const STANDARD_RESOLUTIONS: &[(u32, u32, &str)] = &[
+    (1280, 720, "1280x720 (720p)"),
+    (1920, 1080, "1920x1080 (1080p)"),
+    (3840, 2160, "3840x2160 (4K UHD)"),
+];
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -21,14 +39,14 @@ fn main() -> Result<()> {
 
     info!(
         protocol_version = camcraft_protocol::PROTOCOL_VERSION,
-        "Launching CamCraft GUI shell"
+        "Launching CamCraft GUI"
     );
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("CamCraft — ArtCraft Studio")
-            .with_inner_size([1180.0, 720.0])
-            .with_min_inner_size([900.0, 560.0]),
+            .with_inner_size([1240.0, 760.0])
+            .with_min_inner_size([960.0, 600.0]),
         ..Default::default()
     };
 
@@ -40,114 +58,747 @@ fn main() -> Result<()> {
     .map_err(|err| anyhow!("failed to run CamCraft GUI: {err}"))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConnectionStatus {
+    Disconnected,
+    Connecting(ConnectionMode),
+    Connected(ConnectionMode),
+}
+
 struct CamCraftApp {
+    session: GuiSession,
+    status: ConnectionStatus,
+    status_message: Option<String>,
+    device_name: Option<String>,
+    cameras: Vec<CameraInfo>,
+
+    // Connection settings
     vcam_device: String,
+    vcam_active: bool,
     wifi_endpoint: String,
+
+    // Stream & camera controls (synchronized with ActiveCameraState)
+    selected_camera_id: String,
+    selected_width: u32,
+    selected_height: u32,
+    selected_fps: u32,
+    bitrate_mbps: u32,
+
+    zoom_ratio: f32,
+    exposure_ev: f32,
+    autofocus: bool,
+    torch_on: bool,
+    mirror_horizontal: bool,
+    rotation_deg: i32,
+
+    // 50ms debounce tracking for live image adjustments
+    params_dirty: bool,
+    last_params_edit: Instant,
+
+    // Live preview & telemetry
+    preview_texture: Option<egui::TextureHandle>,
+    frame_width: u32,
+    frame_height: u32,
+    decode_time_ms: f32,
+    stats: StreamStats,
 }
 
 impl CamCraftApp {
     fn new(ctx: &egui::Context) -> Self {
         apply_artcraft_dark_theme(ctx);
+        let session = GuiSession::start(ctx.clone());
+
         Self {
+            session,
+            status: ConnectionStatus::Disconnected,
+            status_message: None,
+            device_name: None,
+            cameras: Vec::new(),
             vcam_device: "/dev/video10".to_owned(),
-            wifi_endpoint: format!("192.168.1.100:{}", camcraft_protocol::DEFAULT_PORT),
+            vcam_active: false,
+            wifi_endpoint: format!("192.168.1.100:{DEFAULT_PORT}"),
+            selected_camera_id: "0".to_owned(),
+            selected_width: 1920,
+            selected_height: 1080,
+            selected_fps: 60,
+            bitrate_mbps: 12,
+            zoom_ratio: 1.0,
+            exposure_ev: 0.0,
+            autofocus: true,
+            torch_on: false,
+            mirror_horizontal: false,
+            rotation_deg: 0,
+            params_dirty: false,
+            last_params_edit: Instant::now(),
+            preview_texture: None,
+            frame_width: 0,
+            frame_height: 0,
+            decode_time_ms: 0.0,
+            stats: StreamStats::default(),
         }
+    }
+
+    fn process_updates(&mut self, ctx: &egui::Context) {
+        for update in self.session.drain_updates() {
+            match update {
+                GuiUpdate::Connecting { mode, endpoint } => {
+                    self.status = ConnectionStatus::Connecting(mode);
+                    self.status_message = Some(format!("Connecting to {endpoint}..."));
+                }
+                GuiUpdate::Connected(mode) => {
+                    self.status = ConnectionStatus::Connected(mode);
+                    self.status_message = None;
+                }
+                GuiUpdate::Hello(hello) => {
+                    self.apply_hello(hello);
+                }
+                GuiUpdate::ControlAck(ack) => {
+                    if ack.ok {
+                        if let Some(state) = ack.active_state
+                            && !self.params_dirty
+                        {
+                            self.sync_from_active_state(&state);
+                        }
+                        self.status_message = None;
+                    } else if let Some(err) = ack.error {
+                        self.status_message = Some(format!("Control error: {err}"));
+                    }
+                }
+                GuiUpdate::Stats(stats) => {
+                    self.stats = stats;
+                }
+                GuiUpdate::VcamStatus {
+                    path,
+                    active,
+                    error,
+                } => {
+                    if !path.is_empty() {
+                        self.vcam_device = path;
+                    }
+                    self.vcam_active = active;
+                    if let Some(err) = error {
+                        self.status_message = Some(format!("Virtual camera inactive: {err}"));
+                    }
+                }
+                GuiUpdate::Disconnected(reason) => {
+                    self.status = ConnectionStatus::Disconnected;
+                    self.vcam_active = false;
+                    self.stats = StreamStats::default();
+                    self.decode_time_ms = 0.0;
+                    self.status_message = Some(reason);
+                }
+                GuiUpdate::Error(err) => {
+                    if matches!(self.status, ConnectionStatus::Connecting(_)) {
+                        self.status = ConnectionStatus::Disconnected;
+                        self.vcam_active = false;
+                    }
+                    self.status_message = Some(err);
+                }
+            }
+        }
+
+        if let Some(frame) = self.session.take_latest_frame() {
+            self.frame_width = frame.width;
+            self.frame_height = frame.height;
+            self.decode_time_ms = frame.decode_time_ms;
+
+            if let Some(rgba) = frame.rgba {
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [frame.width as usize, frame.height as usize],
+                    &rgba,
+                );
+                match self.preview_texture {
+                    Some(ref mut tex) => {
+                        tex.set(image, egui::TextureOptions::LINEAR);
+                    }
+                    None => {
+                        self.preview_texture = Some(ctx.load_texture(
+                            "camcraft-preview",
+                            image,
+                            egui::TextureOptions::LINEAR,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply_hello(&mut self, hello: ControlHello) {
+        self.device_name = Some(hello.device_name);
+        self.cameras = hello.cameras;
+        self.sync_from_active_state(&hello.active_state);
+    }
+
+    fn sync_from_active_state(&mut self, state: &ActiveCameraState) {
+        self.selected_camera_id = state.camera_id.clone();
+        self.selected_width = state.width;
+        self.selected_height = state.height;
+        self.selected_fps = state.fps;
+        self.bitrate_mbps = (state.bitrate_kbps / 1000).clamp(4, 40);
+        self.zoom_ratio = state.zoom_ratio;
+        self.exposure_ev = state.exposure_ev;
+        self.autofocus = state.autofocus;
+        self.torch_on = state.torch_on;
+        self.mirror_horizontal = state.mirror_horizontal;
+        self.rotation_deg = state.rotation_deg;
+    }
+
+    fn active_camera_info(&self) -> Option<&CameraInfo> {
+        self.cameras
+            .iter()
+            .find(|c| c.id == self.selected_camera_id)
+            .or_else(|| self.cameras.first())
+    }
+
+    fn mark_params_dirty(&mut self) {
+        self.params_dirty = true;
+        self.last_params_edit = Instant::now();
+    }
+
+    fn flush_debounced_params(&mut self, ctx: &egui::Context) {
+        if !self.params_dirty {
+            return;
+        }
+        let elapsed = self.last_params_edit.elapsed();
+        if elapsed >= DEBOUNCE_DURATION {
+            self.params_dirty = false;
+            if matches!(self.status, ConnectionStatus::Connected(_)) {
+                self.session
+                    .send(GuiCommand::SendControlCmd(ControlCmd::SetCameraParams {
+                        zoom_ratio: Some(self.zoom_ratio),
+                        exposure_ev: Some(self.exposure_ev),
+                        autofocus: Some(self.autofocus),
+                        torch_on: Some(self.torch_on),
+                        mirror_horizontal: Some(self.mirror_horizontal),
+                        rotation_deg: Some(self.rotation_deg),
+                    }));
+            }
+        } else {
+            ctx.request_repaint_after(DEBOUNCE_DURATION - elapsed);
+        }
+    }
+
+    fn is_connected(&self) -> bool {
+        matches!(self.status, ConnectionStatus::Connected(_))
+    }
+
+    fn is_busy(&self) -> bool {
+        !matches!(self.status, ConnectionStatus::Disconnected)
+    }
+
+    fn render_telemetry_bar(&self, ui: &mut egui::Ui) {
+        card_frame().show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                // Connection status badge
+                let (badge_color, badge_text) = match self.status {
+                    ConnectionStatus::Connected(mode) => (
+                        COLOR_STATUS_EMERALD,
+                        format!("Connected via {}", mode.label()),
+                    ),
+                    ConnectionStatus::Connecting(mode) => (
+                        COLOR_STATUS_AMBER,
+                        format!("Connecting ({})...", mode.label()),
+                    ),
+                    ConnectionStatus::Disconnected => (COLOR_TEXT_MUTED, "Disconnected".to_owned()),
+                };
+
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 4.5, badge_color);
+                ui.label(egui::RichText::new(badge_text).color(badge_color).strong());
+
+                separator_dot(ui);
+
+                let dev = self.device_name.as_deref().unwrap_or("No Device");
+                ui.label(egui::RichText::new(dev).color(COLOR_TEXT_PRIMARY).strong());
+
+                separator_dot(ui);
+
+                let res_text = if self.frame_width > 0 && self.frame_height > 0 {
+                    format!(
+                        "{}x{} • {:.1} FPS",
+                        self.frame_width, self.frame_height, self.stats.fps
+                    )
+                } else {
+                    format!(
+                        "{}x{} • {:.1} FPS",
+                        self.selected_width, self.selected_height, self.stats.fps
+                    )
+                };
+                ui.label(
+                    egui::RichText::new(res_text)
+                        .color(COLOR_TEXT_PRIMARY)
+                        .monospace(),
+                );
+
+                separator_dot(ui);
+
+                ui.label(
+                    egui::RichText::new(format!("{:.2} Mbps", self.stats.bitrate_mbps))
+                        .color(COLOR_ACCENT_BLUE)
+                        .monospace(),
+                );
+
+                separator_dot(ui);
+
+                ui.label(
+                    egui::RichText::new(format!("Decode {:.1} ms", self.decode_time_ms))
+                        .color(COLOR_TEXT_MUTED)
+                        .monospace(),
+                );
+
+                separator_dot(ui);
+
+                ui.label(
+                    egui::RichText::new(format!("RTT {:.1} ms", self.stats.rtt_ms))
+                        .color(COLOR_TEXT_MUTED)
+                        .monospace(),
+                );
+
+                separator_dot(ui);
+
+                let vcam_label = if self.vcam_active {
+                    format!("{} Active", self.vcam_device)
+                } else {
+                    format!("{} Standby", self.vcam_device)
+                };
+                let vcam_color = if self.vcam_active {
+                    COLOR_STATUS_EMERALD
+                } else {
+                    COLOR_TEXT_MUTED
+                };
+                ui.label(egui::RichText::new(vcam_label).color(vcam_color).strong());
+            });
+
+            if let Some(ref msg) = self.status_message {
+                ui.add_space(4.0);
+                let msg_color = if msg.to_lowercase().contains("error") {
+                    COLOR_STATUS_ROSE
+                } else {
+                    COLOR_STATUS_AMBER
+                };
+                ui.label(egui::RichText::new(msg).color(msg_color).small());
+            }
+        });
+    }
+
+    fn render_preview_canvas(&self, ui: &mut egui::Ui, size: egui::Vec2) {
+        let inner_size = egui::vec2((size.x - 28.0).max(100.0), (size.y - 28.0).max(100.0));
+        card_frame().show(ui, |ui| {
+            ui.set_min_size(inner_size);
+            ui.set_max_size(inner_size);
+
+            if self.is_connected()
+                && let Some(ref tex) = self.preview_texture
+            {
+                let tex_size = tex.size_vec2();
+                let swapped = self.rotation_deg == 90 || self.rotation_deg == 270;
+                let logical_aspect = if tex_size.y > 0.0 {
+                    if swapped {
+                        tex_size.y / tex_size.x
+                    } else {
+                        tex_size.x / tex_size.y
+                    }
+                } else {
+                    16.0 / 9.0
+                };
+
+                let avail = ui.available_size();
+                let (draw_w, draw_h) = fit_aspect(avail.x, avail.y, logical_aspect);
+                let (rect, _) =
+                    ui.allocate_exact_size(avail, egui::Sense::hover());
+                let center = rect.center();
+
+                let uv = if self.mirror_horizontal {
+                    egui::Rect::from_min_max(egui::pos2(1.0, 0.0), egui::pos2(0.0, 1.0))
+                } else {
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0))
+                };
+
+                // When rotated 90/270, paint with pre-rotation dimensions centered in rect.
+                let (img_w, img_h) = if swapped {
+                    (draw_h, draw_w)
+                } else {
+                    (draw_w, draw_h)
+                };
+                let img_rect =
+                    egui::Rect::from_center_size(center, egui::vec2(img_w, img_h));
+
+                let mut image = egui::Image::new((tex.id(), egui::vec2(img_w, img_h))).uv(uv);
+                if self.rotation_deg != 0 {
+                    let radians = (self.rotation_deg as f32).to_radians();
+                    image = image.rotate(radians, egui::vec2(0.5, 0.5));
+                }
+                image.paint_at(ui, img_rect);
+            } else {
+                ui.centered_and_justified(|ui| {
+                    let placeholder = if self.is_connected() {
+                        "Connected — Waiting for H.264 video frames..."
+                    } else {
+                        "CamCraft Studio Preview (16:9)\nConnect via USB (ADB) or Wi-Fi to start streaming"
+                    };
+                    ui.label(egui::RichText::new(placeholder).color(COLOR_TEXT_MUTED));
+                });
+            }
+        });
+    }
+
+    fn render_connection_card(&mut self, ui: &mut egui::Ui) {
+        card_frame().show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            section_title(ui, "Connection");
+            ui.add_space(8.0);
+
+            ui.label(
+                egui::RichText::new("Virtual Camera Device")
+                    .color(COLOR_TEXT_MUTED)
+                    .small(),
+            );
+            ui.add_enabled(
+                !self.is_busy(),
+                egui::TextEdit::singleline(&mut self.vcam_device),
+            );
+            ui.add_space(8.0);
+
+            let usb_btn = egui::Button::new(
+                egui::RichText::new("Connect via USB (ADB)").color(COLOR_TEXT_PRIMARY),
+            )
+            .fill(COLOR_ACCENT_BLUE);
+            if ui
+                .add_enabled(!self.is_busy(), usb_btn)
+                .on_hover_text("Runs adb forward tcp:9876 tcp:9876 and connects")
+                .clicked()
+            {
+                self.session.send(GuiCommand::ConnectUsb {
+                    port: DEFAULT_PORT,
+                    vcam_device: self.vcam_device.clone(),
+                });
+            }
+
+            ui.add_space(10.0);
+            ui.label(
+                egui::RichText::new("Wi-Fi IP:Port")
+                    .color(COLOR_TEXT_MUTED)
+                    .small(),
+            );
+            ui.horizontal(|ui| {
+                ui.add_enabled(
+                    !self.is_busy(),
+                    egui::TextEdit::singleline(&mut self.wifi_endpoint)
+                        .desired_width((ui.available_width() - 115.0).max(100.0)),
+                );
+                let wifi_btn = egui::Button::new(
+                    egui::RichText::new("Connect Wi-Fi").color(COLOR_TEXT_PRIMARY),
+                )
+                .fill(COLOR_SURFACE_ELEVATED);
+                if ui.add_enabled(!self.is_busy(), wifi_btn).clicked() {
+                    self.session.send(GuiCommand::ConnectWifi {
+                        endpoint: self.wifi_endpoint.clone(),
+                        vcam_device: self.vcam_device.clone(),
+                    });
+                }
+            });
+
+            ui.add_space(10.0);
+            let disconnect_btn =
+                egui::Button::new(egui::RichText::new("Disconnect").color(COLOR_TEXT_PRIMARY))
+                    .fill(if self.is_busy() {
+                        COLOR_STATUS_ROSE
+                    } else {
+                        COLOR_SURFACE_ELEVATED
+                    });
+            if ui.add_enabled(self.is_busy(), disconnect_btn).clicked() {
+                self.session.send(GuiCommand::Disconnect);
+            }
+        });
+    }
+
+    fn render_stream_preset_card(&mut self, ui: &mut egui::Ui) {
+        let connected = self.is_connected();
+
+        card_frame().show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            section_title(ui, "Camera & Stream Preset");
+            ui.add_space(8.0);
+
+            ui.add_enabled_ui(connected, |ui| {
+                // Camera selector
+                ui.label(
+                    egui::RichText::new("Camera Lens")
+                        .color(COLOR_TEXT_MUTED)
+                        .small(),
+                );
+                let selected_label = self
+                    .cameras
+                    .iter()
+                    .find(|c| c.id == self.selected_camera_id)
+                    .map(|c| format!("{} ({})", c.label, c.facing))
+                    .unwrap_or_else(|| format!("Camera {}", self.selected_camera_id));
+
+                egui::ComboBox::from_id_salt("camera_lens_combo")
+                    .selected_text(selected_label)
+                    .width(ui.available_width())
+                    .show_ui(ui, |ui| {
+                        for cam in &self.cameras {
+                            let label = format!("{} ({})", cam.label, cam.facing);
+                            ui.selectable_value(
+                                &mut self.selected_camera_id,
+                                cam.id.clone(),
+                                label,
+                            );
+                        }
+                    });
+
+                ui.add_space(8.0);
+
+                // Resolution selector
+                ui.label(
+                    egui::RichText::new("Resolution")
+                        .color(COLOR_TEXT_MUTED)
+                        .small(),
+                );
+                let res_label = format!("{}x{}", self.selected_width, self.selected_height);
+                egui::ComboBox::from_id_salt("resolution_combo")
+                    .selected_text(res_label)
+                    .width(ui.available_width())
+                    .show_ui(ui, |ui| {
+                        for &(w, h, label) in STANDARD_RESOLUTIONS {
+                            let is_sel = self.selected_width == w && self.selected_height == h;
+                            if ui.selectable_label(is_sel, label).clicked() {
+                                self.selected_width = w;
+                                self.selected_height = h;
+                            }
+                        }
+                    });
+
+                ui.add_space(8.0);
+
+                // FPS selector
+                ui.label(
+                    egui::RichText::new("Frame Rate")
+                        .color(COLOR_TEXT_MUTED)
+                        .small(),
+                );
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.selected_fps, 30, "30 FPS");
+                    ui.selectable_value(&mut self.selected_fps, 60, "60 FPS");
+                });
+
+                ui.add_space(8.0);
+
+                // Bitrate slider
+                ui.label(
+                    egui::RichText::new(format!("Bitrate: {} Mbps", self.bitrate_mbps))
+                        .color(COLOR_TEXT_MUTED)
+                        .small(),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.bitrate_mbps, 4..=40)
+                        .suffix(" Mbps")
+                        .step_by(1.0),
+                );
+
+                ui.add_space(10.0);
+
+                let apply_btn = egui::Button::new(
+                    egui::RichText::new("Apply Stream Settings").color(COLOR_TEXT_PRIMARY),
+                )
+                .fill(COLOR_ACCENT_BLUE);
+                if ui
+                    .add_sized([ui.available_width(), 30.0], apply_btn)
+                    .clicked()
+                {
+                    self.session
+                        .send(GuiCommand::SendControlCmd(ControlCmd::ConfigureStream {
+                            camera_id: self.selected_camera_id.clone(),
+                            width: self.selected_width,
+                            height: self.selected_height,
+                            fps: self.selected_fps,
+                            bitrate_kbps: self.bitrate_mbps * 1000,
+                        }));
+                }
+            });
+        });
+    }
+
+    fn render_live_adjustments_card(&mut self, ui: &mut egui::Ui) {
+        let connected = self.is_connected();
+        let (max_zoom, min_ev, max_ev, has_flash) = match self.active_camera_info() {
+            Some(cam) => (
+                cam.max_zoom.max(1.0),
+                cam.ev_range.0,
+                cam.ev_range.1,
+                cam.has_flash,
+            ),
+            None => (5.0, -2.0, 2.0, true),
+        };
+
+        card_frame().show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            section_title(ui, "Live Image Adjustments");
+            ui.add_space(8.0);
+
+            ui.add_enabled_ui(connected, |ui| {
+                // Zoom slider
+                ui.label(
+                    egui::RichText::new(format!("Zoom: {:.2}x", self.zoom_ratio))
+                        .color(COLOR_TEXT_MUTED)
+                        .small(),
+                );
+                if ui
+                    .add(
+                        egui::Slider::new(&mut self.zoom_ratio, 1.0..=max_zoom)
+                            .suffix("x")
+                            .fixed_decimals(2),
+                    )
+                    .changed()
+                {
+                    self.mark_params_dirty();
+                }
+
+                ui.add_space(6.0);
+
+                // Exposure EV slider
+                let ev_range_valid = max_ev > min_ev;
+                ui.label(
+                    egui::RichText::new(format!("Exposure (EV): {:+.1}", self.exposure_ev))
+                        .color(COLOR_TEXT_MUTED)
+                        .small(),
+                );
+                let ev_min = if ev_range_valid { min_ev } else { -2.0 };
+                let ev_max = if ev_range_valid { max_ev } else { 2.0 };
+                if ui
+                    .add_enabled(
+                        ev_range_valid,
+                        egui::Slider::new(&mut self.exposure_ev, ev_min..=ev_max)
+                            .suffix(" EV")
+                            .fixed_decimals(1),
+                    )
+                    .changed()
+                {
+                    self.mark_params_dirty();
+                }
+
+                ui.add_space(8.0);
+
+                // Checkboxes
+                if ui.checkbox(&mut self.autofocus, "Autofocus").changed() {
+                    self.mark_params_dirty();
+                }
+                if ui
+                    .add_enabled(
+                        has_flash,
+                        egui::Checkbox::new(&mut self.torch_on, "Torch / Flashlight"),
+                    )
+                    .changed()
+                {
+                    self.mark_params_dirty();
+                }
+                if ui
+                    .checkbox(&mut self.mirror_horizontal, "Mirror Horizontal")
+                    .changed()
+                {
+                    self.mark_params_dirty();
+                }
+
+                ui.add_space(8.0);
+
+                // Rotation selector
+                ui.label(
+                    egui::RichText::new("Rotation")
+                        .color(COLOR_TEXT_MUTED)
+                        .small(),
+                );
+                ui.horizontal(|ui| {
+                    for deg in [0, 90, 180, 270] {
+                        if ui
+                            .selectable_value(&mut self.rotation_deg, deg, format!("{deg}°"))
+                            .changed()
+                        {
+                            self.mark_params_dirty();
+                        }
+                    }
+                });
+            });
+        });
     }
 }
 
 impl eframe::App for CamCraftApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.process_updates(&ctx);
+        self.flush_debounced_params(&ctx);
+
+        if self.is_connected() {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+
         egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(ui.style()).fill(COLOR_BG_CARBON))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading(
-                        egui::RichText::new("CamCraft Studio")
-                            .color(COLOR_TEXT_PRIMARY)
-                            .strong(),
-                    );
-                    ui.add_space(12.0);
-                    ui.label(
-                        egui::RichText::new("STANDBY")
-                            .color(COLOR_STATUS_EMERALD)
-                            .strong(),
-                    );
-                });
-                ui.add_space(12.0);
-
-                let available = ui.available_size();
-                let preview_width = (available.x * 0.68).max(360.0);
+                let total_avail = ui.available_size();
+                let left_width = (total_avail.x * 0.67).max(420.0);
 
                 ui.horizontal_top(|ui| {
-                    egui::Frame::new()
-                        .fill(COLOR_SURFACE_CARD)
-                        .corner_radius(8.0)
-                        .inner_margin(16.0)
-                        .show(ui, |ui| {
-                            ui.set_min_size(egui::vec2(preview_width, available.y - 16.0));
-                            ui.centered_and_justified(|ui| {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "Video Preview Canvas (1080p / 4K @ 60fps)\nTarget Sink: {}",
-                                        self.vcam_device
-                                    ))
-                                    .color(COLOR_TEXT_MUTED),
-                                );
-                            });
-                        });
+                    // Left Panel: Telemetry Status Bar + Live Video Preview
+                    ui.vertical(|ui| {
+                        ui.set_width(left_width);
+                        self.render_telemetry_bar(ui);
+                        ui.add_space(10.0);
+                        let preview_h = (ui.available_height() - 4.0).max(240.0);
+                        self.render_preview_canvas(ui, egui::vec2(left_width, preview_h));
+                    });
 
                     ui.add_space(12.0);
 
-                    ui.vertical(|ui| {
-                        egui::Frame::new()
-                            .fill(COLOR_SURFACE_CARD)
-                            .corner_radius(8.0)
-                            .inner_margin(16.0)
-                            .show(ui, |ui| {
-                                ui.set_min_width(ui.available_width());
-                                ui.label(
-                                    egui::RichText::new("Connection")
-                                        .color(COLOR_TEXT_PRIMARY)
-                                        .strong(),
-                                );
-                                ui.add_space(8.0);
-                                let connect_btn = egui::Button::new(
-                                    egui::RichText::new("Connect via USB (ADB)")
-                                        .color(COLOR_TEXT_PRIMARY),
-                                )
-                                .fill(COLOR_ACCENT_BLUE);
-                                let _ = ui.add_sized([ui.available_width(), 32.0], connect_btn);
-                                ui.add_space(8.0);
-                                ui.label(
-                                    egui::RichText::new("Wi-Fi IP:Port").color(COLOR_TEXT_MUTED),
-                                );
-                                ui.text_edit_singleline(&mut self.wifi_endpoint);
-                            });
-
-                        ui.add_space(12.0);
-
-                        egui::Frame::new()
-                            .fill(COLOR_SURFACE_CARD)
-                            .corner_radius(8.0)
-                            .inner_margin(16.0)
-                            .show(ui, |ui| {
-                                ui.set_min_width(ui.available_width());
-                                ui.label(
-                                    egui::RichText::new("Camera Controls (Stage 5)")
-                                        .color(COLOR_TEXT_PRIMARY)
-                                        .strong(),
-                                );
-                                ui.add_space(6.0);
-                                ui.label(
-                                    egui::RichText::new(
-                                        "Lens, Resolution, FPS, Zoom, EV, and Torch controls will connect here.",
-                                    )
-                                    .color(COLOR_TEXT_MUTED),
-                                );
-                            });
-                    });
+                    // Right Panel: Inspector & Two-Way Camera Controls
+                    egui::ScrollArea::vertical()
+                        .id_salt("inspector_scroll")
+                        .show(ui, |ui| {
+                            self.render_connection_card(ui);
+                            ui.add_space(10.0);
+                            self.render_stream_preset_card(ui);
+                            ui.add_space(10.0);
+                            self.render_live_adjustments_card(ui);
+                        });
                 });
             });
+    }
+}
+
+fn card_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(COLOR_SURFACE_CARD)
+        .corner_radius(8.0)
+        .inner_margin(14.0)
+}
+
+fn section_title(ui: &mut egui::Ui, title: &str) {
+    ui.label(
+        egui::RichText::new(title)
+            .color(COLOR_TEXT_PRIMARY)
+            .size(15.0)
+            .strong(),
+    );
+}
+
+fn separator_dot(ui: &mut egui::Ui) {
+    ui.label(egui::RichText::new("•").color(COLOR_TEXT_MUTED));
+}
+
+fn fit_aspect(avail_w: f32, avail_h: f32, aspect: f32) -> (f32, f32) {
+    if avail_w <= 0.0 || avail_h <= 0.0 || aspect <= 0.0 {
+        return (avail_w.max(1.0), avail_h.max(1.0));
+    }
+    let avail_aspect = avail_w / avail_h;
+    if avail_aspect > aspect {
+        let h = avail_h;
+        (h * aspect, h)
+    } else {
+        let w = avail_w;
+        (w, w / aspect)
     }
 }
 
@@ -157,8 +808,13 @@ fn apply_artcraft_dark_theme(ctx: &egui::Context) {
     visuals.panel_fill = COLOR_BG_CARBON;
     visuals.extreme_bg_color = egui::Color32::from_rgb(0x0B, 0x0D, 0x11);
     visuals.widgets.noninteractive.bg_fill = COLOR_SURFACE_CARD;
-    visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(0x26, 0x2B, 0x33);
+    visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(8);
+    visuals.widgets.inactive.bg_fill = COLOR_SURFACE_ELEVATED;
+    visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(8);
     visuals.widgets.hovered.bg_fill = COLOR_ACCENT_BLUE;
+    visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(8);
+    visuals.widgets.active.bg_fill = COLOR_ACCENT_BLUE;
+    visuals.widgets.active.corner_radius = egui::CornerRadius::same(8);
     visuals.selection.bg_fill = COLOR_ACCENT_BLUE;
     ctx.set_visuals(visuals);
 }

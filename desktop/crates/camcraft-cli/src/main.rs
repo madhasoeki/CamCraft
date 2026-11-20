@@ -214,6 +214,7 @@ async fn run_connect(args: ConnectArgs) -> Result<()> {
     // Event consumption loop
     while let Some(event) = event_rx.recv().await {
         match event {
+            ClientEvent::Connected(_) => {}
             ClientEvent::Hello(hello) => {
                 print_device_banner(&hello);
             }
