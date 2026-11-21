@@ -1,14 +1,23 @@
-//! Linux `v4l2loopback` virtual camera sink and abstraction traits.
+//! Linux virtual camera sinks (`PipeWire` native + `v4l2loopback` fallback) and abstraction traits.
 //!
 //! Follows `docs/DESIGN.md` §3.1 and `docs/PLAN.md` (Stage 4):
 //! - Provides the cross-platform [`VirtualCameraSink`] trait.
+//! - Exposes [`PipeWireCameraSink`] via runtime-dlopen `libpipewire-0.3` ([`pipewire`]).
 //! - Implements [`V4l2LoopbackSink`] for Linux `/dev/video*` devices.
 //! - Auto-discovers devices with card label `"CamCraft"`.
 //! - Dynamically reconfigures `V4L2_BUF_TYPE_VIDEO_OUTPUT` formats (`YU12` / `YUV420P`).
 //! - Emits standalone standby frames when the phone is not streaming or reconnecting.
 
+#[path = "vcam_pw.rs"]
+pub mod pipewire;
+
+pub use pipewire::PipeWireCameraSink;
+
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::str::FromStr;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 use v4l::FourCC;
@@ -754,6 +763,154 @@ impl VideoOutputSink for V4l2LoopbackSink {
     }
 }
 
+const PIPEWIRE_DISPLAY_NAME: &str = "PipeWire (CamCraft Virtual Camera)";
+
+/// Error returned when parsing a [`VcamBackendMode`] from a string fails.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("unknown virtual camera backend '{0}' (expected 'auto', 'pipewire', or 'v4l2')")]
+pub struct ParseVcamBackendModeError(pub String);
+
+/// Preferred Linux virtual camera backend selection mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VcamBackendMode {
+    /// Try native PipeWire first, falling back to `v4l2loopback` if unavailable.
+    #[default]
+    Auto,
+    /// Require the native PipeWire `Video/Source` sink.
+    PipeWire,
+    /// Require the Linux `v4l2loopback` `/dev/video*` sink.
+    V4l2,
+}
+
+impl VcamBackendMode {
+    /// Returns a concise human-readable label for UI display and logging.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::PipeWire => "PipeWire",
+            Self::V4l2 => "V4L2",
+        }
+    }
+}
+
+impl fmt::Display for VcamBackendMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+impl FromStr for VcamBackendMode {
+    type Err = ParseVcamBackendModeError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "pipewire" | "pw" => Ok(Self::PipeWire),
+            "v4l2" | "v4l2loopback" => Ok(Self::V4l2),
+            _ => Err(ParseVcamBackendModeError(s.to_owned())),
+        }
+    }
+}
+
+/// An opened virtual camera sink along with its active backend and display label.
+pub struct OpenedVcam {
+    pub sink: Box<dyn VirtualCameraSink>,
+    pub backend: VcamBackendMode,
+    pub display_name: String,
+}
+
+fn resolve_v4l2_path(v4l2_path_hint: &str) -> PathBuf {
+    let trimmed = v4l2_path_hint.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("auto")
+        || trimmed.starts_with("pipewire:")
+        || trimmed == PIPEWIRE_DISPLAY_NAME
+    {
+        find_camcraft_v4l2_device()
+    } else {
+        PathBuf::from(trimmed)
+    }
+}
+
+fn open_pipewire_vcam() -> Result<OpenedVcam, VcamError> {
+    let mut pw_sink = PipeWireCameraSink::new();
+    pw_sink.open()?;
+    Ok(OpenedVcam {
+        sink: Box::new(pw_sink),
+        backend: VcamBackendMode::PipeWire,
+        display_name: PIPEWIRE_DISPLAY_NAME.to_owned(),
+    })
+}
+
+fn open_v4l2_vcam(v4l2_path_hint: &str) -> Result<OpenedVcam, VcamError> {
+    let path = resolve_v4l2_path(v4l2_path_hint);
+    let display_name = path.display().to_string();
+    let mut v4l2_sink = V4l2LoopbackSink::new(path);
+    v4l2_sink.open()?;
+    Ok(OpenedVcam {
+        sink: Box::new(v4l2_sink),
+        backend: VcamBackendMode::V4l2,
+        display_name,
+    })
+}
+
+/// Opens a virtual camera sink according to `mode`, falling back from PipeWire to
+/// `v4l2loopback` when `mode` is [`VcamBackendMode::Auto`].
+pub fn open_virtual_camera(
+    mode: VcamBackendMode,
+    v4l2_path_hint: &str,
+) -> Result<OpenedVcam, VcamError> {
+    match mode {
+        VcamBackendMode::PipeWire => open_pipewire_vcam(),
+        VcamBackendMode::V4l2 => open_v4l2_vcam(v4l2_path_hint),
+        VcamBackendMode::Auto => match open_pipewire_vcam() {
+            Ok(opened) => Ok(opened),
+            Err(pw_err) => {
+                info!(
+                    error = %pw_err,
+                    "PipeWire virtual camera unavailable; falling back to V4L2 loopback"
+                );
+                open_v4l2_vcam(v4l2_path_hint)
+            }
+        },
+    }
+}
+
+/// Loads the `v4l2loopback` kernel module via `pkexec` with CamCraft defaults.
+pub fn enable_v4l2loopback_via_pkexec() -> Result<(), VcamError> {
+    info!("Loading v4l2loopback kernel module via pkexec");
+    let output = Command::new("pkexec")
+        .args([
+            "modprobe",
+            "v4l2loopback",
+            "devices=1",
+            "video_nr=10",
+            "card_label=CamCraft Virtual Camera",
+            "exclusive_caps=1",
+        ])
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let details = if stderr.is_empty() {
+            format!(
+                "pkexec modprobe v4l2loopback exited with status {}",
+                output.status
+            )
+        } else {
+            stderr
+        };
+        return Err(VcamError::DeviceOpen {
+            path: PathBuf::from("/dev/video10"),
+            details,
+        });
+    }
+
+    info!("Loaded v4l2loopback kernel module via pkexec");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -902,6 +1059,72 @@ mod tests {
                 matches!(res, Err(VcamError::InvalidCapabilities { .. })),
                 "Expected InvalidCapabilities for capture-only device, got: {res:?}"
             );
+        }
+    }
+
+    #[test]
+    fn test_vcam_backend_mode_parse_and_labels() {
+        assert_eq!(VcamBackendMode::default(), VcamBackendMode::Auto);
+        assert_eq!(VcamBackendMode::Auto.label(), "Auto");
+        assert_eq!(VcamBackendMode::PipeWire.label(), "PipeWire");
+        assert_eq!(VcamBackendMode::V4l2.label(), "V4L2");
+
+        assert_eq!("auto".parse::<VcamBackendMode>(), Ok(VcamBackendMode::Auto));
+        assert_eq!(
+            "  AUTO ".parse::<VcamBackendMode>(),
+            Ok(VcamBackendMode::Auto)
+        );
+        assert_eq!(
+            "pipewire".parse::<VcamBackendMode>(),
+            Ok(VcamBackendMode::PipeWire)
+        );
+        assert_eq!(
+            "PW".parse::<VcamBackendMode>(),
+            Ok(VcamBackendMode::PipeWire)
+        );
+        assert_eq!("v4l2".parse::<VcamBackendMode>(), Ok(VcamBackendMode::V4l2));
+        assert_eq!(
+            "v4l2loopback".parse::<VcamBackendMode>(),
+            Ok(VcamBackendMode::V4l2)
+        );
+        assert!("unknown".parse::<VcamBackendMode>().is_err());
+    }
+
+    #[test]
+    fn test_open_virtual_camera_fallback_and_path_resolution() {
+        assert_eq!(
+            resolve_v4l2_path("/dev/video12"),
+            PathBuf::from("/dev/video12")
+        );
+        let auto_resolved = resolve_v4l2_path("auto");
+        assert!(auto_resolved.to_string_lossy().starts_with("/dev/video"));
+        let pw_display_resolved = resolve_v4l2_path(PIPEWIRE_DISPLAY_NAME);
+        assert!(
+            pw_display_resolved
+                .to_string_lossy()
+                .starts_with("/dev/video")
+        );
+
+        // Explicit V4L2 against a nonexistent path must fail immediately with DeviceOpen for that path.
+        let missing = "/dev/nonexistent_camcraft_vcam_test";
+        let v4l2_res = open_virtual_camera(VcamBackendMode::V4l2, missing);
+        assert!(matches!(
+            v4l2_res,
+            Err(VcamError::DeviceOpen { ref path, .. }) if path == Path::new(missing)
+        ));
+
+        // Auto falls back to V4L2 using `v4l2_path_hint` if PipeWire daemon is unreachable.
+        let auto_res = open_virtual_camera(VcamBackendMode::Auto, missing);
+        match auto_res {
+            Ok(mut opened) => {
+                assert_eq!(opened.backend, VcamBackendMode::PipeWire);
+                assert!(opened.sink.is_open());
+                assert!(opened.sink.close().is_ok());
+            }
+            Err(VcamError::DeviceOpen { ref path, .. }) => {
+                assert_eq!(path, Path::new(missing));
+            }
+            Err(other) => panic!("unexpected open_virtual_camera(Auto) error: {other:?}"),
         }
     }
 }
