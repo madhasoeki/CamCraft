@@ -9,11 +9,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use camcraft_core::client::StreamStats;
 use camcraft_core::discovery::{DiscoveredDevice, DiscoveryEvent};
+use camcraft_core::vcam::VcamBackendMode;
 use camcraft_core::vmic::{AudioLevelMetrics, DEFAULT_SOURCE_DESCRIPTION};
 use camcraft_protocol::{ActiveCameraState, CameraInfo, ControlCmd, ControlHello, DEFAULT_PORT};
 use eframe::egui;
 use session::{
     ConnectionMode, GuiCommand, GuiSession, GuiUpdate, PerformanceProfile, UpdateUiState,
+    UsbTransportMode,
 };
 use theme::COLOR_BG_CANVAS;
 use tracing::info;
@@ -101,6 +103,17 @@ pub(crate) struct CamCraftApp {
     pub(crate) cameras: Vec<CameraInfo>,
 
     // Connection settings
+    pub(crate) usb_transport: UsbTransportMode,
+    pub(crate) udev_rules_installed: bool,
+    pub(crate) usb_permission_denied: bool,
+    pub(crate) installing_udev_rules: bool,
+    pub(crate) udev_install_feedback: Option<(bool, String)>,
+    pub(crate) vcam_backend: VcamBackendMode,
+    pub(crate) vcam_active_backend: Option<VcamBackendMode>,
+    pub(crate) vcam_active_label: Option<String>,
+    pub(crate) pipewire_unavailable: bool,
+    pub(crate) enabling_v4l2: bool,
+    pub(crate) v4l2_enable_feedback: Option<(bool, String)>,
     pub(crate) vcam_device: String,
     pub(crate) vcam_active: bool,
     pub(crate) vcam_standby: bool,
@@ -165,6 +178,17 @@ impl CamCraftApp {
             status_message: None,
             device_name: None,
             cameras: Vec::new(),
+            usb_transport: UsbTransportMode::default(),
+            udev_rules_installed: true,
+            usb_permission_denied: false,
+            installing_udev_rules: false,
+            udev_install_feedback: None,
+            vcam_backend: VcamBackendMode::default(),
+            vcam_active_backend: None,
+            vcam_active_label: None,
+            pipewire_unavailable: false,
+            enabling_v4l2: false,
+            v4l2_enable_feedback: None,
             vcam_device: "/dev/video10".to_owned(),
             vcam_active: false,
             vcam_standby: false,
@@ -216,6 +240,9 @@ impl CamCraftApp {
                 GuiUpdate::Connected(mode) => {
                     self.status = ConnectionStatus::Connected(mode);
                     self.vcam_standby = false;
+                    if mode == ConnectionMode::UsbAoa {
+                        self.usb_permission_denied = false;
+                    }
                     self.status_message = None;
                 }
                 GuiUpdate::Reconnecting {
@@ -266,16 +293,30 @@ impl CamCraftApp {
                         .retain(|d| d.service_fullname != service_fullname);
                 }
                 GuiUpdate::VcamStatus {
-                    path,
+                    backend,
+                    display_label,
+                    v4l2_path,
                     active,
                     standby,
+                    pipewire_unavailable,
                     error,
                 } => {
-                    if !path.is_empty() {
+                    if let Some(path) = v4l2_path
+                        && !path.is_empty()
+                    {
                         self.vcam_device = path;
                     }
+                    self.vcam_active_backend = backend;
+                    self.vcam_active_label = if active && !display_label.is_empty() {
+                        Some(display_label)
+                    } else {
+                        None
+                    };
                     self.vcam_active = active;
                     self.vcam_standby = standby;
+                    if let Some(unavail) = pipewire_unavailable {
+                        self.pipewire_unavailable = unavail;
+                    }
                     if let Some(err) = error {
                         self.status_message = Some(format!("Virtual camera inactive: {err}"));
                     }
@@ -294,6 +335,33 @@ impl CamCraftApp {
                     self.vmic_active = active;
                     self.vmic_error = error;
                 }
+                GuiUpdate::EnvironmentProbe {
+                    pipewire_available,
+                    udev_rules_installed,
+                } => {
+                    self.pipewire_unavailable = !pipewire_available;
+                    self.udev_rules_installed = udev_rules_installed;
+                }
+                GuiUpdate::V4l2EnableResult { ok, message } => {
+                    self.enabling_v4l2 = false;
+                    self.v4l2_enable_feedback = Some((ok, message));
+                }
+                GuiUpdate::UdevInstallResult {
+                    ok,
+                    udev_rules_installed,
+                    message,
+                } => {
+                    self.installing_udev_rules = false;
+                    self.udev_rules_installed = udev_rules_installed;
+                    if ok {
+                        self.usb_permission_denied = false;
+                    }
+                    self.udev_install_feedback = Some((ok, message));
+                }
+                GuiUpdate::UsbPermissionDenied(msg) => {
+                    self.usb_permission_denied = true;
+                    self.udev_install_feedback = Some((false, msg));
+                }
                 GuiUpdate::UpdateState(next) => {
                     if matches!(
                         next,
@@ -301,6 +369,7 @@ impl CamCraftApp {
                             | UpdateUiState::Downloading { .. }
                             | UpdateUiState::Installing { .. }
                             | UpdateUiState::RestartRequired { .. }
+                            | UpdateUiState::PackageDownloaded { .. }
                             | UpdateUiState::Failed { .. }
                     ) {
                         self.update_banner_dismissed = false;
@@ -385,6 +454,8 @@ impl CamCraftApp {
         self.status = ConnectionStatus::Disconnected;
         self.vcam_active = false;
         self.vcam_standby = false;
+        self.vcam_active_backend = None;
+        self.vcam_active_label = None;
         self.vmic_active = false;
         self.vmic_error = None;
         self.applied_stream = None;
@@ -474,7 +545,9 @@ impl CamCraftApp {
 
     pub(crate) fn connect_usb(&self) {
         self.session.send(GuiCommand::ConnectUsb {
+            transport: self.usb_transport,
             port: DEFAULT_PORT,
+            vcam_backend: self.vcam_backend,
             vcam_device: self.vcam_device.clone(),
             auto_reconnect: self.auto_reconnect,
         });
@@ -484,9 +557,51 @@ impl CamCraftApp {
         self.wifi_endpoint = endpoint.clone();
         self.session.send(GuiCommand::ConnectWifi {
             endpoint,
+            vcam_backend: self.vcam_backend,
             vcam_device: self.vcam_device.clone(),
             auto_reconnect: self.auto_reconnect,
         });
+    }
+
+    pub(crate) fn enable_legacy_v4l2(&mut self) {
+        if self.enabling_v4l2 {
+            return;
+        }
+        self.enabling_v4l2 = true;
+        self.v4l2_enable_feedback = None;
+        self.session.send(GuiCommand::EnableLegacyV4l2);
+    }
+
+    pub(crate) fn install_usb_udev_rules(&mut self) {
+        if self.installing_udev_rules {
+            return;
+        }
+        self.installing_udev_rules = true;
+        self.udev_install_feedback = None;
+        self.session.send(GuiCommand::InstallUsbUdevRules);
+    }
+
+    pub(crate) fn should_show_legacy_v4l2_controls(&self) -> bool {
+        should_show_legacy_v4l2_controls_for(self.vcam_backend, self.pipewire_unavailable)
+    }
+
+    pub(crate) fn should_show_grant_usb_access(&self) -> bool {
+        should_show_grant_usb_access_for(
+            self.usb_transport,
+            self.usb_permission_denied,
+            self.udev_rules_installed,
+        )
+    }
+
+    pub(crate) fn vcam_status_target_label(&self) -> &str {
+        vcam_status_target_label_for(
+            self.vcam_active,
+            self.vcam_active_label.as_deref(),
+            self.vcam_active_backend,
+            self.vcam_backend,
+            self.pipewire_unavailable,
+            &self.vcam_device,
+        )
     }
 
     pub(crate) fn set_performance_profile(&mut self, profile: PerformanceProfile) {
@@ -667,6 +782,58 @@ impl eframe::App for CamCraftApp {
 }
 
 #[must_use]
+pub(crate) const fn should_show_legacy_v4l2_controls_for(
+    vcam_backend: VcamBackendMode,
+    pipewire_unavailable: bool,
+) -> bool {
+    matches!(vcam_backend, VcamBackendMode::V4l2) || pipewire_unavailable
+}
+
+#[must_use]
+pub(crate) const fn should_show_grant_usb_access_for(
+    usb_transport: UsbTransportMode,
+    usb_permission_denied: bool,
+    udev_rules_installed: bool,
+) -> bool {
+    usb_permission_denied
+        || (matches!(usb_transport, UsbTransportMode::DirectAoa) && !udev_rules_installed)
+}
+
+#[must_use]
+pub(crate) fn vcam_status_target_label_for<'a>(
+    vcam_active: bool,
+    vcam_active_label: Option<&'a str>,
+    vcam_active_backend: Option<VcamBackendMode>,
+    vcam_backend: VcamBackendMode,
+    pipewire_unavailable: bool,
+    vcam_device: &'a str,
+) -> &'a str {
+    if vcam_active {
+        if let Some(label) = vcam_active_label
+            && !label.is_empty()
+        {
+            return label;
+        }
+        if matches!(vcam_active_backend, Some(VcamBackendMode::PipeWire)) {
+            return "PipeWire";
+        }
+    }
+
+    match vcam_backend {
+        VcamBackendMode::Auto if !pipewire_unavailable => "PipeWire",
+        VcamBackendMode::PipeWire => "PipeWire",
+        _ => {
+            let trimmed = vcam_device.trim();
+            if trimmed.is_empty() || trimmed == "auto" {
+                "/dev/video10"
+            } else {
+                trimmed
+            }
+        }
+    }
+}
+
+#[must_use]
 pub(crate) const fn next_rotation_cw(deg: i32) -> i32 {
     match deg {
         0 => 90,
@@ -810,5 +977,106 @@ mod tests {
         let (w3, h3) = panels::fit_aspect(1000.0, 500.0, 9.0 / 16.0);
         assert!((h3 - 500.0).abs() < 0.01);
         assert!((w3 - 281.25).abs() < 0.01);
+    }
+
+    #[test]
+    fn legacy_v4l2_controls_only_shown_when_selected_or_pipewire_unavailable() {
+        assert!(!should_show_legacy_v4l2_controls_for(
+            VcamBackendMode::Auto,
+            false
+        ));
+        assert!(!should_show_legacy_v4l2_controls_for(
+            VcamBackendMode::PipeWire,
+            false
+        ));
+        assert!(should_show_legacy_v4l2_controls_for(
+            VcamBackendMode::Auto,
+            true
+        ));
+        assert!(should_show_legacy_v4l2_controls_for(
+            VcamBackendMode::PipeWire,
+            true
+        ));
+        assert!(should_show_legacy_v4l2_controls_for(
+            VcamBackendMode::V4l2,
+            false
+        ));
+    }
+
+    #[test]
+    fn grant_usb_access_visibility_covers_missing_udev_and_permission_denied() {
+        assert!(!should_show_grant_usb_access_for(
+            UsbTransportMode::DirectAoa,
+            false,
+            true
+        ));
+        assert!(should_show_grant_usb_access_for(
+            UsbTransportMode::DirectAoa,
+            false,
+            false
+        ));
+        assert!(should_show_grant_usb_access_for(
+            UsbTransportMode::DirectAoa,
+            true,
+            true
+        ));
+        assert!(!should_show_grant_usb_access_for(
+            UsbTransportMode::LegacyAdb,
+            false,
+            false
+        ));
+        assert!(should_show_grant_usb_access_for(
+            UsbTransportMode::LegacyAdb,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn vcam_status_target_label_prefers_active_backend_label() {
+        assert_eq!(
+            vcam_status_target_label_for(
+                true,
+                Some("PipeWire"),
+                Some(VcamBackendMode::PipeWire),
+                VcamBackendMode::Auto,
+                false,
+                "/dev/video10"
+            ),
+            "PipeWire"
+        );
+        assert_eq!(
+            vcam_status_target_label_for(
+                true,
+                Some("/dev/video10"),
+                Some(VcamBackendMode::V4l2),
+                VcamBackendMode::Auto,
+                true,
+                "/dev/video10"
+            ),
+            "/dev/video10"
+        );
+        assert_eq!(
+            vcam_status_target_label_for(
+                false,
+                None,
+                None,
+                VcamBackendMode::Auto,
+                false,
+                "/dev/video10"
+            ),
+            "PipeWire"
+        );
+        assert_eq!(
+            vcam_status_target_label_for(
+                false,
+                None,
+                None,
+                VcamBackendMode::V4l2,
+                false,
+                "/dev/video12"
+            ),
+            "/dev/video12"
+        );
     }
 }

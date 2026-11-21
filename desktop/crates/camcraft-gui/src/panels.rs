@@ -3,10 +3,11 @@
 //! - Left 70% Cinema Preview Canvas with Rule-of-Thirds grid & floating quick actions
 //! - Right 30% Tabbed Inspector (`Connect` | `Camera` | `Audio`)
 
+use camcraft_core::vcam::VcamBackendMode;
 use camcraft_protocol::{CameraInfo, ControlCmd};
 use eframe::egui::{self, Color32, Pos2, Rect, Stroke, Vec2};
 
-use crate::session::{GuiCommand, PerformanceProfile, UpdateUiState};
+use crate::session::{GuiCommand, PerformanceProfile, UpdateUiState, UsbTransportMode};
 use crate::theme::{
     self, COLOR_ACCENT_BLUE, COLOR_BG_CANVAS, COLOR_BG_STAGE, COLOR_BORDER_SUBTLE,
     COLOR_STATUS_AMBER, COLOR_STATUS_EMERALD, COLOR_STATUS_ROSE, COLOR_SURFACE_CARD,
@@ -194,12 +195,13 @@ pub(crate) fn render_telemetry_bar(app: &mut CamCraftApp, ui: &mut egui::Ui) {
 
                 separator_dot(ui);
 
+                let vcam_target = app.vcam_status_target_label();
                 let (vcam_label, vcam_dot) = if app.vcam_active && app.vcam_standby {
-                    (format!("{} Standby", app.vcam_device), COLOR_STATUS_AMBER)
+                    (format!("{vcam_target} Standby"), COLOR_STATUS_AMBER)
                 } else if app.vcam_active {
-                    (format!("{} Active", app.vcam_device), COLOR_STATUS_EMERALD)
+                    (format!("{vcam_target} Active"), COLOR_STATUS_EMERALD)
                 } else {
-                    (format!("{} Inactive", app.vcam_device), COLOR_TEXT_MUTED)
+                    (format!("{vcam_target} Inactive"), COLOR_TEXT_MUTED)
                 };
                 theme::pill_badge_dot(
                     ui,
@@ -236,7 +238,7 @@ pub(crate) fn render_telemetry_bar(app: &mut CamCraftApp, ui: &mut egui::Ui) {
                         Vec2::new(108.0, 26.0),
                     )
                     .on_hover_text(
-                        "Preview performance profile (does not affect /dev/video10 quality)",
+                        "Preview performance profile (does not affect virtual camera output quality)",
                     );
 
                     egui::Popup::menu(&perf_resp).show(|ui| {
@@ -296,6 +298,7 @@ pub(crate) fn render_update_banner(app: &mut CamCraftApp, ui: &mut egui::Ui) {
             | UpdateUiState::Downloading { .. }
             | UpdateUiState::Installing { .. }
             | UpdateUiState::RestartRequired { .. }
+            | UpdateUiState::PackageDownloaded { .. }
             | UpdateUiState::Failed { .. }
     );
     if !should_render {
@@ -303,7 +306,9 @@ pub(crate) fn render_update_banner(app: &mut CamCraftApp, ui: &mut egui::Ui) {
     }
 
     let accent_border = match &state {
-        UpdateUiState::RestartRequired { .. } => COLOR_STATUS_EMERALD.gamma_multiply(0.5),
+        UpdateUiState::RestartRequired { .. } | UpdateUiState::PackageDownloaded { .. } => {
+            COLOR_STATUS_EMERALD.gamma_multiply(0.5)
+        }
         UpdateUiState::Failed { .. } => COLOR_STATUS_ROSE.gamma_multiply(0.55),
         _ => COLOR_ACCENT_BLUE.gamma_multiply(0.5),
     };
@@ -451,6 +456,74 @@ pub(crate) fn render_update_banner(app: &mut CamCraftApp, ui: &mut egui::Ui) {
                             {
                                 app.update_banner_dismissed = true;
                             }
+                        });
+                    });
+                }
+                UpdateUiState::PackageDownloaded {
+                    version,
+                    path,
+                    install_command,
+                } => {
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            theme::pill_badge(
+                                ui,
+                                &format!("Package v{version} Ready"),
+                                COLOR_STATUS_EMERALD,
+                                COLOR_STATUS_EMERALD.gamma_multiply(0.16),
+                            );
+                            ui.label(
+                                egui::RichText::new(
+                                    "Installer opened — or install in terminal (no restart needed until installed):",
+                                )
+                                .color(COLOR_TEXT_PRIMARY)
+                                .small(),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui
+                                    .add_sized(
+                                        [62.0, 24.0],
+                                        egui::Button::new(
+                                            egui::RichText::new("Dismiss")
+                                                .color(COLOR_TEXT_SECONDARY)
+                                                .small(),
+                                        )
+                                        .fill(COLOR_SURFACE_ELEVATED),
+                                    )
+                                    .clicked()
+                                {
+                                    app.update_banner_dismissed = true;
+                                }
+                                if ui
+                                    .add_sized(
+                                        [104.0, 24.0],
+                                        egui::Button::new(
+                                            egui::RichText::new("Copy Command")
+                                                .color(COLOR_BG_STAGE)
+                                                .strong()
+                                                .small(),
+                                        )
+                                        .fill(COLOR_STATUS_EMERALD),
+                                    )
+                                    .clicked()
+                                {
+                                    ui.ctx().copy_text(install_command.clone());
+                                }
+                            });
+                        });
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(&install_command)
+                                    .color(COLOR_TEXT_PRIMARY)
+                                    .monospace()
+                                    .small(),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("({})", path.display()))
+                                    .color(COLOR_TEXT_MUTED)
+                                    .small(),
+                            );
                         });
                     });
                 }
@@ -700,7 +773,7 @@ fn render_live_canvas_overlays(app: &mut CamCraftApp, ui: &mut egui::Ui, stage_r
                     Some(StudioIcon::Mirror),
                     "Mirror [H]",
                 )
-                .on_hover_text("Flip video horizontally on preview & /dev/video10 (H)");
+                .on_hover_text("Flip video horizontally on preview & virtual camera (H)");
                 if mirror_resp.clicked() {
                     app.toggle_mirror();
                 }
@@ -711,7 +784,7 @@ fn render_live_canvas_overlays(app: &mut CamCraftApp, ui: &mut egui::Ui, stage_r
                     Some(StudioIcon::Rotate),
                     &format!("Rotate {}° [R]", app.rotation_deg),
                 )
-                .on_hover_text("Rotate +90° clockwise on preview & /dev/video10 (R)");
+                .on_hover_text("Rotate +90° clockwise on preview & virtual camera (R)");
                 if rot_resp.clicked() {
                     app.rotate_cw_90();
                 }
@@ -768,10 +841,11 @@ fn render_paused_preview_card(app: &mut CamCraftApp, ui: &mut egui::Ui, stage_re
             );
             ui.add_space(4.0);
 
+            let vcam_target = app.vcam_status_target_label();
             let vcam_status = if app.vcam_active {
-                format!("{} Active (OBS / Browser / Discord Ready)", app.vcam_device)
+                format!("{vcam_target} Active (OBS / Browser / Discord Ready)")
             } else {
-                format!("{} Inactive", app.vcam_device)
+                format!("{vcam_target} Inactive")
             };
             ui.label(
                 egui::RichText::new(vcam_status)
@@ -824,11 +898,11 @@ fn render_reconnecting_stage_card(
                 .strong(),
             );
             if app.vcam_active {
+                let vcam_target = app.vcam_status_target_label();
                 ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new(format!(
-                        "{} remains active in Standby Frame mode (OBS/Discord safe)",
-                        app.vcam_device
+                        "{vcam_target} remains active in Standby Frame mode (OBS/Discord safe)"
                     ))
                     .color(COLOR_TEXT_MUTED)
                     .small(),
@@ -852,23 +926,27 @@ fn render_disconnected_quickstart_card(app: &mut CamCraftApp, ui: &mut egui::Ui,
         });
         ui.add_space(8.0);
 
-        step_row(ui, "1", "Start CamCraft Server on your Android phone.");
+        step_row(ui, "1", "Open CamCraft on your Android phone.");
         ui.add_space(6.0);
         step_row(
             ui,
             "2",
-            "Connect via USB (ADB) or pick a Wi-Fi device in the Connect tab.",
+            "Plug in USB & tap Allow, or pick Wi-Fi in the Connect tab.",
         );
         ui.add_space(12.0);
 
+        let cta_label = match app.usb_transport {
+            UsbTransportMode::DirectAoa => "Connect via USB (Plug & Play)",
+            UsbTransportMode::LegacyAdb => "Connect via USB (ADB)",
+        };
         ui.add_enabled_ui(!app.is_busy(), |ui| {
             if theme::icon_action_button(
                 ui,
                 StudioIcon::Usb,
-                "Quick Connect via USB (ADB)",
+                cta_label,
                 COLOR_ACCENT_BLUE,
                 COLOR_TEXT_PRIMARY,
-                Vec2::new(ui.available_width().min(240.0), 32.0),
+                Vec2::new(ui.available_width().min(250.0), 32.0),
             )
             .clicked()
             {
@@ -895,8 +973,8 @@ fn render_centered_stage_card(
     stage_rect: Rect,
     add_contents: impl FnOnce(&mut egui::Ui),
 ) {
-    let card_w = 440.0_f32.min((stage_rect.width() - 32.0).max(200.0));
-    let card_h = 190.0_f32.min((stage_rect.height() - 32.0).max(120.0));
+    let card_w = 450.0_f32.min((stage_rect.width() - 32.0).max(200.0));
+    let card_h = 204.0_f32.min((stage_rect.height() - 32.0).max(120.0));
     let card_rect = Rect::from_center_size(stage_rect.center(), Vec2::new(card_w, card_h));
     let mut child = ui.new_child(
         egui::UiBuilder::new()
@@ -939,19 +1017,48 @@ fn render_connect_tab(app: &mut CamCraftApp, ui: &mut egui::Ui) {
         ui.add_space(8.0);
 
         ui.add_enabled_ui(!app.is_busy(), |ui| {
+            theme::field_label(ui, "USB Transport");
+            theme::segmented_tab_proportional(
+                ui,
+                &mut app.usb_transport,
+                &[
+                    (
+                        UsbTransportMode::DirectAoa,
+                        UsbTransportMode::DirectAoa.label(),
+                    ),
+                    (
+                        UsbTransportMode::LegacyAdb,
+                        UsbTransportMode::LegacyAdb.label(),
+                    ),
+                ],
+            );
+            ui.add_space(8.0);
+
+            let (usb_label, usb_tooltip) = match app.usb_transport {
+                UsbTransportMode::DirectAoa => (
+                    "Connect via USB (Plug & Play)",
+                    "Connects directly over USB AOA (no Developer Options or USB Debugging needed)",
+                ),
+                UsbTransportMode::LegacyAdb => (
+                    "Connect via USB (ADB)",
+                    "Runs adb forward tcp:9876 tcp:9876 and connects",
+                ),
+            };
             let usb_resp = theme::icon_action_button(
                 ui,
                 StudioIcon::Usb,
-                "Connect via USB (ADB)",
+                usb_label,
                 COLOR_ACCENT_BLUE,
                 COLOR_TEXT_PRIMARY,
                 Vec2::new(ui.available_width(), 32.0),
             )
-            .on_hover_text("Runs adb forward tcp:9876 tcp:9876 and connects");
+            .on_hover_text(usb_tooltip);
             if usb_resp.clicked() {
                 app.connect_usb();
             }
         });
+
+        render_usb_access_callout(app, ui);
 
         ui.add_space(10.0);
         ui.horizontal(|ui| {
@@ -1124,18 +1231,7 @@ fn render_connect_tab(app: &mut CamCraftApp, ui: &mut egui::Ui) {
     });
 
     ui.add_space(10.0);
-    theme::card_frame().show(ui, |ui| {
-        ui.set_min_width(ui.available_width());
-        theme::section_title(ui, "Virtual Camera & Resilience");
-        ui.add_space(6.0);
-
-        theme::field_label(ui, "V4L2 Loopback Device");
-        ui.add_enabled_ui(!app.is_busy(), |ui| {
-            ui.add(egui::TextEdit::singleline(&mut app.vcam_device).desired_width(f32::INFINITY));
-            ui.add_space(6.0);
-            ui.checkbox(&mut app.auto_reconnect, "Auto-Reconnect on Drop (2s)");
-        });
-    });
+    render_vcam_section(app, ui);
 
     ui.add_space(10.0);
     theme::card_frame().show(ui, |ui| {
@@ -1179,6 +1275,182 @@ fn render_connect_tab(app: &mut CamCraftApp, ui: &mut egui::Ui) {
     });
 
     ui.add_space(10.0);
+    render_updates_card(app, ui);
+}
+
+fn render_usb_access_callout(app: &mut CamCraftApp, ui: &mut egui::Ui) {
+    let show_callout = app.should_show_grant_usb_access() || app.udev_install_feedback.is_some();
+    if !show_callout {
+        return;
+    }
+
+    ui.add_space(8.0);
+    let border_color = if app.usb_permission_denied {
+        COLOR_STATUS_ROSE.gamma_multiply(0.6)
+    } else if !app.udev_rules_installed {
+        COLOR_STATUS_AMBER.gamma_multiply(0.55)
+    } else {
+        COLOR_STATUS_EMERALD.gamma_multiply(0.5)
+    };
+
+    egui::Frame::new()
+        .fill(COLOR_BG_STAGE)
+        .stroke(Stroke::new(1.0, border_color))
+        .corner_radius(6.0)
+        .inner_margin(8.0)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            if app.should_show_grant_usb_access() {
+                let prompt = if app.usb_permission_denied {
+                    "USB access was denied by the OS. Grant udev permissions once for Plug & Play USB."
+                } else {
+                    "USB udev rules are not installed (e.g. AppImage). Grant access once for Plug & Play USB."
+                };
+                ui.label(
+                    egui::RichText::new(prompt)
+                        .color(if app.usb_permission_denied {
+                            COLOR_STATUS_ROSE
+                        } else {
+                            COLOR_STATUS_AMBER
+                        })
+                        .small(),
+                );
+                ui.add_space(6.0);
+
+                ui.add_enabled_ui(!app.installing_udev_rules, |ui| {
+                    let btn_label = if app.installing_udev_rules {
+                        "Granting USB Access..."
+                    } else {
+                        "Grant USB Access"
+                    };
+                    if theme::icon_action_button(
+                        ui,
+                        StudioIcon::Usb,
+                        btn_label,
+                        COLOR_SURFACE_ELEVATED,
+                        COLOR_TEXT_PRIMARY,
+                        Vec2::new(ui.available_width(), 28.0),
+                    )
+                    .on_hover_text("Installs 70-camcraft-aoa.rules via Polkit (pkexec)")
+                    .clicked()
+                    {
+                        app.install_usb_udev_rules();
+                    }
+                });
+            }
+
+            if let Some((ok, ref msg)) = app.udev_install_feedback {
+                if app.should_show_grant_usb_access() {
+                    ui.add_space(4.0);
+                }
+                ui.label(
+                    egui::RichText::new(msg)
+                        .color(if ok {
+                            COLOR_STATUS_EMERALD
+                        } else {
+                            COLOR_STATUS_ROSE
+                        })
+                        .small(),
+                );
+            }
+        });
+}
+
+fn render_vcam_section(app: &mut CamCraftApp, ui: &mut egui::Ui) {
+    theme::card_frame().show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        theme::section_title(ui, "Virtual Camera & Resilience");
+        ui.add_space(6.0);
+
+        theme::field_label(ui, "Virtual Camera Backend");
+        ui.add_enabled_ui(!app.is_busy(), |ui| {
+            theme::segmented_tab_proportional(
+                ui,
+                &mut app.vcam_backend,
+                &[
+                    (VcamBackendMode::Auto, "Auto (PipeWire)"),
+                    (VcamBackendMode::PipeWire, "PipeWire"),
+                    (VcamBackendMode::V4l2, "Legacy V4L2"),
+                ],
+            );
+        });
+        ui.add_space(4.0);
+
+        let hint_text = match app.vcam_backend {
+            VcamBackendMode::Auto if !app.pipewire_unavailable => {
+                "Zero-setup PipeWire virtual camera enabled (falls back to V4L2 if needed)."
+            }
+            VcamBackendMode::PipeWire if !app.pipewire_unavailable => {
+                "Uses native PipeWire Video/Source sink (no kernel module needed)."
+            }
+            VcamBackendMode::Auto | VcamBackendMode::PipeWire => {
+                "PipeWire virtual camera unavailable on this host — configure Legacy V4L2 below."
+            }
+            VcamBackendMode::V4l2 => "Uses legacy v4l2loopback kernel device (/dev/video*).",
+        };
+        ui.label(
+            egui::RichText::new(hint_text)
+                .color(
+                    if app.pipewire_unavailable && app.vcam_backend != VcamBackendMode::V4l2 {
+                        COLOR_STATUS_AMBER
+                    } else {
+                        COLOR_TEXT_MUTED
+                    },
+                )
+                .small(),
+        );
+
+        if app.should_show_legacy_v4l2_controls() {
+            ui.add_space(8.0);
+            theme::field_label(ui, "V4L2 Loopback Device");
+            ui.add_enabled_ui(!app.is_busy(), |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.vcam_device).desired_width(f32::INFINITY),
+                );
+            });
+            ui.add_space(6.0);
+            ui.add_enabled_ui(!app.is_busy() && !app.enabling_v4l2, |ui| {
+                let btn_label = if app.enabling_v4l2 {
+                    "Enabling Legacy V4L2..."
+                } else {
+                    "Enable Legacy V4L2 (Polkit)"
+                };
+                if theme::icon_action_button(
+                    ui,
+                    StudioIcon::Camera,
+                    btn_label,
+                    COLOR_SURFACE_ELEVATED,
+                    COLOR_TEXT_PRIMARY,
+                    Vec2::new(ui.available_width(), 28.0),
+                )
+                .on_hover_text("Runs pkexec modprobe v4l2loopback on /dev/video10")
+                .clicked()
+                {
+                    app.enable_legacy_v4l2();
+                }
+            });
+            if let Some((ok, ref msg)) = app.v4l2_enable_feedback {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(msg)
+                        .color(if ok {
+                            COLOR_STATUS_EMERALD
+                        } else {
+                            COLOR_STATUS_ROSE
+                        })
+                        .small(),
+                );
+            }
+        }
+
+        ui.add_space(6.0);
+        ui.add_enabled_ui(!app.is_busy(), |ui| {
+            ui.checkbox(&mut app.auto_reconnect, "Auto-Reconnect on Drop (2s)");
+        });
+    });
+}
+
+fn render_updates_card(app: &mut CamCraftApp, ui: &mut egui::Ui) {
     theme::card_frame().show(ui, |ui| {
         ui.set_min_width(ui.available_width());
         ui.horizontal(|ui| {
@@ -1212,6 +1484,9 @@ fn render_connect_tab(app: &mut CamCraftApp, ui: &mut egui::Ui) {
                     UpdateUiState::RestartRequired { .. } => {
                         ("Restart ready", COLOR_STATUS_EMERALD)
                     }
+                    UpdateUiState::PackageDownloaded { .. } => {
+                        ("Package ready", COLOR_STATUS_EMERALD)
+                    }
                     UpdateUiState::Failed { .. } => ("Check failed", COLOR_STATUS_ROSE),
                     UpdateUiState::Idle => ("Ready", COLOR_TEXT_MUTED),
                 };
@@ -1223,6 +1498,53 @@ fn render_connect_tab(app: &mut CamCraftApp, ui: &mut egui::Ui) {
                 )
             });
         });
+
+        if let UpdateUiState::PackageDownloaded {
+            version,
+            path,
+            install_command,
+        } = &app.update_state
+        {
+            ui.add_space(6.0);
+            let cmd = install_command.clone();
+            egui::Frame::new()
+                .fill(COLOR_BG_STAGE)
+                .stroke(Stroke::new(1.0, COLOR_STATUS_EMERALD.gamma_multiply(0.45)))
+                .corner_radius(6.0)
+                .inner_margin(8.0)
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Downloaded v{version} package to {}:",
+                            path.display()
+                        ))
+                        .color(COLOR_TEXT_SECONDARY)
+                        .small(),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(&cmd)
+                            .color(COLOR_TEXT_PRIMARY)
+                            .monospace()
+                            .small(),
+                    );
+                    ui.add_space(4.0);
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Copy Install Command")
+                                    .color(COLOR_TEXT_PRIMARY)
+                                    .small(),
+                            )
+                            .fill(COLOR_SURFACE_ELEVATED),
+                        )
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(cmd);
+                    }
+                });
+        }
 
         ui.add_space(8.0);
         let check_busy = matches!(

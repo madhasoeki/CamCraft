@@ -21,16 +21,17 @@ Dokumen ini menjabarkan arsitektur internal **CamCraft** (CamCraft Studio v2), p
 |                                              |     (+ FLAG_MIRROR_H /       |
 |  [AudioRecord 48kHz] ---> [AudioStreamEngine]|      FLAG_ROTATE_* metadata) |
 |                           (Zero-alloc PCM) --+           |                  |
-+----------------------------------------------|-----------|------------------+
-                                               | (TCP Port 9876, TCP_NODELAY:
-                                               |  USB ADB Forward or Wi-Fi)
-                                               v
++----------------------------------------------|------------------|---------------+
+                                               | (USB AOA v1 Bulk | Wi-Fi / ADB
+                                               |  Plug & Play     | TCP Port 9876,
+                                               |  16KiB Chunks)   | TCP_NODELAY)
+                                               v                  v
 +-----------------------------------------------------------------------------+
-| FEDORA LINUX DESKTOP (Native Rust, 2024 Edition)                            |
+| LINUX DESKTOP (Native Rust, 2024 Edition — Fedora/Ubuntu AppImage/RPM/DEB)  |
 |                                              |                              |
-|  [CamCraft Studio GUI] <---------------------+     [Tokio TCP Reader]       |
-|  (eframe + glow OpenGL +                     |     (current_thread di GUI,  |
-|   winit wayland-csd-adwaita)                 |      256 KiB buffer, biased) |
+|  [CamCraft Studio GUI] <---------------------+     [Tokio / AOA Reader]     |
+|  (eframe + glow OpenGL +                     |     (usbdevfs AOA bridge     |
+|   winit wayland-csd-adwaita)                 |      or 256 KiB TCP socket)  |
 |         ^                                    |               |              |
 |         | (Recycled RGBA Buffer,             |               v              |
 |         |  Event-Driven Repaint,             |     [CCFT Frame Demuxer]     |
@@ -42,7 +43,8 @@ Dokumen ini menjabarkan arsitektur internal **CamCraft** (CamCraft Studio v2), p
 |   In-Pipeline YUV420P Mirror/Rotate)         |                        v     |
 |         |                                    |           [PipeWire VMic]    |
 |         v (YUV420P, 1:1 parity w/ Preview)   |           (pacat ->          |
-|  [/dev/video10 (v4l2loopback, FD_CLOEXEC)]   |            camcraft_virtual_mic)
+|  [PipeWire Video/Source (Zero-Setup dlopen)] |            camcraft_virtual_mic)
+|   `-> Fallback: [/dev/video10 v4l2loopback]  |                              |
 +-----------------------------------------------------------------------------+
 ```
 
@@ -73,9 +75,9 @@ Dokumen ini menjabarkan arsitektur internal **CamCraft** (CamCraft Studio v2), p
    - Membaca sampel suara dari `AudioRecord` (`AudioSource.MIC`, 48.000 Hz, 16-bit PCM Mono, 960 sampel / 1.920 byte per frame 20 ms) menggunakan buffer PCM tetap dan buffer senyap terpra-alokasi saat kondisi *mute* (tanpa alokasi per-frame).
    - Mengirimkan `AUDIO_CONFIG (0x03)` (`"pcm_s16le"` sebagai baseline *ultra-low latency*, dengan dukungan ekstensi `"opus"`) diikuti aliran `AUDIO_FRAME (0x04)`.
 
-4. **`CamCraftStreamService` & `MdnsAdvertiser` (`network/`):**
-   - Berjalan sebagai **Android Foreground Service** (`foregroundServiceType="camera|microphone|connectedDevice"`) dengan ikon notifikasi monokrom `ic_stat_camcraft` dan teks status dinamis (`Connected (<ip>) • WxH @ FPS`).
-   - **Mode Server (USB & Wi-Fi Direct Connect):** Membuka `ServerSocket(9876)` dengan `TCP_NODELAY = true`. Untuk USB, PC Fedora menjalankan `adb forward tcp:9876 tcp:9876` lalu terhubung ke `127.0.0.1:9876`. Untuk Wi-Fi, PC terhubung langsung ke `<IP_HP>:9876`.
+4. **`CamCraftStreamService`, `UsbAccessoryTransport` & `MdnsAdvertiser` (`network/`):**
+   - Berjalan sebagai **Android Foreground Service** (`foregroundServiceType="camera|microphone|connectedDevice"`) dengan ikon notifikasi monokrom `ic_stat_camcraft` dan teks status dinamis (`Connected (<ip|USB Direct>) • WxH @ FPS`).
+   - **Mode Transport Ganda (USB AOA Plug & Play + Wi-Fi / ADB):** Membuka `ServerSocket(9876)` dengan `TCP_NODELAY = true` untuk Wi-Fi LAN (`<IP_HP>:9876`) maupun fallback ADB (`adb forward tcp:9876 tcp:9876`), sekaligus mendukung **Android Open Accessory (AOA v1)** melalui `UsbAccessoryTransport` (`accessory_filter.xml`: `ArtCraft/CamCraft/1.0`, `AoaChunkedOutputStream` berpotongan <= `16_384` byte, `ParcelFileDescriptor` dengan `AtomicBoolean` close guard, dan `ACTION_USB_ACCESSORY_DETACHED` receiver `RECEIVER_NOT_EXPORTED`) sehingga koneksi kabel USB berjalan *Plug & Play* tanpa mengaktifkan USB Debugging.
    - **Mode Discovery (mDNS):** `MdnsAdvertiser` mengiklankan `_camcraft._tcp.local.` melalui `NsdManager` Android serta memilih alamat IPv4 LAN terbaik via `selectBestLocalIpv4`.
    - **Pemisahan Lifecycle UI:** `MainActivity` mengonsumsi `CamCraftStreamService.serviceState` melalui `collectAsStateWithLifecycle()`, mengamati baterai/suhu OS secara pasif lewat `BroadcastReceiver` (`ACTION_BATTERY_CHANGED`), dan hanya meneruskan state serta callback ke *composable* `ui/` yang bersifat *dumb UI* (`AGENTS.md` §5.1).
 
@@ -89,16 +91,18 @@ Dokumen ini menjabarkan arsitektur internal **CamCraft** (CamCraft Studio v2), p
    - Crate murni tanpa dependensi OS/FFI berat.
    - Berisi struktur header biner `PacketHeader` (20 byte Big-Endian sesuai `docs/PROTOCOL.md` §2), enum `PacketType`, bitmask `FrameFlags`, parser *zero-copy* berbasis `bytes`, serta tipe pesan JSON `ControlHello`, `ControlCmd`, `ControlAck`, dan `AudioConfigPayload` (`serde` + `serde_json`).
 2. **`crates/camcraft-core`:**
-   - **`net` & `client`:** Klien TCP asinkron Tokio (`TCP_NODELAY = true`) dengan kapasitas *read buffer* default **256 KiB (`262_144` byte)**, `tokio::select!` berprioritas (`biased;`) memakai `tokio::time::interval` persisten, serta pemindahan kepemilikan `Bytes` payload tanpa `.clone()` pada paket `VIDEO_CONFIG` dan `VIDEO_FRAME` menuju *bounded channel* (`crossbeam_channel::bounded`, membuang frame P non-keyframe saat terjadi *backpressure* agar latensi tetap *real-time*).
-   - **`adb`:** Wrapper untuk menjalankan `adb devices` dan `adb forward tcp:9876 tcp:9876` secara otomatis.
+   - **`net` & `client`:** Klien asinkron Tokio berbasis stream generik `run_client_stream_loop<R, W>` (`run_client_loop` / `run_client_with_reconnect` untuk TCP `TCP_NODELAY = true` dan `run_aoa_client_loop` / `run_aoa_client_with_reconnect` untuk USB AOA) dengan kapasitas *read buffer* default **256 KiB (`262_144` byte)**, `tokio::select!` berprioritas (`biased;`) memakai `tokio::time::interval` persisten, serta pemindahan kepemilikan `Bytes` payload tanpa `.clone()` pada paket `VIDEO_CONFIG` dan `VIDEO_FRAME` menuju *bounded channel* (`crossbeam_channel::bounded`, membuang frame P non-keyframe saat terjadi *backpressure* agar latensi tetap *real-time*).
+   - **`usb_aoa`:** Implementasi murni Rust untuk Linux `usbdevfs` AOA v1 (`/sys/bus/usb/devices` enumerator, `AOA_GET_PROTOCOL` / `AOA_SEND_STRING` / `AOA_START_ACCESSORY`, `O_CLOEXEC`, `UnixStream::pair` bridged oleh worker thread berbuffer 16 KiB tanpa alokasi per-transfer), disertai deteksi aturan udev (`is_udev_rule_installed`) dan penginstal Polkit 1-klik (`install_udev_rules_via_pkexec` untuk `70-camcraft-aoa.rules`).
+   - **`adb`:** Wrapper opsional untuk mode warisan `adb devices` dan `adb forward tcp:9876 tcp:9876` (`--adb` / *Legacy ADB*).
    - **`discovery`:** Scanner mDNS RFC 6762/6763 UDP ringan (`_camcraft._tcp.local.`) tanpa dependensi DBus `avahi-daemon`. Mendukung `MdnsScanner::start_with_handler` (pemrosesan event langsung tanpa thread jembatan) serta `set_active_queries_paused(bool)`.
-   - **`decoder`:** Dekoder H.264 berbasis `ffmpeg-next` (`libavcodec` + `libswscale`) pada thread `camcraft-vdec` yang memproses frame `YUV420P` (untuk V4L2) dan RGBA opsional (untuk preview GUI), dilengkapi `KeyframeRecoveryTracker` dan generator frame *standby/reconnecting*.
-   - **`vcam` (Linux `v4l2loopback` Output Sink):** Membuka `/dev/videoX` (label `"CamCraft"`) yang disediakan [`v4l2loopback`](https://github.com/umlaeute/v4l2loopback), menyetel format piksel `V4L2_PIX_FMT_YUV420` (`YU12`), serta menjaga kelangsungan stream dengan frame statis (*standby/reconnecting card*) saat koneksi terputus agar aplikasi penerima (OBS, Discord/Vesktop, Google Meet/browser) tidak mengalami error I/O.
+   - **`decoder`:** Dekoder H.264 berbasis `ffmpeg-next` (`libavcodec` + `libswscale`) pada thread `camcraft-vdec` yang memproses frame `YUV420P` (untuk V4L2/PipeWire) dan RGBA opsional (untuk preview GUI), dilengkapi `KeyframeRecoveryTracker` dan generator frame *standby/reconnecting*.
+   - **`vcam` (`PipeWireCameraSink` + `V4l2LoopbackSink`):** Memilih backend melalui `open_virtual_camera(VcamBackendMode, ...)`: default `Auto` memprioritaskan **`PipeWireCameraSink`** (`vcam_pw.rs`, memuat `libpipewire-0.3.so.0` secara dinamis via `libc::dlopen`/`dlsym` tanpa `DT_NEEDED` dan mengekspor simpul `Video/Source` `"CamCraft Virtual Camera"` format `I420` secara *zero-setup*), serta otomatis jatuh ke `V4l2LoopbackSink` (`/dev/videoX`, `YU12`, `FD_CLOEXEC`) bila PipeWire tidak tersedia. Menyediakan `enable_v4l2loopback_via_pkexec()` untuk mengaktifkan `v4l2loopback` via Polkit serta memancarkan kartu *standby/reconnecting* agar aplikasi penerima (OBS, Discord/Vesktop, Google Meet/browser) tidak mengalami error I/O.
    - **`vmic` (PipeWire / PulseAudio Virtual Audio Sink):** Mengelola null sink `camcraft_sink` dan virtual microphone source `"CamCraft Virtual Mic"` (`camcraft_virtual_mic`) via `pactl`, menyalurkan PCM 48 kHz Mono S16LE ke `pacat` (fallback `pw-cat`) pada worker berkanal *bounded* (`camcraft-vmic`), serta menghitung metrik RMS/Peak dBFS secara langsung.
+   - **`updater`:** Mendeteksi jenis instalasi (`InstallKind::{AppImage, RpmPackage, DebPackage, PortableArchive}`), memverifikasi `SHA256SUMS.txt`, mengganti `.AppImage`/tarball secara atomik (`InstallAction::ReplacedInPlace`), atau mengunduh paket `.rpm`/`.deb` terverifikasi lengkap dengan perintah instalasi (`InstallAction::DownloadedPackage`).
 3. **`crates/camcraft-cli`:**
-   - Binary ringan berbasis `clap` untuk menjalankan CamCraft dari terminal (`camcraft-cli connect --usb --vcam /dev/video10 --resolution 1080p --fps 60`), memakai `push_frame_with_flags` serta callback langsung tanpa thread jembatan.
+   - Binary ringan berbasis `clap` untuk menjalankan CamCraft dari terminal (`camcraft-cli connect --usb` menggunakan USB AOA + `--vcam-backend auto` secara default; `--adb` untuk fallback ADB forward; `--vcam-backend <auto|pipewire|v4l2>` untuk memilih sink virtual camera; serta `camcraft-cli update` yang menangani pembaruan in-place maupun paket `.rpm`/`.deb`).
 4. **`crates/camcraft-gui`:**
-   - Aplikasi desktop native berbasis `eframe` / `egui` yang dipecah bersih menjadi `main.rs` (*entry point* & *shortcut* keyboard), `session.rs` (*background session manager*), `theme.rs` (*ArtCraft Studio v2 Design System* & ikon vektor `egui::Painter`), dan `panels.rs` (*telemetry strip*, *preview canvas*, dan *tabbed inspector*).
+   - Aplikasi desktop native berbasis `eframe` / `egui` yang dipecah bersih menjadi `main.rs` (*entry point* & *shortcut* keyboard), `session.rs` (*background session manager*), `theme.rs` (*ArtCraft Studio v2 Design System* & ikon vektor `egui::Painter`), dan `panels.rs` (*telemetry strip*, *preview canvas*, *smart updater banner*, dan *tabbed inspector*).
 
 ### 3.2 Optimasi Performa & Sumber Daya Rendah ("Laptop Kentang")
 
@@ -176,16 +180,17 @@ Untuk memenuhi target penggunaan CPU dan memori yang sangat ringan pada laptop s
    - Menampilkan info minimalis (status stream, resolusi/FPS, dan **`batterySummary`** baterai & suhu) yang bergeser antar 8 *waypoint* setiap 30 detik untuk mencegah *burn-in*; ketuk dua kali (*double-tap*) untuk membuka kembali layar kontrol.
    - Menghormati pengaturan aksesibilitas **Reduced Motion** (`Settings.Global.ANIMATOR_DURATION_SCALE == 0f`) dengan memindahkan posisi teks secara instan (*snap*) tanpa interpolasi animasi.
 
-### 4.3 Spesifikasi UI Aplikasi Desktop Fedora (`desktop/crates/camcraft-gui/`)
+### 4.3 Spesifikasi UI Aplikasi Desktop Linux (`desktop/crates/camcraft-gui/`)
 
-1. **Top Studio Telemetry Strip:**
-   - Menampilkan wordmark `CamCraft` + lencana `STUDIO`, pill status koneksi + nama perangkat Android, telemetri monospace tabular (**`WxH • FPS`**, **`Mbps`**, **`Decode ms`** berkode warna *emerald* `< 8 ms` / *amber* `8–15 ms` / *rose* `> 15 ms`, dan **`RTT ms`**), badge **`VCam`** (`/dev/video10`), badge **`VMic`**, serta pill interaktif satu-klik untuk memilih **Laptop Performance Profile / Preview Quality** (`Eco` / `Balanced` / `Crisp` / `Preview Off`).
+1. **Top Studio Telemetry Strip & Smart Updater Banner:**
+   - Menampilkan wordmark `CamCraft` + lencana `STUDIO`, pill status koneksi + nama perangkat Android, telemetri monospace tabular (**`WxH • FPS`**, **`Mbps`**, **`Decode ms`** berkode warna *emerald* `< 8 ms` / *amber* `8–15 ms` / *rose* `> 15 ms`, dan **`RTT ms`**), badge **`VCam`** aktual (`PipeWire Active` vs `/dev/video10 Active`), badge **`VMic`**, serta pill interaktif satu-klik untuk memilih **Laptop Performance Profile / Preview Quality** (`Eco` / `Balanced` / `Crisp` / `Preview Off`).
+   - Banner pembaruan menampilkan *progress* unduhan, tombol **Restart Now** untuk AppImage/portable yang diganti di tempat, atau panel **Package Ready** (`UpdateUiState::PackageDownloaded`) lengkap dengan perintah instalasi `dnf`/`apt` dan tombol **Copy Command** tanpa memaksa restart sebelum paket terpasang.
 2. **Left 70% Cinema Preview Canvas:**
    - Area panggung `#080A0E` dengan bingkai `1px` `#252B37` yang merender frame GPU preview, pill `LIVE` di sudut kiri atas, toggle kisi *Rule-of-Thirds*, dan bilah aksi cepat mengambang di kanan bawah.
-   - **Empty-State & Auto-Pause:** Ketika belum terhubung, menampilkan kartu **2-Step Quick-Start Guide** (koneksi USB ADB atau Wi-Fi LAN); ketika preview dijeda (*Pause Preview* / mode `Eco`) menampilkan kartu ringkas dengan metrik aktif dan status `/dev/video10 Active`; ketika jendela diminimalkan, preview terjeda otomatis (*auto-pause*).
+   - **Empty-State & Auto-Pause:** Ketika belum terhubung, menampilkan kartu **2-Step Quick-Start Guide** (*Step 1: Open CamCraft on phone; Step 2: Plug in USB & tap Allow, or pick Wi-Fi*) dengan tombol cepat **Connect via USB (Plug & Play)**; ketika preview dijeda (*Pause Preview* / mode `Eco`) menampilkan kartu ringkas dengan metrik aktif dan status backend aktual (`PipeWire Active` vs `/dev/video10 Active`); ketika jendela diminimalkan, preview terjeda otomatis (*auto-pause*).
    - **Keyboard Shortcuts** (aktif saat fokus tidak berada di input teks): **`M`** (Mute/Unmute Mic), **`P`** (Pause/Resume Preview), **`H`** (Mirror Horizontal), dan **`R`** (Rotate +90°).
 3. **Right 30% Tabbed Inspector (`Connect` | `Camera` | `Audio`):**
    - Menggunakan navigasi tab tersegmen agar seluruh kontrol mudah dijangkau dalam satu pandangan tanpa *endless scrolling*:
-     - **`Connect`:** Tombol `Connect via USB (ADB)`, daftar perangkat mDNS Wi-Fi dengan tombol `Refresh` dan koneksi 1-klik, input manual `IP:Port` (mendukung tombol `Enter`), path VCam (`/dev/video10`), checkbox `Auto-Reconnect (2s)`, pemilih **Laptop Performance Profile** (`Eco` 480px/~15fps, `Balanced` 640px/~24fps, `Crisp` 960px/~30fps + `Pause Preview`), dan tombol `Disconnect` / `Cancel Reconnect`.
+     - **`Connect`:** Pemilih mode USB **`Direct USB (No Debugging)`** (default `DirectAoa`) vs **`Legacy ADB`**, CTA utama **`Connect via USB (Plug & Play)`** (atau `Connect via USB (ADB)` saat mode ADB), panel bersyarat **`Grant USB Access`** (`install_udev_rules_via_pkexec()`) saat izin USB ditolak atau aturan udev belum terpasang (mis. AppImage), daftar perangkat mDNS Wi-Fi dengan tombol `Refresh` dan koneksi 1-klik, input manual `IP:Port` (mendukung tombol `Enter`), pemilih backend Virtual Camera **`Auto (PipeWire)` | `PipeWire` | `Legacy V4L2`** (default `Auto`), input path `/dev/video10` & tombol **`Enable Legacy V4L2 (Polkit)`** (`enable_v4l2loopback_via_pkexec()`) yang hanya tampil saat `Legacy V4L2` dipilih atau PipeWire tidak tersedia, checkbox `Auto-Reconnect on Drop (2s)`, pemilih **Laptop Performance Profile**, dan kartu **App Version & Updates**.
      - **`Camera`:** Pemilih Lensa, dropdown Resolusi berdasarkan kapabilitas kamera aktif (fallback 720p/1080p/4K), toggle segmen `30 / 60 FPS`, slider Bitrate + chip cepat (`6M` / `12M` / `20M`), tombol `Apply Stream Settings` (disorot saat ada perubahan tertunda), serta *Live Adjustments* (*debounce* 50 ms tanpa restart pipeline: slider Zoom + chip `1x`/`2x`/`3x`, slider Exposure EV + `Reset 0.0`, toggle `Autofocus`, `Torch`, `Mirror Horizontal`, dan segmen Rotasi `0°`/`90°`/`180°`/`270°`).
      - **`Audio`:** Status dan nama *PipeWire Virtual Mic* (`"CamCraft Virtual Mic"`), toggle `Enable Audio Forwarding`, tombol `Mute / Unmute Mic (M)`, serta **Segmented LED dBFS VU Meter** (`-60` hingga `0 dB`) lengkap dengan *peak hold* dan penanda *clipping*.

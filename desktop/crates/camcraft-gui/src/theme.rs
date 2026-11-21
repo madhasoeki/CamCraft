@@ -230,11 +230,32 @@ pub fn segmented_tab<T: Copy + PartialEq>(
     current: &mut T,
     options: &[(T, &str)],
 ) -> bool {
+    render_segmented_control(ui, current, options, false)
+}
+
+/// Renders a width-proportional segmented control for options with varying label lengths.
+pub fn segmented_tab_proportional<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    current: &mut T,
+    options: &[(T, &str)],
+) -> bool {
+    render_segmented_control(ui, current, options, true)
+}
+
+fn render_segmented_control<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    current: &mut T,
+    options: &[(T, &str)],
+    proportional: bool,
+) -> bool {
     if options.is_empty() {
         return false;
     }
 
     let mut changed = false;
+    let enabled = ui.is_enabled();
+    let font_size = if proportional { 12.0 } else { 12.5 };
+
     egui::Frame::new()
         .fill(COLOR_BG_STAGE)
         .stroke(Stroke::new(1.0, COLOR_BORDER_SUBTLE))
@@ -244,22 +265,59 @@ pub fn segmented_tab<T: Copy + PartialEq>(
             let count = options.len() as f32;
             let gap = 4.0;
             let total_gap = gap * (count - 1.0);
-            let seg_w = ((ui.available_width() - total_gap) / count).max(40.0);
+            let avail_for_segs = (ui.available_width() - total_gap).max(40.0 * count);
+
+            let widths: Vec<f32> = if proportional {
+                let raw: Vec<f32> = options
+                    .iter()
+                    .map(|(_, label)| {
+                        let galley = ui.painter().layout_no_wrap(
+                            (*label).to_owned(),
+                            FontId::proportional(font_size),
+                            COLOR_TEXT_PRIMARY,
+                        );
+                        (galley.size().x + 12.0).max(40.0)
+                    })
+                    .collect();
+                let raw_sum: f32 = raw.iter().sum();
+                if raw_sum <= avail_for_segs {
+                    let extra = (avail_for_segs - raw_sum) / count;
+                    raw.into_iter().map(|w| w + extra).collect()
+                } else {
+                    let scale = avail_for_segs / raw_sum;
+                    raw.into_iter().map(|w| (w * scale).max(32.0)).collect()
+                }
+            } else {
+                let seg_w = (avail_for_segs / count).max(40.0);
+                vec![seg_w; options.len()]
+            };
 
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = gap;
-                for &(value, label) in options {
+                for (&(value, label), seg_w) in options.iter().zip(widths) {
                     let selected = *current == value;
                     let (rect, resp) =
                         ui.allocate_exact_size(Vec2::new(seg_w, 26.0), egui::Sense::click());
-                    let fill = if selected {
+                    let fill = if !enabled {
+                        if selected {
+                            COLOR_ACCENT_BLUE.gamma_multiply(0.45)
+                        } else {
+                            Color32::TRANSPARENT
+                        }
+                    } else if selected {
                         COLOR_ACCENT_BLUE
                     } else if resp.hovered() {
                         COLOR_SURFACE_HOVER
                     } else {
                         Color32::TRANSPARENT
                     };
-                    let text_color = if selected || resp.hovered() {
+                    let text_color = if !enabled {
+                        if selected {
+                            COLOR_TEXT_PRIMARY.gamma_multiply(0.7)
+                        } else {
+                            COLOR_TEXT_MUTED
+                        }
+                    } else if selected || resp.hovered() {
                         COLOR_TEXT_PRIMARY
                     } else {
                         COLOR_TEXT_SECONDARY
@@ -268,7 +326,7 @@ pub fn segmented_tab<T: Copy + PartialEq>(
                     if fill != Color32::TRANSPARENT {
                         ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
                     }
-                    if resp.has_focus() {
+                    if enabled && resp.has_focus() {
                         ui.painter().rect_stroke(
                             rect,
                             CornerRadius::same(6),
@@ -280,11 +338,11 @@ pub fn segmented_tab<T: Copy + PartialEq>(
                         rect.center(),
                         egui::Align2::CENTER_CENTER,
                         label,
-                        FontId::proportional(12.5),
+                        FontId::proportional(font_size),
                         text_color,
                     );
 
-                    if resp.clicked() && !selected {
+                    if enabled && resp.clicked() && !selected {
                         *current = value;
                         changed = true;
                     }

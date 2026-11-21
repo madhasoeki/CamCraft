@@ -18,8 +18,14 @@ use camcraft_core::decoder::{
     spawn_decoder_worker_optimized,
 };
 use camcraft_core::discovery::{DiscoveryEvent, MdnsScanner};
-use camcraft_core::updater::{self, ReleaseInfo, UpdateCheckOutcome, UpdateConfig};
-use camcraft_core::vcam::{V4l2LoopbackSink, VirtualCameraSink, find_camcraft_v4l2_device};
+use camcraft_core::updater::{
+    self, InstallAction, InstallOutcome, ReleaseInfo, UpdateCheckOutcome, UpdateConfig,
+};
+use camcraft_core::usb_aoa::{self, UsbAoaError};
+use camcraft_core::vcam::{
+    PipeWireCameraSink, VcamBackendMode, VirtualCameraSink, enable_v4l2loopback_via_pkexec,
+    open_virtual_camera,
+};
 use camcraft_core::vmic::{
     AudioLevelMetrics, AudioWorkerSender, DEFAULT_SOURCE_DESCRIPTION, VirtualMicSink,
     ensure_virtual_mic, run_audio_worker_loop,
@@ -32,10 +38,32 @@ use tracing::{error, info, warn};
 
 const AUDIO_METER_REPAINT_MIN_INTERVAL: Duration = Duration::from_millis(66);
 
+/// USB transport method selected in the desktop GUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UsbTransportMode {
+    /// Direct Android Open Accessory (AOA v1) over Linux `usbdevfs` (no USB Debugging needed).
+    #[default]
+    DirectAoa,
+    /// Legacy Android Debug Bridge (`adb forward tcp:9876 tcp:9876`).
+    LegacyAdb,
+}
+
+impl UsbTransportMode {
+    /// Short label for UI selectors.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::DirectAoa => "Direct USB (No Debugging)",
+            Self::LegacyAdb => "Legacy ADB",
+        }
+    }
+}
+
 /// Transport mode used for the current or pending connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionMode {
-    Usb,
+    UsbAoa,
+    UsbAdb,
     Wifi,
 }
 
@@ -43,7 +71,8 @@ impl ConnectionMode {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Usb => "USB",
+            Self::UsbAoa => "USB",
+            Self::UsbAdb => "USB ADB",
             Self::Wifi => "Wi-Fi",
         }
     }
@@ -119,6 +148,11 @@ pub enum UpdateUiState {
     RestartRequired {
         version: String,
     },
+    PackageDownloaded {
+        version: String,
+        path: PathBuf,
+        install_command: String,
+    },
     Failed {
         message: String,
         retry_release: Option<ReleaseInfo>,
@@ -129,16 +163,21 @@ pub enum UpdateUiState {
 #[derive(Debug, Clone)]
 pub enum GuiCommand {
     ConnectUsb {
+        transport: UsbTransportMode,
         port: u16,
+        vcam_backend: VcamBackendMode,
         vcam_device: String,
         auto_reconnect: bool,
     },
     ConnectWifi {
         endpoint: String,
+        vcam_backend: VcamBackendMode,
         vcam_device: String,
         auto_reconnect: bool,
     },
     RefreshWifiDiscovery,
+    EnableLegacyV4l2,
+    InstallUsbUdevRules,
     Disconnect,
     SendControlCmd(ControlCmd),
     SetAudioState {
@@ -170,9 +209,12 @@ pub enum GuiUpdate {
     Stats(StreamStats),
     Discovery(DiscoveryEvent),
     VcamStatus {
-        path: String,
+        backend: Option<VcamBackendMode>,
+        display_label: String,
+        v4l2_path: Option<String>,
         active: bool,
         standby: bool,
+        pipewire_unavailable: Option<bool>,
         error: Option<String>,
     },
     VmicStatus {
@@ -181,6 +223,20 @@ pub enum GuiUpdate {
         active: bool,
         error: Option<String>,
     },
+    EnvironmentProbe {
+        pipewire_available: bool,
+        udev_rules_installed: bool,
+    },
+    V4l2EnableResult {
+        ok: bool,
+        message: String,
+    },
+    UdevInstallResult {
+        ok: bool,
+        udev_rules_installed: bool,
+        message: String,
+    },
+    UsbPermissionDenied(String),
     UpdateState(UpdateUiState),
     Disconnected(String),
     Error(String),
@@ -431,6 +487,35 @@ async fn run_session_supervisor(
         }
     };
 
+    // Probe PipeWire virtual camera availability & USB udev rules off the UI thread.
+    let update_tx_probe = update_tx.clone();
+    let ctx_probe = ctx.clone();
+    tokio::spawn(async move {
+        let (pw_available, udev_installed) = tokio::task::spawn_blocking(|| {
+            let mut pw = PipeWireCameraSink::new();
+            let pw_ok = match pw.open() {
+                Ok(()) => {
+                    let _ = pw.close();
+                    true
+                }
+                Err(_) => false,
+            };
+            let udev_ok = usb_aoa::is_udev_rule_installed();
+            (pw_ok, udev_ok)
+        })
+        .await
+        .unwrap_or((false, false));
+
+        emit(
+            &update_tx_probe,
+            &ctx_probe,
+            GuiUpdate::EnvironmentProbe {
+                pipewire_available: pw_available,
+                udev_rules_installed: udev_installed,
+            },
+        );
+    });
+
     // Delay silent startup update check slightly so UI paints and mDNS starts first.
     let update_tx_startup = update_tx.clone();
     let ctx_startup = ctx.clone();
@@ -446,22 +531,19 @@ async fn run_session_supervisor(
                     break;
                 };
                 match cmd {
-                    GuiCommand::ConnectUsb { port, vcam_device, auto_reconnect } => {
+                    GuiCommand::ConnectUsb {
+                        transport,
+                        port,
+                        vcam_backend,
+                        vcam_device,
+                        auto_reconnect,
+                    } => {
                         if let Some(conn) = active.take() {
                             conn.stop();
                         }
                         if let Some(ref s) = scanner {
                             s.set_active_queries_paused(false);
                         }
-                        let endpoint = format!("127.0.0.1:{port}");
-                        emit(&update_tx, &ctx, GuiUpdate::Connecting {
-                            mode: ConnectionMode::Usb,
-                            endpoint: endpoint.clone(),
-                        });
-
-                        let fwd_res = tokio::task::spawn_blocking(move || {
-                            adb::setup_adb_forward(None, port, port)
-                        }).await;
 
                         let channels = SessionChannels {
                             update_tx: &update_tx,
@@ -474,27 +556,65 @@ async fn run_session_supervisor(
                             ctx: &ctx,
                         };
 
-                        match fwd_res {
-                            Ok(Ok(device)) => {
-                                info!(serial = %device.serial, model = ?device.model, "ADB forward established");
+                        match transport {
+                            UsbTransportMode::DirectAoa => {
+                                let endpoint = "USB AOA (Plug & Play)".to_owned();
+                                emit(&update_tx, &ctx, GuiUpdate::Connecting {
+                                    mode: ConnectionMode::UsbAoa,
+                                    endpoint: endpoint.clone(),
+                                });
                                 active = start_connection(
-                                    ConnectionMode::Usb,
+                                    ConnectionMode::UsbAoa,
                                     endpoint,
                                     port,
+                                    vcam_backend,
                                     vcam_device,
                                     auto_reconnect,
                                     &channels,
-                                );
+                                )
+                                .await;
                             }
-                            Ok(Err(e)) => {
-                                emit(&update_tx, &ctx, GuiUpdate::Error(format!("ADB error: {e}")));
-                            }
-                            Err(e) => {
-                                emit(&update_tx, &ctx, GuiUpdate::Error(format!("ADB task failed: {e}")));
+                            UsbTransportMode::LegacyAdb => {
+                                let endpoint = format!("127.0.0.1:{port}");
+                                emit(&update_tx, &ctx, GuiUpdate::Connecting {
+                                    mode: ConnectionMode::UsbAdb,
+                                    endpoint: endpoint.clone(),
+                                });
+
+                                let fwd_res = tokio::task::spawn_blocking(move || {
+                                    adb::setup_adb_forward(None, port, port)
+                                }).await;
+
+                                match fwd_res {
+                                    Ok(Ok(device)) => {
+                                        info!(serial = %device.serial, model = ?device.model, "ADB forward established");
+                                        active = start_connection(
+                                            ConnectionMode::UsbAdb,
+                                            endpoint,
+                                            port,
+                                            vcam_backend,
+                                            vcam_device,
+                                            auto_reconnect,
+                                            &channels,
+                                        )
+                                        .await;
+                                    }
+                                    Ok(Err(e)) => {
+                                        emit(&update_tx, &ctx, GuiUpdate::Error(format!("ADB error: {e}")));
+                                    }
+                                    Err(e) => {
+                                        emit(&update_tx, &ctx, GuiUpdate::Error(format!("ADB task failed: {e}")));
+                                    }
+                                }
                             }
                         }
                     }
-                    GuiCommand::ConnectWifi { endpoint, vcam_device, auto_reconnect } => {
+                    GuiCommand::ConnectWifi {
+                        endpoint,
+                        vcam_backend,
+                        vcam_device,
+                        auto_reconnect,
+                    } => {
                         if let Some(conn) = active.take() {
                             conn.stop();
                         }
@@ -520,15 +640,73 @@ async fn run_session_supervisor(
                             ConnectionMode::Wifi,
                             normalized,
                             DEFAULT_PORT,
+                            vcam_backend,
                             vcam_device,
                             auto_reconnect,
                             &channels,
-                        );
+                        )
+                        .await;
                     }
                     GuiCommand::RefreshWifiDiscovery => {
                         if let Some(ref s) = scanner {
                             s.trigger_scan();
                         }
+                    }
+                    GuiCommand::EnableLegacyV4l2 => {
+                        let update_tx_c = update_tx.clone();
+                        let ctx_c = ctx.clone();
+                        tokio::spawn(async move {
+                            let res = tokio::task::spawn_blocking(enable_v4l2loopback_via_pkexec).await;
+                            let (ok, message) = match res {
+                                Ok(Ok(())) => (
+                                    true,
+                                    "Legacy V4L2 kernel module enabled (/dev/video10 ready)."
+                                        .to_owned(),
+                                ),
+                                Ok(Err(e)) => (false, e.to_string()),
+                                Err(e) => (false, format!("Polkit V4L2 task failed: {e}")),
+                            };
+                            emit(
+                                &update_tx_c,
+                                &ctx_c,
+                                GuiUpdate::V4l2EnableResult { ok, message },
+                            );
+                        });
+                    }
+                    GuiCommand::InstallUsbUdevRules => {
+                        let update_tx_c = update_tx.clone();
+                        let ctx_c = ctx.clone();
+                        tokio::spawn(async move {
+                            let res = tokio::task::spawn_blocking(|| {
+                                let install_res = usb_aoa::install_udev_rules_via_pkexec();
+                                let installed = usb_aoa::is_udev_rule_installed();
+                                (install_res, installed)
+                            })
+                            .await;
+                            let (ok, udev_rules_installed, message) = match res {
+                                Ok((Ok(()), installed)) => (
+                                    true,
+                                    installed,
+                                    "USB access rules installed. Plug & Play USB is ready."
+                                        .to_owned(),
+                                ),
+                                Ok((Err(e), installed)) => (false, installed, e.to_string()),
+                                Err(e) => (
+                                    false,
+                                    false,
+                                    format!("USB udev rules install task failed: {e}"),
+                                ),
+                            };
+                            emit(
+                                &update_tx_c,
+                                &ctx_c,
+                                GuiUpdate::UdevInstallResult {
+                                    ok,
+                                    udev_rules_installed,
+                                    message,
+                                },
+                            );
+                        });
                     }
                     GuiCommand::Disconnect => {
                         if let Some(conn) = active.take() {
@@ -539,9 +717,12 @@ async fn run_session_supervisor(
                             s.set_active_queries_paused(false);
                         }
                         emit(&update_tx, &ctx, GuiUpdate::VcamStatus {
-                            path: String::new(),
+                            backend: None,
+                            display_label: String::new(),
+                            v4l2_path: None,
                             active: false,
                             standby: false,
+                            pipewire_unavailable: None,
                             error: None,
                         });
                         emit(&update_tx, &ctx, GuiUpdate::VmicStatus {
@@ -681,10 +862,38 @@ struct SessionChannels<'a> {
     ctx: &'a egui::Context,
 }
 
-fn start_connection(
+fn vcam_backend_fallback_label(mode: VcamBackendMode, vcam_device: &str) -> String {
+    match mode {
+        VcamBackendMode::Auto | VcamBackendMode::PipeWire => "PipeWire".to_owned(),
+        VcamBackendMode::V4l2 => {
+            let trimmed = vcam_device.trim();
+            if trimmed.is_empty() || trimmed == "auto" {
+                "/dev/video10".to_owned()
+            } else {
+                trimmed.to_owned()
+            }
+        }
+    }
+}
+
+fn is_usb_permission_denied_reason(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    lower.contains("usb permission denied") || lower.contains("70-camcraft-aoa.rules")
+}
+
+struct PreparedVcam {
+    sink: Option<Box<dyn VirtualCameraSink>>,
+    active_backend: Option<VcamBackendMode>,
+    label: String,
+    v4l2_path: Option<String>,
+    pipewire_unavailable: Option<bool>,
+}
+
+async fn start_connection(
     mode: ConnectionMode,
     endpoint: String,
     port: u16,
+    vcam_backend: VcamBackendMode,
     vcam_device: String,
     auto_reconnect: bool,
     channels: &SessionChannels<'_>,
@@ -702,47 +911,112 @@ fn start_connection(
     let decoder_running = Arc::new(AtomicBool::new(true));
     let (decoder_tx, decoder_rx) = DecoderSender::new_with_capacity(LIVE_DECODER_QUEUE_CAPACITY);
 
-    // Open V4L2 virtual camera if available; fall back gracefully to preview-only mode.
-    let vcam_path = if vcam_device.trim().is_empty() || vcam_device.trim() == "auto" {
-        find_camcraft_v4l2_device()
-    } else {
-        PathBuf::from(vcam_device.trim())
-    };
-    let vcam_display = vcam_path.display().to_string();
+    let vcam_device_probe = vcam_device.clone();
+    let vcam_open_res =
+        tokio::task::spawn_blocking(move || open_virtual_camera(vcam_backend, &vcam_device_probe))
+            .await;
 
-    let mut vcam_sink = V4l2LoopbackSink::new(vcam_path);
-    let sink: Option<Box<dyn VirtualCameraSink>> = match vcam_sink.open() {
-        Ok(()) => {
-            if let Err(e) = vcam_sink.write_standby_frame(1920, 1080) {
+    let prepared_vcam = match vcam_open_res {
+        Ok(Ok(mut opened)) => {
+            if let Err(e) = opened.sink.write_standby_frame(1920, 1080) {
                 warn!(error = %e, "Failed to write initial standby frame to virtual camera");
             }
+            let (label, v4l2_path) = match opened.backend {
+                VcamBackendMode::PipeWire | VcamBackendMode::Auto => ("PipeWire".to_owned(), None),
+                VcamBackendMode::V4l2 => (
+                    opened.display_name.clone(),
+                    Some(opened.display_name.clone()),
+                ),
+            };
+            let pw_unavail = match (vcam_backend, opened.backend) {
+                (VcamBackendMode::Auto, VcamBackendMode::V4l2) => Some(true),
+                (_, VcamBackendMode::PipeWire) => Some(false),
+                _ => None,
+            };
             emit(
                 update_tx,
                 ctx,
                 GuiUpdate::VcamStatus {
-                    path: vcam_display.clone(),
+                    backend: Some(opened.backend),
+                    display_label: label.clone(),
+                    v4l2_path: v4l2_path.clone(),
                     active: true,
                     standby: false,
+                    pipewire_unavailable: pw_unavail,
                     error: None,
                 },
             );
-            Some(Box::new(vcam_sink))
+            PreparedVcam {
+                sink: Some(opened.sink),
+                active_backend: Some(opened.backend),
+                label,
+                v4l2_path,
+                pipewire_unavailable: pw_unavail,
+            }
         }
-        Err(e) => {
-            warn!(device = %vcam_display, error = %e, "Virtual camera unavailable; running in preview-only mode");
+        Ok(Err(e)) => {
+            let fallback_label = vcam_backend_fallback_label(vcam_backend, &vcam_device);
+            let pw_unavail = matches!(
+                vcam_backend,
+                VcamBackendMode::Auto | VcamBackendMode::PipeWire
+            )
+            .then_some(true);
+            warn!(
+                backend = %vcam_backend,
+                device = %fallback_label,
+                error = %e,
+                "Virtual camera unavailable; running in preview-only mode"
+            );
             emit(
                 update_tx,
                 ctx,
                 GuiUpdate::VcamStatus {
-                    path: vcam_display.clone(),
+                    backend: None,
+                    display_label: fallback_label.clone(),
+                    v4l2_path: None,
                     active: false,
                     standby: false,
+                    pipewire_unavailable: pw_unavail,
                     error: Some(e.to_string()),
                 },
             );
-            None
+            PreparedVcam {
+                sink: None,
+                active_backend: None,
+                label: fallback_label,
+                v4l2_path: None,
+                pipewire_unavailable: pw_unavail,
+            }
+        }
+        Err(join_err) => {
+            let fallback_label = vcam_backend_fallback_label(vcam_backend, &vcam_device);
+            emit(
+                update_tx,
+                ctx,
+                GuiUpdate::VcamStatus {
+                    backend: None,
+                    display_label: fallback_label.clone(),
+                    v4l2_path: None,
+                    active: false,
+                    standby: false,
+                    pipewire_unavailable: None,
+                    error: Some(format!("Virtual camera task failed: {join_err}")),
+                },
+            );
+            PreparedVcam {
+                sink: None,
+                active_backend: None,
+                label: fallback_label,
+                v4l2_path: None,
+                pipewire_unavailable: None,
+            }
         }
     };
+    let sink = prepared_vcam.sink;
+    let active_vcam_backend = prepared_vcam.active_backend;
+    let vcam_label = prepared_vcam.label;
+    let v4l2_path = prepared_vcam.v4l2_path;
+    let pw_unavailable = prepared_vcam.pipewire_unavailable;
     let vcam_opened = sink.is_some();
 
     let ctx_preview = ctx.clone();
@@ -842,37 +1116,57 @@ fn start_connection(
     let audio_meter_active_c = audio_meter_active.clone();
     let internal_tx_c = internal_tx.clone();
     let endpoint_c = endpoint.clone();
-    let vcam_display_c = vcam_display.clone();
+    let vcam_label_c = vcam_label.clone();
+    let v4l2_path_c = v4l2_path.clone();
 
     let client_task = tokio::spawn(async move {
         let (event_tx, mut event_rx) = mpsc::channel::<ClientEvent>(128);
-        let cfg = ClientConfig::new(endpoint_c.clone());
+        let cfg = if mode == ConnectionMode::UsbAoa {
+            ClientConfig::usb_default()
+        } else {
+            ClientConfig::new(endpoint_c.clone())
+        };
         let client_shutdown = shutdown_c.clone();
 
         let net_handle = tokio::spawn(async move {
-            if auto_reconnect {
-                client::run_client_with_reconnect(
-                    cfg,
-                    ReconnectConfig::default(),
-                    event_tx,
-                    client_shutdown,
-                    move |_attempt| async move {
-                        if mode == ConnectionMode::Usb {
-                            tokio::task::spawn_blocking(move || {
-                                adb::setup_adb_forward(None, port, port)
-                            })
-                            .await
-                            .map_err(|e| format!("ADB forward task failed: {e}"))?
-                            .map(|_| ())
-                            .map_err(|e| format!("ADB error: {e}"))
-                        } else {
-                            Ok(())
-                        }
-                    },
-                )
-                .await
-            } else {
-                client::run_client_loop(cfg, event_tx, client_shutdown).await
+            match (mode, auto_reconnect) {
+                (ConnectionMode::UsbAoa, true) => {
+                    client::run_aoa_client_with_reconnect(
+                        cfg,
+                        ReconnectConfig::default(),
+                        event_tx,
+                        client_shutdown,
+                    )
+                    .await
+                }
+                (ConnectionMode::UsbAoa, false) => {
+                    client::run_aoa_client_loop(cfg, event_tx, client_shutdown).await
+                }
+                (ConnectionMode::UsbAdb, true) | (ConnectionMode::Wifi, true) => {
+                    client::run_client_with_reconnect(
+                        cfg,
+                        ReconnectConfig::default(),
+                        event_tx,
+                        client_shutdown,
+                        move |_attempt| async move {
+                            if mode == ConnectionMode::UsbAdb {
+                                tokio::task::spawn_blocking(move || {
+                                    adb::setup_adb_forward(None, port, port)
+                                })
+                                .await
+                                .map_err(|e| format!("ADB forward task failed: {e}"))?
+                                .map(|_| ())
+                                .map_err(|e| format!("ADB error: {e}"))
+                            } else {
+                                Ok(())
+                            }
+                        },
+                    )
+                    .await
+                }
+                (ConnectionMode::UsbAdb, false) | (ConnectionMode::Wifi, false) => {
+                    client::run_client_loop(cfg, event_tx, client_shutdown).await
+                }
             }
         });
 
@@ -888,9 +1182,12 @@ fn start_connection(
                             &update_tx_c,
                             &ctx_c,
                             GuiUpdate::VcamStatus {
-                                path: vcam_display_c.clone(),
+                                backend: active_vcam_backend,
+                                display_label: vcam_label_c.clone(),
+                                v4l2_path: v4l2_path_c.clone(),
                                 active: true,
                                 standby: false,
+                                pipewire_unavailable: pw_unavailable,
                                 error: None,
                             },
                         );
@@ -907,11 +1204,22 @@ fn start_connection(
                             &update_tx_c,
                             &ctx_c,
                             GuiUpdate::VcamStatus {
-                                path: vcam_display_c.clone(),
+                                backend: active_vcam_backend,
+                                display_label: vcam_label_c.clone(),
+                                v4l2_path: v4l2_path_c.clone(),
                                 active: true,
                                 standby: true,
+                                pipewire_unavailable: pw_unavailable,
                                 error: None,
                             },
+                        );
+                    }
+                    let formatted_reason = format_disconnect_reason(&reason);
+                    if is_usb_permission_denied_reason(&reason) {
+                        emit(
+                            &update_tx_c,
+                            &ctx_c,
+                            GuiUpdate::UsbPermissionDenied(formatted_reason.clone()),
                         );
                     }
                     emit(
@@ -921,7 +1229,7 @@ fn start_connection(
                             mode,
                             endpoint: endpoint_c.clone(),
                             attempt,
-                            reason: format_disconnect_reason(&reason),
+                            reason: formatted_reason,
                         },
                     );
                 }
@@ -983,10 +1291,18 @@ fn start_connection(
                 }
                 ClientEvent::Disconnected(reason) => {
                     disconnected_emitted = true;
+                    let formatted_reason = format_disconnect_reason(&reason);
+                    if is_usb_permission_denied_reason(&reason) {
+                        emit(
+                            &update_tx_c,
+                            &ctx_c,
+                            GuiUpdate::UsbPermissionDenied(formatted_reason.clone()),
+                        );
+                    }
                     emit(
                         &update_tx_c,
                         &ctx_c,
-                        GuiUpdate::Disconnected(format_disconnect_reason(&reason)),
+                        GuiUpdate::Disconnected(formatted_reason),
                     );
                     break;
                 }
@@ -997,12 +1313,16 @@ fn start_connection(
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 error!(error = %e, "Client network loop exited with error");
-                if !disconnected_emitted {
+                let formatted = format_client_error(&e);
+                if matches!(e, ClientError::UsbAoa(UsbAoaError::PermissionDenied(_))) {
                     emit(
                         &update_tx_c,
                         &ctx_c,
-                        GuiUpdate::Error(format_client_error(&e)),
+                        GuiUpdate::UsbPermissionDenied(formatted.clone()),
                     );
+                }
+                if !disconnected_emitted {
+                    emit(&update_tx_c, &ctx_c, GuiUpdate::Error(formatted));
                 }
             }
             Err(e) => {
@@ -1064,6 +1384,21 @@ fn format_client_error(err: &ClientError) -> String {
         ClientError::ConnectionClosed => {
             return "Connection closed by Android sender".to_owned();
         }
+        ClientError::UsbAoa(UsbAoaError::PermissionDenied(_)) => {
+            return "USB permission denied — click 'Grant USB Access' in the Connect tab"
+                .to_owned();
+        }
+        ClientError::UsbAoa(UsbAoaError::NoDeviceFound) => {
+            return "No Android phone detected on USB — plug in your phone, unlock it, and open CamCraft"
+                .to_owned();
+        }
+        ClientError::UsbAoa(UsbAoaError::ReenumerationTimeout(_)) => {
+            return "Phone entered USB accessory mode but timed out — tap Allow on the phone prompt and retry"
+                .to_owned();
+        }
+        ClientError::UsbAoa(aoa_err) => {
+            return format!("USB AOA connection failed: {aoa_err}");
+        }
         _ => {}
     }
     format!("Connection failed: {err}")
@@ -1071,7 +1406,12 @@ fn format_client_error(err: &ClientError) -> String {
 
 fn format_disconnect_reason(reason: &str) -> String {
     let lower = reason.to_ascii_lowercase();
-    if lower.contains("connection refused") || lower.contains("os error 111") {
+    if is_usb_permission_denied_reason(reason) {
+        "USB permission denied — click 'Grant USB Access' in the Connect tab".to_owned()
+    } else if lower.contains("no aoa-capable android device found") {
+        "No Android phone detected on USB — plug in your phone, unlock it, and open CamCraft"
+            .to_owned()
+    } else if lower.contains("connection refused") || lower.contains("os error 111") {
         "Phone reached, but CamCraft Server is not running (tap 'Start Server' on Android)"
             .to_owned()
     } else if lower.contains("no route to host") || lower.contains("os error 113") {
@@ -1209,9 +1549,7 @@ async fn run_update_install(
             emit(
                 &update_tx,
                 &ctx,
-                GuiUpdate::UpdateState(UpdateUiState::RestartRequired {
-                    version: outcome.version,
-                }),
+                GuiUpdate::UpdateState(install_outcome_to_ui_state(outcome)),
             );
         }
         Ok(Err(err)) => {
@@ -1234,6 +1572,22 @@ async fn run_update_install(
                 }),
             );
         }
+    }
+}
+
+fn install_outcome_to_ui_state(outcome: InstallOutcome) -> UpdateUiState {
+    match outcome.action {
+        InstallAction::ReplacedInPlace => UpdateUiState::RestartRequired {
+            version: outcome.version,
+        },
+        InstallAction::DownloadedPackage {
+            package_path,
+            install_command,
+        } => UpdateUiState::PackageDownloaded {
+            version: outcome.version,
+            path: package_path,
+            install_command,
+        },
     }
 }
 
@@ -1293,6 +1647,64 @@ mod tests {
         assert_eq!(PerformanceProfile::Balanced.min_interval_ms(), 42);
         assert_eq!(PerformanceProfile::Crisp.max_width(), 960);
         assert_eq!(PerformanceProfile::Crisp.min_interval_ms(), 33);
+    }
+
+    #[test]
+    fn usb_transport_and_connection_mode_defaults_and_labels() {
+        assert_eq!(UsbTransportMode::default(), UsbTransportMode::DirectAoa);
+        assert_eq!(
+            UsbTransportMode::DirectAoa.label(),
+            "Direct USB (No Debugging)"
+        );
+        assert_eq!(UsbTransportMode::LegacyAdb.label(), "Legacy ADB");
+        assert_eq!(ConnectionMode::UsbAoa.label(), "USB");
+        assert_eq!(ConnectionMode::UsbAdb.label(), "USB ADB");
+        assert_eq!(ConnectionMode::Wifi.label(), "Wi-Fi");
+    }
+
+    #[test]
+    fn install_outcome_maps_replaced_in_place_and_downloaded_package() {
+        let in_place = InstallOutcome {
+            version: "0.2.0".to_owned(),
+            binary_path: PathBuf::from("/tmp/CamCraft.AppImage"),
+            sibling_updated: false,
+            action: InstallAction::ReplacedInPlace,
+        };
+        assert_eq!(
+            install_outcome_to_ui_state(in_place),
+            UpdateUiState::RestartRequired {
+                version: "0.2.0".to_owned(),
+            }
+        );
+
+        let pkg = InstallOutcome {
+            version: "0.2.0".to_owned(),
+            binary_path: PathBuf::from("/tmp/camcraft-0.2.0-1.x86_64.rpm"),
+            sibling_updated: false,
+            action: InstallAction::DownloadedPackage {
+                package_path: PathBuf::from("/tmp/camcraft-0.2.0-1.x86_64.rpm"),
+                install_command: "sudo dnf install -y /tmp/camcraft-0.2.0-1.x86_64.rpm".to_owned(),
+            },
+        };
+        assert_eq!(
+            install_outcome_to_ui_state(pkg),
+            UpdateUiState::PackageDownloaded {
+                version: "0.2.0".to_owned(),
+                path: PathBuf::from("/tmp/camcraft-0.2.0-1.x86_64.rpm"),
+                install_command: "sudo dnf install -y /tmp/camcraft-0.2.0-1.x86_64.rpm".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn usb_permission_denied_detection_and_formatting() {
+        let err = ClientError::UsbAoa(UsbAoaError::PermissionDenied(PathBuf::from(
+            "/dev/bus/usb/001/002",
+        )));
+        let msg = format_client_error(&err);
+        assert!(msg.contains("Grant USB Access"));
+        assert!(is_usb_permission_denied_reason(&err.to_string()));
+        assert!(!is_usb_permission_denied_reason("connection refused"));
     }
 
     #[test]

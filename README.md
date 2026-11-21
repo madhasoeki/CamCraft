@@ -22,14 +22,14 @@
 
 - **High-Resolution, 60 FPS Hardware Pipeline:** Streams `1280x720`, `1920x1080`, and `3840x2160` (device-dependent) up to **60 FPS** using Android CameraX + `MediaCodec` hardware H.264 surface encoding and FFmpeg `AV_CODEC_FLAG_LOW_DELAY` decoding in Rust.
 - **USB & Wireless Transport:**
-  - **USB (ADB Tunnel):** Ultra-low latency over `127.0.0.1:9876` (`adb forward tcp:9876 tcp:9876`).
+  - **USB Direct (AOA v1 Plug & Play):** Zero-config direct USB bulk transport — no Developer Options or USB Debugging required (just plug in USB and tap **Allow** on Android; Legacy ADB `--adb` remains available as an option).
   - **Wi-Fi LAN:** Automatic `_camcraft._tcp.` mDNS discovery (with dual-NIC subnet routing) plus manual `IP:Port` fallback and instant IDR keyframe recovery.
 - **Native Linux Virtual Devices:**
-  - **Virtual Camera:** Injects decoded YUV420P frames directly into `v4l2loopback` (`/dev/video10`, `"CamCraft Virtual Camera"`), ready for OBS Studio, Discord / Vesktop, Chromium, Firefox, and Zoom.
+  - **Zero-Setup PipeWire Virtual Camera (+ Legacy V4L2 Fallback):** Streams directly into PipeWire as `"CamCraft Virtual Camera"` via runtime-loaded `libpipewire-0.3` (no kernel modules required!), with automatic fallback to `v4l2loopback` (`/dev/video10`) when needed — ready for OBS Studio, Discord / Vesktop, Chromium, Firefox, and Zoom.
   - **Virtual Microphone:** Forwards 48 kHz mono 16-bit PCM microphone audio into a PipeWire/PulseAudio virtual source (`"CamCraft Virtual Mic"`) with a live dBFS LED VU meter.
 - **Two-Way Studio Controls:** Switch lenses (front / back / ultrawide), resolution, FPS, bitrate (4–40 Mbps), zoom, exposure compensation (EV), autofocus, torch, horizontal mirror, 90° rotation, and audio mute from either desktop GUI or phone.
-- **Built for Long Sessions:** Automatic 2-second reconnection with a non-freezing `v4l2loopback` Standby Frame (`"CAMCRAFT - RECONNECTING..."`), **Eco / Balanced / Crisp** laptop preview profiles, and an **OLED Battery Saver** black overlay (`0.01f` brightness + anti-burn-in drift) on Android.
-- **Seamless In-App Updates:** Both desktop (`camcraft-gui` / `camcraft-cli`) and Android check GitHub Releases automatically, verify `SHA256SUMS.txt`, and update in place without manual browser downloads.
+- **Built for Long Sessions:** Automatic 2-second reconnection with a non-freezing Standby Frame (`"CAMCRAFT - RECONNECTING..."`), **Eco / Balanced / Crisp** laptop preview profiles, and an **OLED Battery Saver** black overlay (`0.01f` brightness + anti-burn-in drift) on Android.
+- **Seamless In-App Updates:** Desktop (`camcraft-gui` / `camcraft-cli`) and Android check GitHub Releases automatically and verify `SHA256SUMS.txt` — AppImages and portable archives update in place, `.rpm`/`.deb` packages download cleanly with ready-to-run install commands, and Android launches the APK installer directly.
 
 ---
 
@@ -42,7 +42,7 @@ CamCraft/
 ├── desktop/                     # Rust 2024 Cargo workspace (Linux receiver)
 │   └── crates/
 │       ├── camcraft-protocol/   # CCFT v1 20-byte framing & JSON control schemas
-│       ├── camcraft-core/       # Tokio client, ADB tunnel, mDNS, H.264 decode, V4L2, PipeWire, updater
+│       ├── camcraft-core/       # Tokio client, USB AOA v1, ADB fallback, mDNS, H.264 decode, PipeWire/V4L2 vcam, PipeWire vmic, updater
 │       ├── camcraft-cli/        # Headless daemon & CLI (`connect`, `discover`, `update`, `status`)
 │       └── camcraft-gui/        # Native eframe/egui studio UI with live preview & remote controls
 ├── android/                     # Native Kotlin + Jetpack Compose sender (minSdk 29, targetSdk 35)
@@ -50,11 +50,12 @@ CamCraft/
 │       ├── protocol/            # Byte-identical CCFT v1 serializer & JSON models
 │       ├── camera/              # CameraX lifecycle, lens & FPS capability enumerator
 │       ├── encoder/             # MediaCodec H.264 surface encoder & AudioRecord 48kHz PCM
-│       ├── network/             # Foreground streaming service (TCP server) & NsdManager mDNS
+│       ├── network/             # Foreground service (USB AOA + TCP server) & NsdManager mDNS
 │       ├── update/              # GitHub Releases update checker, SHA-256 verifier & APK installer
 │       └── ui/                  # Stateless ArtCraft Studio v2 Compose UI + OLED Battery Saver
+├── packaging/linux/             # RPM spec, DEB builder, AppImage builder & `70-camcraft-aoa.rules`
 ├── assets/branding/             # Official Miter Frame logos, app icons, banners & .desktop entry
-├── scripts/setup-fedora-dev.sh  # One-time Fedora Linux dependency & virtual device setup
+├── scripts/setup-fedora-dev.sh  # Developer-only Fedora source build & optional V4L2 setup script
 └── docs/                        # Architecture (`DESIGN.md`), Wire Spec (`PROTOCOL.md`), PRD (`PRD.md`)
 ```
 
@@ -66,44 +67,31 @@ CamCraft/
 
 Download the latest release assets from [**GitHub Releases**](https://github.com/madhasoeki/CamCraft/releases/latest):
 
-| Target | Asset | Notes |
+| Platform | Package | Quick Install |
 | :--- | :--- | :--- |
-| **Fedora Linux (x86_64)** | `camcraft-desktop-fedora-x86_64.tar.gz` | Contains `camcraft-gui`, `camcraft-cli`, and `setup-fedora-dev.sh` |
-| **Generic Linux (x86_64)** | `camcraft-desktop-linux-x86_64.tar.gz` | Contains `camcraft-gui` and `camcraft-cli` |
-| **Android (10 / API 29+)** | `camcraft-android-vX.Y.Z.apk` | Install directly on your Android device |
-| **Checksums** | `SHA256SUMS.txt` | SHA-256 verification digests for all release assets |
+| **Any Linux (Universal)** | `CamCraft-vX.Y.Z-x86_64.AppImage` | `chmod +x CamCraft-*.AppImage && ./CamCraft-*.AppImage` |
+| **Fedora / RHEL / Nobara (x86_64)** | `camcraft-X.Y.Z-1.x86_64.rpm` | `sudo dnf install -y ./camcraft-*.rpm` |
+| **Ubuntu / Debian / Linux Mint (amd64)** | `camcraft_X.Y.Z_amd64.deb` | `sudo apt install -y ./camcraft_*_amd64.deb` |
+| **Android (Universal APK, ~2.8 MB)** | `camcraft-android-vX.Y.Z.apk` | Install directly on Android 10+ (API 29+) |
 
-Extract the desktop archive into a writable user folder (such as `~/.local/bin`) so the in-app updater can replace binaries without elevated privileges:
+Portable tarballs (`camcraft-desktop-fedora-x86_64.tar.gz`, `camcraft-desktop-linux-x86_64.tar.gz`) and `SHA256SUMS.txt` are also published on every release.
+
+### 2. Zero-Setup Virtual Camera & Plug-and-Play USB
+
+End users installing the `.AppImage`, `.rpm`, or `.deb` do **not** need `setup-fedora-dev.sh`, manual `v4l2loopback` setup, or Android USB Debugging:
+
+- **Zero-Setup PipeWire Virtual Camera:** By default (`Auto (PipeWire)`), CamCraft exposes `"CamCraft Virtual Camera"` natively through PipeWire (`libpipewire-0.3` loaded dynamically at runtime). If your system lacks PipeWire or an app requires a `/dev/video*` node, select **Legacy V4L2** in the **Connect** tab (or pass `--vcam-backend v4l2` in CLI) and click **Enable Legacy V4L2 (Polkit)** if `v4l2loopback` is not yet loaded.
+- **Plug-and-Play USB (AOA v1):** Direct USB works out of the box without enabling Developer Options or ADB. Native `.rpm` and `.deb` packages install `70-camcraft-aoa.rules` automatically. If you run the universal `.AppImage` (or a portable tarball) without udev rules installed, click the 1-click **Grant USB Access** button in the **Connect** tab when prompted.
+
+### 3. Build from Source (Developers Only)
+
+The `scripts/setup-fedora-dev.sh` helper is **only for compiling CamCraft from source on Fedora** (installing Rust/Clang/FFmpeg development headers and optional `v4l2loopback` tooling) — end users do not need it:
 
 ```bash
-tar -xzf camcraft-desktop-fedora-x86_64.tar.gz
-mkdir -p ~/.local/bin ~/.local/share/applications ~/.local/share/icons/hicolor/scalable/apps
-cp camcraft-desktop-fedora-x86_64/camcraft-{gui,cli} ~/.local/bin/
-cp camcraft-desktop-fedora-x86_64/org.artcraft.camcraft.desktop ~/.local/share/applications/
-cp camcraft-desktop-fedora-x86_64/org.artcraft.camcraft.svg ~/.local/share/icons/hicolor/scalable/apps/
-```
-
-### 2. One-Time Linux System Setup (Virtual Camera & Microphone)
-
-On **Fedora Linux**, install `v4l2loopback`, PipeWire utilities, ADB, and runtime FFmpeg libraries:
-
-```bash
+# Optional: Fedora developer dependencies for building from source
 chmod +x scripts/setup-fedora-dev.sh
 ./scripts/setup-fedora-dev.sh
-```
 
-Or enable the virtual devices for the current session using [`just`](https://github.com/casey/just):
-
-```bash
-just setup-vcam   # Loads v4l2loopback on /dev/video10 ("CamCraft Virtual Camera")
-just setup-vmic   # Creates PipeWire virtual source ("CamCraft Virtual Mic")
-```
-
-> **Secure Boot note (Fedora):** If `modprobe v4l2loopback` fails when Secure Boot is enabled, enroll your MOK key (`akmods` / `mokutil`) or disable Secure Boot in UEFI.
-
-### 3. Build from Source
-
-```bash
 # Desktop (Rust 2024)
 cd desktop
 cargo build --release --locked -p camcraft-gui -p camcraft-cli
@@ -118,9 +106,9 @@ cd android
 ## Usage
 
 ### Desktop GUI (`camcraft-gui`)
-1. Open **CamCraft** on your Android phone and tap **Start Server**.
-2. Launch `camcraft-gui` on Linux:
-   - **USB:** Connect your phone with USB Debugging enabled and click **Connect via USB (ADB)**.
+1. Open **CamCraft** on your Android phone (for Wi-Fi, tap **Start Server**; for USB, simply plug in the cable).
+2. Launch `camcraft-gui` on Linux (or `./CamCraft-*.AppImage`):
+   - **USB (Plug & Play):** Plug in your phone via USB, tap **Allow** on the Android USB accessory prompt, and click **Connect via USB (Plug & Play)**. (If you prefer ADB forwarding, switch to **Legacy ADB** in the **Connect** tab.)
    - **Wi-Fi:** Pick your phone from **Wi-Fi Discovered Devices (mDNS)** or enter `<phone-ip>:9876`.
 3. Select **CamCraft Virtual Camera** and **CamCraft Virtual Mic** inside OBS Studio, Discord / Vesktop, Chromium, or Firefox.
 
@@ -128,8 +116,15 @@ cd android
 
 ### Headless CLI (`camcraft-cli`)
 ```bash
-# Stream over USB to /dev/video10 + PipeWire virtual mic
-camcraft-cli connect --usb --vcam /dev/video10
+# Stream over Plug & Play USB AOA to PipeWire Virtual Camera (Auto) + Virtual Mic
+camcraft-cli connect --usb
+
+# Force Legacy V4L2 virtual camera (/dev/video10) or PipeWire explicitly
+camcraft-cli connect --usb --vcam-backend v4l2 --vcam /dev/video10
+camcraft-cli connect --usb --vcam-backend pipewire
+
+# Use legacy ADB port forwarding instead of USB AOA
+camcraft-cli connect --usb --adb
 
 # Discover Android devices on Wi-Fi LAN via mDNS
 camcraft-cli discover --timeout 5
@@ -137,14 +132,14 @@ camcraft-cli discover --timeout 5
 # Connect over Wi-Fi
 camcraft-cli connect --wifi 192.168.1.42:9876
 
-# Check for or install desktop updates from GitHub Releases
+# Check for or apply desktop updates from GitHub Releases
 camcraft-cli update --check
 camcraft-cli update
 ```
 
 ### In-App Updates
-- **Desktop GUI:** Checks GitHub Releases silently at startup and shows a non-intrusive top banner when a new version is available. Click **Update Now** to download, verify `SHA256SUMS.txt`, replace the binary, and restart in one click. You can also check manually under **Connect → App Version & Updates**.
-- **Desktop CLI:** Run `camcraft-cli update` (updates `camcraft-cli` and sibling `camcraft-gui` in the same directory).
+- **Desktop GUI:** Checks GitHub Releases silently at startup and shows a non-intrusive top banner when a new version is available. AppImage and portable installs update in place with a **Restart Now** prompt; `.rpm` / `.deb` installs download and verify the package with `SHA256SUMS.txt`, launch your system installer, and display the exact terminal command if needed. You can also check manually under **Connect → App Version & Updates**.
+- **Desktop CLI:** Run `camcraft-cli update` (updates AppImage/portable binaries in place, or downloads and verifies the `.rpm`/`.deb` package and prints the install command).
 - **Android:** Checks GitHub Releases at startup (or tap the version badge e.g. `v0.0.1` in the top status card), verifies `SHA256SUMS.txt`, and opens the Android installer directly.
 
 ---

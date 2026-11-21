@@ -1,6 +1,6 @@
 //! Headless CLI entrypoint for CamCraft desktop receiver.
 //!
-//! Provides the `connect` sub-command for USB ADB and TCP Wi-Fi connections,
+//! Provides the `connect` sub-command for USB (AOA/ADB) and TCP Wi-Fi connections,
 //! displaying discovered device cameras, real-time FPS, bitrate, and RTT latency.
 
 use std::collections::BTreeMap;
@@ -18,7 +18,7 @@ use tracing::{info, warn};
 use camcraft_core::AudioOutputSink;
 use camcraft_core::adb;
 use camcraft_core::client::{
-    self, ClientConfig, ClientEvent, ClientSender, ReconnectConfig, StreamStats,
+    self, ClientConfig, ClientError, ClientEvent, ClientSender, ReconnectConfig, StreamStats,
 };
 use camcraft_core::decoder::{
     DecoderOptions, DecoderSender, KEYFRAME_REQUEST_COOLDOWN, KeyframeRequestReason,
@@ -26,8 +26,9 @@ use camcraft_core::decoder::{
     spawn_decoder_worker_optimized,
 };
 use camcraft_core::discovery::{DiscoveredDevice, DiscoveryEvent, MdnsScanner};
-use camcraft_core::updater::{self, UpdateCheckOutcome, UpdateConfig};
-use camcraft_core::vcam::{V4l2LoopbackSink, VirtualCameraSink, find_camcraft_v4l2_device};
+use camcraft_core::updater::{self, InstallAction, UpdateCheckOutcome, UpdateConfig};
+use camcraft_core::usb_aoa::UsbAoaError;
+use camcraft_core::vcam::{VcamBackendMode, VirtualCameraSink, open_virtual_camera};
 use camcraft_core::vmic::{
     AudioWorkerSender, VirtualMicSink, ensure_virtual_mic, spawn_audio_worker,
 };
@@ -37,7 +38,7 @@ use camcraft_protocol::{ControlCmd, ControlHello};
 #[command(
     name = "camcraft-cli",
     version,
-    about = "CamCraft headless desktop receiver for Fedora Linux"
+    about = "CamCraft headless desktop receiver for Linux"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -46,7 +47,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Connect to an Android CamCraft sender over USB ADB tunnel or TCP network.
+    /// Connect to an Android CamCraft sender over USB (AOA/ADB) or Wi-Fi TCP.
     Connect(ConnectArgs),
 
     /// Discover CamCraft Android senders advertised on the local network via mDNS.
@@ -56,7 +57,7 @@ enum Command {
         timeout: u64,
     },
 
-    /// Check GitHub Releases and optionally install desktop updates in-place.
+    /// Check GitHub Releases and optionally install desktop updates.
     Update {
         /// Only check if a newer release exists without downloading or installing.
         #[arg(long)]
@@ -70,9 +71,13 @@ enum Command {
 /// Arguments for the `connect` subcommand.
 #[derive(Debug, Parser)]
 struct ConnectArgs {
-    /// Connect via USB ADB port forwarding (127.0.0.1:9876).
+    /// Connect via USB (direct USB AOA Plug & Play by default, or ADB with --adb).
     #[arg(long)]
     usb: bool,
+
+    /// Use legacy ADB port forwarding (`adb forward`) instead of direct USB AOA.
+    #[arg(long)]
+    adb: bool,
 
     /// Target host IP or IP:PORT (e.g. 192.168.1.100 or 127.0.0.1:9876).
     #[arg(long)]
@@ -86,11 +91,19 @@ struct ConnectArgs {
     #[arg(long)]
     serial: Option<String>,
 
-    /// Target v4l2loopback device path (e.g. /dev/video10 or 'auto').
+    /// Virtual camera backend (`auto`, `pipewire`, or `v4l2`).
+    #[arg(
+        long = "vcam-backend",
+        value_name = "auto|pipewire|v4l2",
+        default_value = "auto"
+    )]
+    vcam_backend: VcamBackendMode,
+
+    /// Target v4l2loopback device path when using V4L2 backend (e.g. /dev/video10 or 'auto').
     #[arg(long, default_value = "/dev/video10")]
     vcam: String,
 
-    /// Disable virtual camera output to v4l2loopback device.
+    /// Disable virtual camera output (PipeWire / V4L2).
     #[arg(long)]
     no_vcam: bool,
 
@@ -149,71 +162,103 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Executes the connection workflow: setup ADB forward if needed, connect to sender,
-/// and display incoming stream stats.
-async fn run_connect(args: ConnectArgs) -> Result<()> {
-    let is_usb = args.usb || (args.host.is_none() && args.wifi.is_none());
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConnectTransport {
+    UsbAoa,
+    UsbAdb { endpoint: String },
+    Wifi { endpoint: String },
+}
 
-    let endpoint = if is_usb {
-        info!(
-            "Setting up USB tunnel via ADB port forwarding (port {})...",
-            args.port
-        );
-        let device = adb::setup_adb_forward(args.serial.as_deref(), args.port, args.port)
-            .context("Failed to configure ADB port forwarding")?;
-        info!(
-            serial = %device.serial,
-            model = ?device.model,
-            "Android USB tunnel established successfully"
-        );
-        format!("127.0.0.1:{}", args.port)
+fn resolve_connect_transport(args: &ConnectArgs) -> ConnectTransport {
+    let has_wifi_target = args.host.is_some() || args.wifi.is_some();
+    let is_usb = args.usb || args.adb || !has_wifi_target;
+
+    if is_usb {
+        if args.adb {
+            ConnectTransport::UsbAdb {
+                endpoint: format!("127.0.0.1:{}", args.port),
+            }
+        } else {
+            ConnectTransport::UsbAoa
+        }
     } else {
         let raw_addr = args
             .host
-            .or(args.wifi)
-            .unwrap_or_else(|| "127.0.0.1".to_string());
-        if raw_addr.contains(':') {
-            raw_addr
+            .as_deref()
+            .or(args.wifi.as_deref())
+            .unwrap_or("127.0.0.1");
+        let endpoint = if raw_addr.contains(':') {
+            raw_addr.to_owned()
         } else {
             format!("{raw_addr}:{}", args.port)
+        };
+        ConnectTransport::Wifi { endpoint }
+    }
+}
+
+/// Executes the connection workflow: setup transport (USB AOA, ADB forward, or Wi-Fi TCP),
+/// initialize virtual camera/mic sinks, and display incoming stream stats.
+async fn run_connect(args: ConnectArgs) -> Result<()> {
+    let transport = resolve_connect_transport(&args);
+
+    match &transport {
+        ConnectTransport::UsbAoa => {
+            info!(
+                vcam_backend = %args.vcam_backend,
+                "Connecting to CamCraft stream sender via USB AOA (Plug & Play, no ADB required)"
+            );
         }
-    };
+        ConnectTransport::UsbAdb { endpoint } => {
+            info!(
+                "Setting up USB tunnel via legacy ADB port forwarding (port {})...",
+                args.port
+            );
+            let device = adb::setup_adb_forward(args.serial.as_deref(), args.port, args.port)
+                .context("Failed to configure ADB port forwarding")?;
+            info!(
+                serial = %device.serial,
+                model = ?device.model,
+                %endpoint,
+                "Android USB ADB tunnel established successfully"
+            );
+        }
+        ConnectTransport::Wifi { endpoint } => {
+            info!(
+                %endpoint,
+                vcam_backend = %args.vcam_backend,
+                "Connecting to CamCraft stream sender over Wi-Fi"
+            );
+        }
+    }
 
-    info!(%endpoint, vcam = %args.vcam, "Connecting to CamCraft stream sender");
-
-    // Initialize v4l2loopback virtual camera sink (unless disabled)
+    // Initialize virtual camera sink (Auto = PipeWire first with V4L2 fallback) unless disabled
     let sink: Option<Box<dyn VirtualCameraSink>> = if args.no_vcam {
         info!("Virtual camera output disabled via --no-vcam");
         None
     } else {
-        let vcam_path = if args.vcam == "auto" {
-            find_camcraft_v4l2_device()
-        } else {
-            PathBuf::from(&args.vcam)
-        };
-
-        let mut vcam_sink = V4l2LoopbackSink::new(vcam_path.clone());
-        match vcam_sink.open() {
-            Ok(()) => {
+        match open_virtual_camera(args.vcam_backend, &args.vcam) {
+            Ok(mut opened) => {
                 info!(
-                    device = %vcam_path.display(),
-                    "Initialized v4l2loopback virtual camera sink"
+                    backend = %opened.backend,
+                    device = %opened.display_name,
+                    "Initialized virtual camera sink"
                 );
                 // Emit initial standby frame (1920x1080) matching default CamCraft stream resolution
-                // so the device node is immediately queryable and active in OBS/Discord
-                if let Err(e) = vcam_sink.write_standby_frame(1920, 1080) {
+                // so the virtual camera is immediately queryable and active in OBS/Discord
+                if let Err(e) = opened.sink.write_standby_frame(1920, 1080) {
                     warn!(
                         error = %e,
                         "Failed to write initial standby frame to virtual camera"
                     );
                 }
-                Some(Box::new(vcam_sink) as Box<dyn VirtualCameraSink>)
+                Some(opened.sink)
             }
             Err(e) => {
                 warn!(
-                    device = %vcam_path.display(),
+                    backend = %args.vcam_backend,
+                    vcam = %args.vcam,
                     error = %e,
-                    "Failed to open virtual camera device (v4l2loopback module might not be loaded); continuing in headless mode without virtual camera injection"
+                    "Failed to open virtual camera sink; continuing in headless mode without virtual camera injection"
                 );
                 None
             }
@@ -282,7 +327,12 @@ async fn run_connect(args: ConnectArgs) -> Result<()> {
     )
     .context("Failed to spawn audio worker thread")?;
 
-    let config = ClientConfig::new(&endpoint);
+    let config = match &transport {
+        ConnectTransport::UsbAoa => ClientConfig::usb_default(),
+        ConnectTransport::UsbAdb { endpoint } | ConnectTransport::Wifi { endpoint } => {
+            ClientConfig::new(endpoint)
+        }
+    };
     let (event_tx, mut event_rx) = mpsc::channel::<ClientEvent>(64);
     let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -302,17 +352,30 @@ async fn run_connect(args: ConnectArgs) -> Result<()> {
     let auto_reconnect = !args.no_reconnect;
     let reconnect_serial = args.serial.clone();
     let reconnect_port = args.port;
+    let spawn_transport = transport.clone();
     let client_handle = tokio::spawn(async move {
-        if auto_reconnect {
-            client::run_client_with_reconnect(
-                config,
-                ReconnectConfig::default(),
-                event_tx,
-                client_shutdown,
-                move |_attempt| {
-                    let serial = reconnect_serial.clone();
-                    async move {
-                        if is_usb {
+        match (spawn_transport, auto_reconnect) {
+            (ConnectTransport::UsbAoa, true) => {
+                client::run_aoa_client_with_reconnect(
+                    config,
+                    ReconnectConfig::default(),
+                    event_tx,
+                    client_shutdown,
+                )
+                .await
+            }
+            (ConnectTransport::UsbAoa, false) => {
+                client::run_aoa_client_loop(config, event_tx, client_shutdown).await
+            }
+            (ConnectTransport::UsbAdb { .. }, true) => {
+                client::run_client_with_reconnect(
+                    config,
+                    ReconnectConfig::default(),
+                    event_tx,
+                    client_shutdown,
+                    move |_attempt| {
+                        let serial = reconnect_serial.clone();
+                        async move {
                             tokio::task::spawn_blocking(move || {
                                 adb::setup_adb_forward(
                                     serial.as_deref(),
@@ -324,15 +387,24 @@ async fn run_connect(args: ConnectArgs) -> Result<()> {
                             .map_err(|e| format!("ADB forward task failed: {e}"))?
                             .map(|_| ())
                             .map_err(|e| format!("ADB error: {e}"))
-                        } else {
-                            Ok(())
                         }
-                    }
-                },
-            )
-            .await
-        } else {
-            client::run_client_loop(config, event_tx, client_shutdown).await
+                    },
+                )
+                .await
+            }
+            (ConnectTransport::Wifi { .. }, true) => {
+                client::run_client_with_reconnect(
+                    config,
+                    ReconnectConfig::default(),
+                    event_tx,
+                    client_shutdown,
+                    |_attempt| async { Ok(()) },
+                )
+                .await
+            }
+            (ConnectTransport::UsbAdb { .. } | ConnectTransport::Wifi { .. }, false) => {
+                client::run_client_loop(config, event_tx, client_shutdown).await
+            }
         }
     });
 
@@ -482,7 +554,7 @@ async fn run_connect(args: ConnectArgs) -> Result<()> {
     }
 
     shutdown.store(true, Ordering::Relaxed);
-    let _ = client_handle.await;
+    let client_result = client_handle.await;
 
     // Gracefully terminate decoder and audio worker threads
     decoder_sender.stop();
@@ -507,8 +579,15 @@ async fn run_connect(args: ConnectArgs) -> Result<()> {
         );
     }
 
-    if is_usb {
+    if matches!(transport, ConnectTransport::UsbAdb { .. }) {
         let _ = adb::remove_adb_forward(args.serial.as_deref(), args.port);
+    }
+
+    if let Ok(Err(ClientError::UsbAoa(UsbAoaError::PermissionDenied(path)))) = client_result {
+        eprintln!(
+            "USB permission denied on '{}'. Install `packaging/linux/70-camcraft-aoa.rules` into /etc/udev/rules.d/ or click 'Grant USB Access' in `camcraft-gui`.",
+            path.display()
+        );
     }
 
     info!("CamCraft CLI connection session ended");
@@ -665,16 +744,36 @@ async fn run_update(check_only: bool) -> Result<()> {
     .context("Update install task panicked")?
     .context("Failed to install update")?;
 
-    println!(
-        "Successfully updated {} to v{}.",
-        install_outcome.binary_path.display(),
-        install_outcome.version
-    );
-    if install_outcome.sibling_updated {
-        println!("Sibling `camcraft-gui` binary in the same folder was also updated.");
-    }
+    println!("{}", format_update_outcome(&install_outcome));
 
     Ok(())
+}
+
+fn format_update_outcome(install_outcome: &updater::InstallOutcome) -> String {
+    match &install_outcome.action {
+        InstallAction::ReplacedInPlace => {
+            let mut msg = format!(
+                "Successfully updated {} to v{}.",
+                install_outcome.binary_path.display(),
+                install_outcome.version
+            );
+            if install_outcome.sibling_updated {
+                msg.push_str(
+                    "\nSibling `camcraft-gui` binary in the same folder was also updated.",
+                );
+            }
+            msg
+        }
+        InstallAction::DownloadedPackage {
+            package_path,
+            install_command,
+        } => format!(
+            "Downloaded verified v{} package to: {}\nInstall it by running:\n  {}",
+            install_outcome.version,
+            package_path.display(),
+            install_command
+        ),
+    }
 }
 
 /// Formats and logs the device capability banner upon receiving `CONTROL_HELLO`.
@@ -735,4 +834,127 @@ fn print_stats(stats: &StreamStats) {
         "[STATS] FPS: {:>5.1} | Bitrate: {:>6.2} Mbps | RTT: {:>5.2} ms | Total: {:>6} frames ({:.2} MB) | Keyframes: {}",
         stats.fps, stats.bitrate_mbps, stats.rtt_ms, stats.total_frames, mb, stats.keyframe_count
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_connect_defaults_to_usb_aoa_and_auto_vcam_backend() {
+        let cli = Cli::try_parse_from(["camcraft-cli", "connect"]).expect("parse defaults");
+        let Command::Connect(args) = cli.command else {
+            panic!("expected Connect command");
+        };
+        assert_eq!(args.vcam_backend, VcamBackendMode::Auto);
+        assert_eq!(resolve_connect_transport(&args), ConnectTransport::UsbAoa);
+
+        let cli_usb =
+            Cli::try_parse_from(["camcraft-cli", "connect", "--usb"]).expect("parse --usb");
+        let Command::Connect(args_usb) = cli_usb.command else {
+            panic!("expected Connect command");
+        };
+        assert_eq!(
+            resolve_connect_transport(&args_usb),
+            ConnectTransport::UsbAoa
+        );
+    }
+
+    #[test]
+    fn cli_connect_adb_flag_selects_legacy_adb_transport() {
+        let cli_usb_adb = Cli::try_parse_from([
+            "camcraft-cli",
+            "connect",
+            "--usb",
+            "--adb",
+            "--port",
+            "9877",
+        ])
+        .expect("parse --usb --adb");
+        let Command::Connect(args) = cli_usb_adb.command else {
+            panic!("expected Connect command");
+        };
+        assert_eq!(
+            resolve_connect_transport(&args),
+            ConnectTransport::UsbAdb {
+                endpoint: "127.0.0.1:9877".to_owned(),
+            }
+        );
+
+        let cli_adb_only =
+            Cli::try_parse_from(["camcraft-cli", "connect", "--adb"]).expect("parse --adb");
+        let Command::Connect(args_only) = cli_adb_only.command else {
+            panic!("expected Connect command");
+        };
+        assert_eq!(
+            resolve_connect_transport(&args_only),
+            ConnectTransport::UsbAdb {
+                endpoint: "127.0.0.1:9876".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn cli_connect_wifi_and_vcam_backend_flags_parse_properly() {
+        let cli = Cli::try_parse_from([
+            "camcraft-cli",
+            "connect",
+            "--wifi",
+            "192.168.1.42",
+            "--vcam-backend",
+            "pipewire",
+        ])
+        .expect("parse --wifi + --vcam-backend");
+        let Command::Connect(args) = cli.command else {
+            panic!("expected Connect command");
+        };
+        assert_eq!(args.vcam_backend, VcamBackendMode::PipeWire);
+        assert_eq!(
+            resolve_connect_transport(&args),
+            ConnectTransport::Wifi {
+                endpoint: "192.168.1.42:9876".to_owned(),
+            }
+        );
+
+        let cli_v4l2 = Cli::try_parse_from([
+            "camcraft-cli",
+            "connect",
+            "--host",
+            "10.0.0.5:9000",
+            "--vcam-backend",
+            "v4l2",
+        ])
+        .expect("parse --host + v4l2");
+        let Command::Connect(args_v4l2) = cli_v4l2.command else {
+            panic!("expected Connect command");
+        };
+        assert_eq!(args_v4l2.vcam_backend, VcamBackendMode::V4l2);
+        assert_eq!(
+            resolve_connect_transport(&args_v4l2),
+            ConnectTransport::Wifi {
+                endpoint: "10.0.0.5:9000".to_owned(),
+            }
+        );
+
+        assert!(
+            Cli::try_parse_from(["camcraft-cli", "connect", "--vcam-backend", "invalid"]).is_err()
+        );
+    }
+
+    #[test]
+    fn format_update_outcome_handles_downloaded_package_cleanly() {
+        let pkg = updater::InstallOutcome {
+            version: "0.2.0".to_owned(),
+            binary_path: PathBuf::from("/home/user/.cache/camcraft/updates/camcraft-0.2.0-1.x86_64.rpm"),
+            sibling_updated: false,
+            action: InstallAction::DownloadedPackage {
+                package_path: PathBuf::from("/home/user/.cache/camcraft/updates/camcraft-0.2.0-1.x86_64.rpm"),
+                install_command: "sudo dnf install -y /home/user/.cache/camcraft/updates/camcraft-0.2.0-1.x86_64.rpm".to_owned(),
+            },
+        };
+        let rendered = format_update_outcome(&pkg);
+        assert!(rendered.contains("Downloaded verified v0.2.0 package"));
+        assert!(rendered.contains("sudo dnf install -y"));
+        assert!(!rendered.contains("Successfully updated"));
+    }
 }
