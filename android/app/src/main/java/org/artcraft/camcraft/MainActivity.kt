@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color as AndroidColor
+import android.hardware.usb.UsbAccessory
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -27,6 +28,7 @@ import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import org.artcraft.camcraft.network.CamCraftStreamService
 import org.artcraft.camcraft.network.StreamConnectionStatus
+import org.artcraft.camcraft.network.UsbAccessoryTransport
 import org.artcraft.camcraft.ui.CamCraftScreen
 import org.artcraft.camcraft.ui.OledSaverOverlay
 import org.artcraft.camcraft.ui.rememberDeviceTelemetry
@@ -36,6 +38,8 @@ import org.artcraft.camcraft.update.AppUpdateManager
 
 class MainActivity : ComponentActivity() {
 
+    private var pendingUsbAccessory: UsbAccessory? = null
+
     private val permissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { results ->
@@ -44,8 +48,15 @@ class MainActivity : ComponentActivity() {
             Manifest.permission.CAMERA,
         ) == PackageManager.PERMISSION_GRANTED)
 
+        val accessory = pendingUsbAccessory
+        pendingUsbAccessory = null
+
         if (cameraGranted) {
-            CamCraftStreamService.start(this)
+            if (accessory != null) {
+                CamCraftStreamService.startUsbAccessory(this, accessory)
+            } else {
+                CamCraftStreamService.start(this)
+            }
         }
     }
 
@@ -58,9 +69,7 @@ class MainActivity : ComponentActivity() {
         CamCraftStreamService.refreshLocalIp(this)
         AppUpdateManager.checkOnStartup()
 
-        if (intent?.getBooleanExtra("autostart", false) == true) {
-            startServerWithPermissionCheck()
-        }
+        handleIncomingIntent(intent, checkAttachedAccessory = true)
 
         setContent {
             val serviceState by CamCraftStreamService.serviceState.collectAsStateWithLifecycle()
@@ -132,12 +141,27 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        if (intent.getBooleanExtra("autostart", false)) {
+        handleIncomingIntent(intent, checkAttachedAccessory = false)
+    }
+
+    private fun handleIncomingIntent(intent: Intent?, checkAttachedAccessory: Boolean) {
+        val accessoryFromIntent = UsbAccessoryTransport.extractAccessoryFromIntent(intent)
+            ?.takeIf { UsbAccessoryTransport.isCamCraftAccessory(it) }
+        val accessory = accessoryFromIntent
+            ?: if (checkAttachedAccessory) {
+                UsbAccessoryTransport.findAttachedCamCraftAccessory(this)
+            } else {
+                null
+            }
+
+        if (accessory != null) {
+            startUsbAccessoryWithPermissionCheck(accessory)
+        } else if (intent?.getBooleanExtra("autostart", false) == true) {
             startServerWithPermissionCheck()
         }
     }
 
-    private fun startServerWithPermissionCheck() {
+    private fun missingStreamPermissions(): List<String> {
         val permissions = mutableListOf(
             Manifest.permission.CAMERA,
             Manifest.permission.RECORD_AUDIO,
@@ -146,13 +170,35 @@ class MainActivity : ComponentActivity() {
             permissions.add(Manifest.permission.POST_NOTIFICATIONS)
         }
 
-        val missing = permissions.filter {
+        return permissions.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
+    }
 
+    private fun startUsbAccessoryWithPermissionCheck(accessory: UsbAccessory) {
+        val missing = missingStreamPermissions()
         if (missing.isEmpty()) {
+            pendingUsbAccessory = null
+            CamCraftStreamService.startUsbAccessory(this, accessory)
+        } else {
+            pendingUsbAccessory = accessory
+            permissionsLauncher.launch(missing.toTypedArray())
+        }
+    }
+
+    private fun startServerWithPermissionCheck() {
+        val attachedAccessory = UsbAccessoryTransport.findAttachedCamCraftAccessory(this)
+        if (attachedAccessory != null) {
+            startUsbAccessoryWithPermissionCheck(attachedAccessory)
+            return
+        }
+
+        val missing = missingStreamPermissions()
+        if (missing.isEmpty()) {
+            pendingUsbAccessory = null
             CamCraftStreamService.start(this)
         } else {
+            pendingUsbAccessory = null
             permissionsLauncher.launch(missing.toTypedArray())
         }
     }

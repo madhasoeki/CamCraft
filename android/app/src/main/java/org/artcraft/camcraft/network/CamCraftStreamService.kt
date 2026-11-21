@@ -6,21 +6,29 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.hardware.usb.UsbAccessory
+import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.IBinder
+import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.camera.core.MeteringPoint
 import androidx.camera.view.PreviewView
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import androidx.core.content.IntentCompat
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.DataInputStream
 import java.io.EOFException
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.io.IOException
 import java.io.OutputStream
 import java.lang.ref.WeakReference
@@ -41,6 +49,8 @@ import kotlinx.coroutines.flow.getAndUpdate
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.artcraft.camcraft.MainActivity
 import org.artcraft.camcraft.R
 import org.artcraft.camcraft.camera.CameraEnumerator
@@ -122,9 +132,49 @@ class CamCraftStreamService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var serverSocket: ServerSocket? = null
     private var serverJob: Job? = null
+    private var usbJob: Job? = null
+
+    private val sessionMutex = Mutex()
 
     @Volatile
     private var activeClientSocket: Socket? = null
+
+    @Volatile
+    private var activeSessionCloser: (() -> Unit)? = null
+
+    private val usbTransportLock = Any()
+
+    @Volatile
+    private var activeUsbPfd: ParcelFileDescriptor? = null
+
+    @Volatile
+    private var activeUsbPfdClosed = AtomicBoolean(false)
+
+    @Volatile
+    private var activeUsbAccessory: UsbAccessory? = null
+    private val usbSessionClosing = AtomicBoolean(true)
+    private var isUsbReceiverRegistered = false
+
+    private val usbDetachedReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != UsbManager.ACTION_USB_ACCESSORY_DETACHED) return
+            val detachedAccessory = IntentCompat.getParcelableExtra(
+                intent,
+                UsbManager.EXTRA_ACCESSORY,
+                UsbAccessory::class.java,
+            )
+            val currentAccessory = activeUsbAccessory
+            if (detachedAccessory == null ||
+                currentAccessory == null ||
+                detachedAccessory == currentAccessory ||
+                UsbAccessoryTransport.isCamCraftAccessory(detachedAccessory)
+            ) {
+                Log.i(TAG, "USB accessory detached; closing USB AOA transport")
+                closeActiveUsbTransport()
+            }
+        }
+    }
+
     private val isStopping = AtomicBoolean(false)
     private val lifecycleLock = Any()
 
@@ -153,6 +203,14 @@ class CamCraftStreamService : Service() {
         super.onCreate()
         createNotificationChannel()
         startInForeground()
+
+        ContextCompat.registerReceiver(
+            this,
+            usbDetachedReceiver,
+            IntentFilter(UsbManager.ACTION_USB_ACCESSORY_DETACHED),
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
+        isUsbReceiverRegistered = true
 
         val initialIp = LocalIpResolver.resolveLocalIpv4Address(this)
         _serviceState.update { it.copy(localIpAddress = initialIp) }
@@ -211,6 +269,21 @@ class CamCraftStreamService : Service() {
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
             }
+            ACTION_START_USB_ACCESSORY -> {
+                Log.i(TAG, "USB accessory start command received")
+                startInForeground()
+                startServer()
+                val accessory = IntentCompat.getParcelableExtra(
+                    intent,
+                    UsbManager.EXTRA_ACCESSORY,
+                    UsbAccessory::class.java,
+                ) ?: UsbAccessoryTransport.findAttachedCamCraftAccessory(this)
+                if (accessory != null) {
+                    startUsbAccessorySession(accessory)
+                } else {
+                    Log.w(TAG, "ACTION_START_USB_ACCESSORY received without an attached CamCraft accessory")
+                }
+            }
             else -> {
                 Log.i(TAG, "Start command received, initializing CamCraft server")
                 startInForeground()
@@ -223,7 +296,15 @@ class CamCraftStreamService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         Log.i(TAG, "Destroying CamCraft service")
+        if (isUsbReceiverRegistered) {
+            try {
+                unregisterReceiver(usbDetachedReceiver)
+            } catch (_: IllegalArgumentException) {
+            }
+            isUsbReceiverRegistered = false
+        }
         stopServer()
+        closeActiveUsbTransport()
         activeTransformFlags = CcftFlags.NONE
         mdnsAdvertiser?.unregister()
         mdnsAdvertiser = null
@@ -283,21 +364,37 @@ class CamCraftStreamService : Service() {
                 serverSocket = socket
 
                 val currentIp = LocalIpResolver.resolveLocalIpv4Address(this@CamCraftStreamService)
-                _serviceState.update {
-                    it.copy(
-                        status = StreamConnectionStatus.LISTENING,
-                        clientAddress = null,
-                        localIpAddress = currentIp,
-                        listenPort = port,
-                        errorMessage = null,
-                    )
+                var becameListening = false
+                synchronized(lifecycleLock) {
+                    val sessionActive = activeSessionCloser != null ||
+                        _serviceState.value.status == StreamConnectionStatus.CONNECTED
+                    _serviceState.update {
+                        if (sessionActive) {
+                            it.copy(
+                                localIpAddress = currentIp,
+                                listenPort = port,
+                                errorMessage = null,
+                            )
+                        } else {
+                            becameListening = true
+                            it.copy(
+                                status = StreamConnectionStatus.LISTENING,
+                                clientAddress = null,
+                                localIpAddress = currentIp,
+                                listenPort = port,
+                                errorMessage = null,
+                            )
+                        }
+                    }
                 }
                 mdnsAdvertiser?.register(
                     deviceName = resolveDeviceName(),
                     port = port,
                     localIpAddress = currentIp,
                 )
-                updateNotification(buildListeningNotificationText(currentIp, port))
+                if (becameListening) {
+                    updateNotification(buildListeningNotificationText(currentIp, port))
+                }
                 Log.i(TAG, "CamCraft TCP Server listening on port $port (Wi-Fi IP: $currentIp)")
 
                 while (isActive && !socket.isClosed) {
@@ -318,13 +415,15 @@ class CamCraftStreamService : Service() {
                 }
                 Log.e(TAG, "Fatal server socket exception", e)
                 mdnsAdvertiser?.unregister()
-                _serviceState.update {
-                    it.copy(
-                        status = StreamConnectionStatus.ERROR,
-                        errorMessage = e.message ?: "Server error",
-                    )
+                if (activeSessionCloser == null) {
+                    _serviceState.update {
+                        it.copy(
+                            status = StreamConnectionStatus.ERROR,
+                            errorMessage = e.message ?: "Server error",
+                        )
+                    }
+                    updateNotification("Error: ${e.message}")
                 }
-                updateNotification("Error: ${e.message}")
             } finally {
                 if (socket != null) {
                     try {
@@ -367,6 +466,7 @@ class CamCraftStreamService : Service() {
             if (activeClientOutputStream === stream) {
                 activeClientOutputStream = null
             }
+            activeSessionCloser?.invoke()
             try {
                 activeClientSocket?.close()
             } catch (_: IOException) {}
@@ -423,144 +523,317 @@ class CamCraftStreamService : Service() {
     }
 
     private suspend fun handleClientConnection(clientSocket: Socket) {
-        activeClientSocket = clientSocket
         if (isStopping.get()) {
+            try {
+                clientSocket.close()
+            } catch (_: IOException) {}
+            return
+        }
+        if (usbJob?.isActive == true && !usbSessionClosing.get()) {
+            Log.i(TAG, "Ignoring incoming TCP connection while USB AOA session is active")
+            try {
+                clientSocket.close()
+            } catch (_: IOException) {}
+            return
+        }
+
+        activeClientSocket = clientSocket
+        val clientIp = clientSocket.inetAddress?.hostAddress ?: "unknown"
+        Log.i(TAG, "PC Client connected from $clientIp")
+
+        var inputStream: DataInputStream? = null
+        var outputStream: OutputStream? = null
+        val closeTransport: () -> Unit = {
             try {
                 clientSocket.close()
             } catch (_: IOException) {}
             if (activeClientSocket === clientSocket) {
                 activeClientSocket = null
             }
-            return
         }
-
-        val clientIp = clientSocket.inetAddress?.hostAddress ?: "unknown"
-        Log.i(TAG, "PC Client connected from $clientIp")
-
-        clientSocket.tcpNoDelay = true
-        clientSocket.keepAlive = true
-        clientSocket.soTimeout = CLIENT_READ_TIMEOUT_MS
-
-        val initialActiveState = _serviceState.value.activeState
-        activeTransformFlags = computeTransformFlags(
-            mirrorHorizontal = initialActiveState.mirrorHorizontal,
-            rotationDeg = initialActiveState.rotationDeg,
-        )
-
-        _serviceState.update {
-            it.copy(
-                status = StreamConnectionStatus.CONNECTED,
-                clientAddress = clientIp,
-            )
-        }
-        updateNotification(buildConnectedNotificationText(clientIp, initialActiveState))
-
-        var inputStream: DataInputStream? = null
-        var outputStream: OutputStream? = null
 
         try {
+            clientSocket.tcpNoDelay = true
+            clientSocket.keepAlive = true
+            clientSocket.soTimeout = CLIENT_READ_TIMEOUT_MS
+
             outputStream = BufferedOutputStream(clientSocket.getOutputStream(), 65536)
             inputStream = DataInputStream(BufferedInputStream(clientSocket.getInputStream(), 16384))
 
-            // 1. Send CONTROL_HELLO (0x10)
-            val hello = createDeviceHello(_serviceState.value.activeState, this)
-            val helloPacket = CcftPacket.controlHello(System.nanoTime() / 1_000L, hello)
-            synchronized(clientOutputLock) {
-                helloPacket.encodeTo(outputStream, flush = true)
-            }
-            Log.i(TAG, "Sent CONTROL_HELLO to client")
-
-            // 2. Set active output stream for encoder video packets
-            activeClientOutputStream = outputStream
-
-            // 3. Start real CameraX + H.264 hardware encoder pipeline
-            val activeState = _serviceState.value.activeState
-            cameraStreamManager?.startStream(
-                cameraId = activeState.cameraId,
-                width = activeState.width,
-                height = activeState.height,
-                fps = activeState.fps,
-                bitrateKbps = activeState.bitrateKbps,
+            handleClientSession(
+                clientLabel = clientIp,
+                inputStream = inputStream,
+                outputStream = outputStream,
+                closeTransport = closeTransport,
             )
-
-            // 4. If encoder already cached SPS/PPS config, immediately dispatch it
-            cameraStreamManager?.cachedConfig?.let { spsPps ->
-                synchronized(clientOutputLock) {
-                    CcftPacket.writePacket(
-                        output = outputStream,
-                        type = PacketType.VIDEO_CONFIG,
-                        flags = CcftFlags.NONE,
-                        ptsUs = System.nanoTime() / 1_000L,
-                        payload = spsPps,
-                        offset = 0,
-                        length = spsPps.size,
-                        flush = true,
-                    )
-                }
-                cameraStreamManager?.requestKeyFrame()
-            }
-
-            // 5. Start AudioStreamEngine if audio forwarding is enabled
-            if (activeState.audioEnabled) {
-                val audioStarted = audioStreamEngine?.start(initiallyMuted = activeState.audioMuted) ?: false
-                if (!audioStarted) {
-                    Log.w(TAG, "AudioStreamEngine failed to start (check RECORD_AUDIO permission)")
-                    val updatedAudioState = activeState.copy(audioEnabled = false)
-                    _serviceState.update { state ->
-                        state.copy(activeState = updatedAudioState)
-                    }
-                    sendControlAck(updatedAudioState, outputStream, clientOutputLock)
-                }
-            }
-
-            // 6. Run reader loop to process incoming heartbeats and control commands
-            runPacketReader(inputStream, outputStream, clientOutputLock)
         } catch (e: Exception) {
-            Log.w(TAG, "Client session terminated: ${e.message}")
-        } finally {
-            audioStreamEngine?.stop()
-            cameraStreamManager?.stopStream()
-            activeClientOutputStream = null
-            if (activeClientSocket === clientSocket) {
-                activeClientSocket = null
-            }
-
+            Log.w(TAG, "Client TCP connection setup/session error: ${e.message}")
             try {
                 inputStream?.close()
             } catch (_: IOException) {}
             try {
                 outputStream?.close()
             } catch (_: IOException) {}
-            try {
-                clientSocket.close()
-            } catch (_: IOException) {}
+            closeTransport()
+        }
+    }
 
-            val isActiveCoroutine = currentCoroutineContext().isActive
-            val revertedToListening = synchronized(lifecycleLock) {
-                val canRevertToListening = !isStopping.get() &&
-                    isActiveCoroutine &&
-                    serverSocket?.isClosed == false
-                if (canRevertToListening) {
-                    val refreshedIp = LocalIpResolver.resolveLocalIpv4Address(this)
-                    val listenPort = _serviceState.value.listenPort
-                    _serviceState.update {
-                        it.copy(
-                            status = StreamConnectionStatus.LISTENING,
-                            clientAddress = null,
-                            localIpAddress = refreshedIp,
-                            currentFps = 0f,
-                        )
+    private fun startUsbAccessorySession(accessory: UsbAccessory) {
+        if (!UsbAccessoryTransport.isCamCraftAccessory(accessory)) {
+            Log.w(
+                TAG,
+                "Ignoring non-CamCraft USB accessory (${accessory.manufacturer}/${accessory.model})",
+            )
+            return
+        }
+
+        val previousUsbJob: Job?
+        synchronized(lifecycleLock) {
+            isStopping.set(false)
+            val existing = usbJob
+            if (existing?.isActive == true && !usbSessionClosing.get()) {
+                Log.i(TAG, "USB AOA session already active; skipping duplicate start")
+                return
+            }
+            previousUsbJob = existing
+            usbSessionClosing.set(false)
+
+            // Preempt any active Wi-Fi client socket so USB Direct can take ownership immediately.
+            activeClientSocket?.let { socket ->
+                try {
+                    socket.close()
+                } catch (_: IOException) {}
+            }
+
+            usbJob = serviceScope.launch {
+                if (previousUsbJob != null && previousUsbJob.isActive) {
+                    previousUsbJob.join()
+                }
+                if (isStopping.get() || !currentCoroutineContext().isActive) {
+                    return@launch
+                }
+
+                val usbManager = getSystemService(Context.USB_SERVICE) as? UsbManager
+                if (usbManager == null) {
+                    Log.w(TAG, "UsbManager unavailable; cannot open USB accessory")
+                    return@launch
+                }
+
+                val pfd = try {
+                    usbManager.openAccessory(accessory)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to open USB accessory: ${e.message}", e)
+                    null
+                }
+                if (pfd == null) {
+                    Log.w(TAG, "UsbManager.openAccessory returned null for ${accessory.model}")
+                    return@launch
+                }
+
+                val pfdClosedFlag = AtomicBoolean(false)
+                synchronized(usbTransportLock) {
+                    activeUsbPfd = pfd
+                    activeUsbPfdClosed = pfdClosedFlag
+                    activeUsbAccessory = accessory
+                }
+
+                val closeTransport: () -> Unit = {
+                    usbSessionClosing.set(true)
+                    if (pfdClosedFlag.compareAndSet(false, true)) {
+                        try {
+                            pfd.close()
+                        } catch (e: IOException) {
+                            Log.w(TAG, "Error closing USB accessory descriptor: ${e.message}")
+                        }
                     }
-                    updateNotification(buildListeningNotificationText(refreshedIp, listenPort))
-                    true
-                } else {
-                    false
+                    synchronized(usbTransportLock) {
+                        if (activeUsbPfd === pfd) {
+                            activeUsbPfd = null
+                            activeUsbAccessory = null
+                        }
+                    }
+                }
+
+                var inputStream: DataInputStream? = null
+                var outputStream: OutputStream? = null
+                try {
+                    val fd = pfd.fileDescriptor
+                    inputStream = DataInputStream(BufferedInputStream(FileInputStream(fd), 16_384))
+                    outputStream = BufferedOutputStream(
+                        AoaChunkedOutputStream(FileOutputStream(fd)),
+                        65_536,
+                    )
+
+                    handleClientSession(
+                        clientLabel = USB_CLIENT_LABEL,
+                        inputStream = inputStream,
+                        outputStream = outputStream,
+                        closeTransport = closeTransport,
+                    )
+                } catch (e: Exception) {
+                    Log.w(TAG, "USB AOA session setup/teardown error: ${e.message}")
+                } finally {
+                    try {
+                        inputStream?.close()
+                    } catch (_: IOException) {}
+                    try {
+                        outputStream?.close()
+                    } catch (_: IOException) {}
+                    closeTransport()
                 }
             }
-            if (revertedToListening) {
-                Log.i(TAG, "Client disconnected, reverting to LISTENING state")
-            } else {
-                Log.i(TAG, "Client disconnected during server stop; skipping LISTENING revert")
+        }
+    }
+
+    private fun closeActiveUsbTransport() {
+        val pfd: ParcelFileDescriptor?
+        val closedFlag: AtomicBoolean
+        synchronized(usbTransportLock) {
+            usbSessionClosing.set(true)
+            pfd = activeUsbPfd
+            closedFlag = activeUsbPfdClosed
+            activeUsbPfd = null
+            activeUsbAccessory = null
+        }
+        if (pfd != null && closedFlag.compareAndSet(false, true)) {
+            try {
+                pfd.close()
+            } catch (e: IOException) {
+                Log.w(TAG, "Error closing active USB accessory descriptor: ${e.message}")
+            }
+        }
+    }
+
+    private suspend fun handleClientSession(
+        clientLabel: String,
+        inputStream: DataInputStream,
+        outputStream: OutputStream,
+        closeTransport: () -> Unit,
+    ) {
+        sessionMutex.withLock {
+            if (isStopping.get() || !currentCoroutineContext().isActive) {
+                closeTransport()
+                return
+            }
+
+            val initialActiveState = _serviceState.value.activeState
+            activeTransformFlags = computeTransformFlags(
+                mirrorHorizontal = initialActiveState.mirrorHorizontal,
+                rotationDeg = initialActiveState.rotationDeg,
+            )
+
+            synchronized(lifecycleLock) {
+                activeSessionCloser = closeTransport
+                _serviceState.update {
+                    it.copy(
+                        status = StreamConnectionStatus.CONNECTED,
+                        clientAddress = clientLabel,
+                    )
+                }
+            }
+            updateNotification(buildConnectedNotificationText(clientLabel, initialActiveState))
+
+            try {
+                // 1. Send CONTROL_HELLO (0x10)
+                val hello = createDeviceHello(_serviceState.value.activeState, this)
+                val helloPacket = CcftPacket.controlHello(System.nanoTime() / 1_000L, hello)
+                synchronized(clientOutputLock) {
+                    helloPacket.encodeTo(outputStream, flush = true)
+                }
+                Log.i(TAG, "Sent CONTROL_HELLO to $clientLabel")
+
+                // 2. Set active output stream for encoder video packets
+                activeClientOutputStream = outputStream
+
+                // 3. Start real CameraX + H.264 hardware encoder pipeline
+                val activeState = _serviceState.value.activeState
+                cameraStreamManager?.startStream(
+                    cameraId = activeState.cameraId,
+                    width = activeState.width,
+                    height = activeState.height,
+                    fps = activeState.fps,
+                    bitrateKbps = activeState.bitrateKbps,
+                )
+
+                // 4. If encoder already cached SPS/PPS config, immediately dispatch it
+                cameraStreamManager?.cachedConfig?.let { spsPps ->
+                    synchronized(clientOutputLock) {
+                        CcftPacket.writePacket(
+                            output = outputStream,
+                            type = PacketType.VIDEO_CONFIG,
+                            flags = CcftFlags.NONE,
+                            ptsUs = System.nanoTime() / 1_000L,
+                            payload = spsPps,
+                            offset = 0,
+                            length = spsPps.size,
+                            flush = true,
+                        )
+                    }
+                    cameraStreamManager?.requestKeyFrame()
+                }
+
+                // 5. Start AudioStreamEngine if audio forwarding is enabled
+                if (activeState.audioEnabled) {
+                    val audioStarted = audioStreamEngine?.start(initiallyMuted = activeState.audioMuted) ?: false
+                    if (!audioStarted) {
+                        Log.w(TAG, "AudioStreamEngine failed to start (check RECORD_AUDIO permission)")
+                        val updatedAudioState = activeState.copy(audioEnabled = false)
+                        _serviceState.update { state ->
+                            state.copy(activeState = updatedAudioState)
+                        }
+                        sendControlAck(updatedAudioState, outputStream, clientOutputLock)
+                    }
+                }
+
+                // 6. Run reader loop to process incoming heartbeats and control commands
+                runPacketReader(inputStream, outputStream, clientOutputLock)
+            } catch (e: Exception) {
+                Log.w(TAG, "Client session ($clientLabel) terminated: ${e.message}")
+            } finally {
+                audioStreamEngine?.stop()
+                cameraStreamManager?.stopStream()
+                if (activeClientOutputStream === outputStream) {
+                    activeClientOutputStream = null
+                }
+                if (activeSessionCloser === closeTransport) {
+                    activeSessionCloser = null
+                }
+
+                try {
+                    inputStream.close()
+                } catch (_: IOException) {}
+                try {
+                    outputStream.close()
+                } catch (_: IOException) {}
+                closeTransport()
+
+                val isActiveCoroutine = currentCoroutineContext().isActive
+                val revertedToListening = synchronized(lifecycleLock) {
+                    val canRevertToListening = !isStopping.get() &&
+                        isActiveCoroutine &&
+                        serverSocket?.isClosed == false
+                    if (canRevertToListening) {
+                        val refreshedIp = LocalIpResolver.resolveLocalIpv4Address(this)
+                        val listenPort = _serviceState.value.listenPort
+                        _serviceState.update {
+                            it.copy(
+                                status = StreamConnectionStatus.LISTENING,
+                                clientAddress = null,
+                                localIpAddress = refreshedIp,
+                                currentFps = 0f,
+                            )
+                        }
+                        updateNotification(buildListeningNotificationText(refreshedIp, listenPort))
+                        true
+                    } else {
+                        false
+                    }
+                }
+                if (revertedToListening) {
+                    Log.i(TAG, "Client disconnected ($clientLabel), reverting to LISTENING state")
+                } else {
+                    Log.i(TAG, "Client disconnected ($clientLabel) during server stop; skipping LISTENING revert")
+                }
             }
         }
     }
@@ -573,7 +846,7 @@ class CamCraftStreamService : Service() {
         output: OutputStream,
         outputLock: Any,
     ) {
-        while (serviceScope.isActive) {
+        while (serviceScope.isActive && !isStopping.get()) {
             val packet = try {
                 CcftPacket.readPacket(input)
             } catch (e: EOFException) {
@@ -815,6 +1088,9 @@ class CamCraftStreamService : Service() {
         synchronized(lifecycleLock) {
             isStopping.set(true)
             mdnsAdvertiser?.unregister()
+            activeSessionCloser?.invoke()
+            activeSessionCloser = null
+            closeActiveUsbTransport()
             try {
                 activeClientSocket?.close()
             } catch (ignored: IOException) {}
@@ -823,6 +1099,8 @@ class CamCraftStreamService : Service() {
                 serverSocket?.close()
             } catch (ignored: IOException) {}
             serverSocket = null
+            usbJob?.cancel()
+            usbJob = null
             serverJob?.cancel()
             serverJob = null
         }
@@ -876,7 +1154,9 @@ class CamCraftStreamService : Service() {
         private const val CLIENT_READ_TIMEOUT_MS = 10_000
 
         const val ACTION_START = "org.artcraft.camcraft.action.START"
+        const val ACTION_START_USB_ACCESSORY = "org.artcraft.camcraft.action.START_USB_ACCESSORY"
         const val ACTION_STOP = "org.artcraft.camcraft.action.STOP"
+        const val USB_CLIENT_LABEL = "USB Direct"
 
         @Volatile
         private var activeInstance: CamCraftStreamService? = null
@@ -961,6 +1241,14 @@ class CamCraftStreamService : Service() {
         fun start(context: Context) {
             val intent = Intent(context, CamCraftStreamService::class.java).apply {
                 action = ACTION_START
+            }
+            context.startForegroundService(intent)
+        }
+
+        fun startUsbAccessory(context: Context, accessory: UsbAccessory) {
+            val intent = Intent(context, CamCraftStreamService::class.java).apply {
+                action = ACTION_START_USB_ACCESSORY
+                putExtra(UsbManager.EXTRA_ACCESSORY, accessory)
             }
             context.startForegroundService(intent)
         }
