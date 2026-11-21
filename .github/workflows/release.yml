@@ -386,11 +386,23 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.tag }}
 
-      - name: Download build artifacts
+      - name: Download Fedora release artifacts
         uses: actions/download-artifact@v8
         with:
+          name: desktop-fedora
           path: release-assets
-          merge-multiple: true
+
+      - name: Download generic Linux release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: desktop-linux
+          path: release-assets
+
+      - name: Download Android APK artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: android-apk
+          path: release-assets
 
       - name: Generate SHA256SUMS.txt
         run: |
@@ -479,11 +491,27 @@ jobs:
             EXTRA_FLAGS+=(--draft)
           fi
 
+          shopt -s nullglob
+          UPLOAD_ASSETS=(
+            release-assets/CamCraft-*.AppImage
+            release-assets/camcraft-*.rpm
+            release-assets/camcraft_*.deb
+            release-assets/camcraft-desktop-fedora-x86_64.tar.gz
+            release-assets/camcraft-desktop-linux-x86_64.tar.gz
+            release-assets/camcraft-android-*.apk
+            release-assets/SHA256SUMS.txt
+          )
+          if [ "${#UPLOAD_ASSETS[@]}" -ne 7 ]; then
+            echo "::error::Expected 7 release assets, found ${#UPLOAD_ASSETS[@]}: ${UPLOAD_ASSETS[*]}"
+            ls -la release-assets
+            exit 1
+          fi
+
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" release-assets/* --clobber
+            gh release upload "$TAG" "${UPLOAD_ASSETS[@]}" --clobber
             gh release edit "$TAG" --title "CamCraft ${TAG}" --notes-file "$NOTES_FILE"
           else
-            gh release create "$TAG" release-assets/* \
+            gh release create "$TAG" "${UPLOAD_ASSETS[@]}" \
               --title "CamCraft ${TAG}" \
               --notes-file "$NOTES_FILE" \
               "${EXTRA_FLAGS[@]}"
