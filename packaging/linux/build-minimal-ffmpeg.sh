@@ -3,7 +3,7 @@ set -euo pipefail
 
 PREFIX_DIR="${1:-/tmp/camcraft-ffmpeg}"
 PRIVLIB_DIR="${2:-/tmp/camcraft-privlib}"
-FFMPEG_VERSION="7.1.1"
+FFMPEG_VERSION="7.1.3"
 FFMPEG_URL="https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"
 
 WORK_DIR="$(mktemp -d)"
@@ -75,6 +75,30 @@ for lib in libavcodec libavutil libswscale; do
         esac
     done <<< "${needed}"
 done
+
+echo "=== Smoke-testing shared libraries with --no-allow-shlib-undefined ==="
+cat > "${WORK_DIR}/smoke.c" <<'EOF'
+#include <libavcodec/avcodec.h>
+#include <libavutil/avutil.h>
+#include <libswscale/swscale.h>
+#include <stdio.h>
+
+int main(void) {
+    printf("avcodec=%u avutil=%u swscale=%u\n",
+           avcodec_version(), avutil_version(), swscale_version());
+    return 0;
+}
+EOF
+cc "${WORK_DIR}/smoke.c" \
+    -I"${PREFIX_DIR}/include" \
+    -L"${PREFIX_DIR}/lib" \
+    -Wl,-rpath-link,"${PREFIX_DIR}/lib" \
+    -Wl,-rpath,"${PRIVLIB_DIR}" \
+    -Wl,--no-allow-shlib-undefined \
+    -Wl,--no-as-needed \
+    -lavcodec -lswscale -lavutil \
+    -o "${WORK_DIR}/smoke"
+env -u LD_LIBRARY_PATH "${WORK_DIR}/smoke"
 
 echo "Minimal LGPL FFmpeg ${FFMPEG_VERSION} staged in ${PRIVLIB_DIR}:"
 ls -lh "${PRIVLIB_DIR}"

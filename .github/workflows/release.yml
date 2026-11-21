@@ -228,7 +228,7 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.tag }}
 
-      - name: Build minimal LGPL FFmpeg 7.1.1 shared libraries
+      - name: Build minimal LGPL FFmpeg 7.1.3 shared libraries
         run: |
           chmod +x packaging/linux/build-minimal-ffmpeg.sh
           ./packaging/linux/build-minimal-ffmpeg.sh /tmp/camcraft-ffmpeg /tmp/camcraft-privlib

@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **Cross-Distro Linux Packaging & FFmpeg SONAME Compatibility:**
-  - Bundled minimal LGPL FFmpeg 7.1.1 shared libraries (`h264` decoder/parser + `swscale` only) privately under `/usr/lib/camcraft/` with `$ORIGIN` RPATH (`packaging/linux/build-minimal-ffmpeg.sh`), eliminating cross-distro SONAME conflicts (`libavcodec.so.63` vs `.62`/`.60`/`.58`) across Fedora 40–45+, Ubuntu 22.04–26.04, Debian 12/13, and derivatives.
+  - Bundled minimal LGPL FFmpeg 7.1.3 shared libraries (`h264` decoder/parser + `swscale` only) privately under `/usr/lib/camcraft/` with `$ORIGIN` RPATH (`packaging/linux/build-minimal-ffmpeg.sh`), eliminating cross-distro SONAME conflicts (`libavcodec.so.63` vs `.62`/`.60`/`.58`) across Fedora 40–45+, Ubuntu 22.04–26.04, Debian 12/13, and derivatives.
   - Updated `camcraft.spec` and `build-deb.sh` so `.rpm` and `.deb` packages require only `glibc >= 2.35` and audio utilities without locking to distro-specific `libav*` SONAMEs.
   - Updated `build-appimage.sh` and `.github/workflows/release.yml` to package the minimal private FFmpeg libraries directly instead of pulling host codec bloat, significantly reducing `.AppImage` size.
 
