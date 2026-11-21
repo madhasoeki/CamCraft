@@ -32,6 +32,9 @@ pub enum CoreError {
     #[error("updater error: {0}")]
     Update(#[from] updater::UpdateError),
 
+    #[error("USB AOA transport error: {0}")]
+    UsbAoa(#[from] usb_aoa::UsbAoaError),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -236,6 +239,9 @@ pub mod vmic;
 
 /// In-app GitHub Releases auto-updater and self-replace helper.
 pub mod updater;
+
+/// Pure-Rust Linux `usbdevfs` Android Open Accessory (AOA v1) transport.
+pub mod usb_aoa;
 
 #[cfg(test)]
 mod tests {
