@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2] - 2026-11-21
+
+### Added
+- **Zero-Setup PipeWire Virtual Camera (`camcraft-core`):**
+  - Added native PipeWire `Video/Source` sink (`PipeWireCameraSink`) loaded dynamically at runtime via `libc::dlopen("libpipewire-0.3.so.0")` with zero compile-time or `DT_NEEDED` PipeWire dependencies.
+  - Added `VcamBackendMode` (`Auto` defaulting to PipeWire with automatic fallback to `v4l2loopback`, `PipeWire`, and `V4l2`) plus a 1-click Polkit helper (`enable_v4l2loopback_via_pkexec`) for legacy V4L2-only apps.
+- **Plug-and-Play USB Without USB Debugging (`AOA v1`):**
+  - Implemented pure-Rust Linux `usbdevfs` Android Open Accessory (`usb_aoa.rs`) and transport-agnostic async streaming (`run_client_stream_loop`, `run_aoa_client_loop`, `run_aoa_client_with_reconnect`), plus 1-click udev permission installation (`70-camcraft-aoa.rules` / `install_udev_rules_via_pkexec`).
+  - Implemented Android `UsbAccessory` transport (`UsbAccessoryTransport.kt`, `accessory_filter.xml`, `AoaChunkedOutputStream` with 16 KiB chunking, `ACTION_USB_ACCESSORY_DETACHED` cleanup, and concurrent Wi-Fi + USB session handling in `CamCraftStreamService`).
+  - Updated GUI and CLI defaults to **Direct USB (Plug & Play)** while preserving **Legacy ADB** (`--adb`) as fallback.
+- **Multi-Distro Linux Packaging & Install-Aware Updater:**
+  - Added RPM (`packaging/linux/camcraft.spec`, `just build-rpm`), Debian/Ubuntu `.deb` (`packaging/linux/build-deb.sh`), universal `.AppImage` (`packaging/linux/build-appimage.sh` built on Ubuntu 22.04), and udev rules (`70-camcraft-aoa.rules`).
+  - Updated `updater.rs`, `camcraft-gui`, and `camcraft-cli` to detect `InstallKind` (`AppImage`, `RpmPackage`, `DebPackage`, `PortableArchive`), update AppImages in place, and verify/open downloaded `.rpm`/`.deb` packages cleanly without permission errors.
+
+### Changed
+- **Slimmed FFmpeg Runtime Linking:** Disabled unused `ffmpeg-next` features (`device`, `filter`, `software-resampling`), leaving only `libavcodec`, `libavutil`, and `libswscale` in release binary `DT_NEEDED` entries.
+- **Documentation:** Updated `README.md` and `docs/DESIGN.md` to feature `.AppImage`, `.rpm`, `.deb`, and universal `.apk` downloads without end-user setup scripts.
+- **Dependencies:** Consolidated Dependabot updates including `eframe`/`egui` 0.37.0, `bytes` 1.12.2, `clap` 4.6.9, Gradle Wrapper 9.9.1, AGP 9.5.2, Kotlin 2.4.21, `kotlinx-coroutines-android` 1.11.0, `kotlinx-serialization-json` 1.13.0, and GitHub Actions (`checkout@v7`, `setup-java@v6`, `gradle/actions@v6`, `upload-artifact@v7`, `download-artifact@v8`).
+
 ## [0.0.1] - 2026-11-20
 
 ### Added
@@ -28,5 +47,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Maintainer-controlled GitHub Release CD (manual `workflow_dispatch` or `vX.Y.Z` tag push) producing Fedora x86_64 tarballs, generic Linux x86_64 tarballs, signed/fallback Android APKs, and `SHA256SUMS.txt`.
   - Secret-configured AI PR Review Agent (`AI_API_ENDPOINT`, `AI_API_KEY`, `AI_MODEL`).
 
-[Unreleased]: https://github.com/madhasoeki/CamCraft/compare/v0.0.1...HEAD
+[Unreleased]: https://github.com/madhasoeki/CamCraft/compare/v0.0.2...HEAD
+[0.0.2]: https://github.com/madhasoeki/CamCraft/releases/tag/v0.0.2
 [0.0.1]: https://github.com/madhasoeki/CamCraft/releases/tag/v0.0.1
