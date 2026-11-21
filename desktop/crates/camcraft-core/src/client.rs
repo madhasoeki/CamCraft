@@ -16,7 +16,7 @@ use camcraft_protocol::{
     ProtocolError,
 };
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -55,6 +55,10 @@ pub enum ClientError {
     /// Channel send failure (internal pipeline issue).
     #[error("Internal pipeline channel error: {0}")]
     Channel(String),
+
+    /// USB AOA v1 transport failure.
+    #[error("USB AOA error: {0}")]
+    UsbAoa(#[from] crate::usb_aoa::UsbAoaError),
 }
 
 /// Real-time streaming metrics aggregated over a 1-second sliding window.
@@ -245,7 +249,7 @@ pub async fn run_client_loop(
     event_tx: mpsc::Sender<ClientEvent>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), ClientError> {
-    run_client_loop_inner(config, event_tx, shutdown, None, true).await
+    run_client_loop_inner(&config, event_tx, shutdown, None, true).await
 }
 
 /// Runs [`run_client_loop`] with an automatic reconnect loop on unexpected disconnections.
@@ -258,11 +262,89 @@ pub async fn run_client_with_reconnect<F, Fut>(
     reconnect: ReconnectConfig,
     event_tx: mpsc::Sender<ClientEvent>,
     shutdown: Arc<AtomicBool>,
-    mut before_reconnect: F,
+    before_reconnect: F,
 ) -> Result<(), ClientError>
 where
     F: FnMut(u32) -> Fut,
     Fut: Future<Output = Result<(), String>>,
+{
+    run_reconnect_loop(
+        reconnect,
+        &event_tx,
+        &shutdown,
+        before_reconnect,
+        |hello_seen| {
+            let config = config.clone();
+            let event_tx = event_tx.clone();
+            let shutdown = shutdown.clone();
+            async move {
+                run_client_loop_inner(
+                    &config,
+                    event_tx,
+                    shutdown,
+                    Some(hello_seen.as_ref()),
+                    false,
+                )
+                .await
+            }
+        },
+    )
+    .await
+}
+
+/// Connects to the Android device directly over USB AOA v1 (no ADB required),
+/// establishes bidirectional CCFT v1 streaming, and forwards events to `event_tx`.
+pub async fn run_aoa_client_loop(
+    config: ClientConfig,
+    event_tx: mpsc::Sender<ClientEvent>,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), ClientError> {
+    run_aoa_client_loop_inner(&config, event_tx, shutdown, None, true).await
+}
+
+/// Runs [`run_aoa_client_loop`] with an automatic reconnect loop on unexpected disconnections.
+pub async fn run_aoa_client_with_reconnect(
+    config: ClientConfig,
+    reconnect: ReconnectConfig,
+    event_tx: mpsc::Sender<ClientEvent>,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), ClientError> {
+    run_reconnect_loop(
+        reconnect,
+        &event_tx,
+        &shutdown,
+        |_| async { Ok(()) },
+        |hello_seen| {
+            let config = config.clone();
+            let event_tx = event_tx.clone();
+            let shutdown = shutdown.clone();
+            async move {
+                run_aoa_client_loop_inner(
+                    &config,
+                    event_tx,
+                    shutdown,
+                    Some(hello_seen.as_ref()),
+                    false,
+                )
+                .await
+            }
+        },
+    )
+    .await
+}
+
+async fn run_reconnect_loop<B, BFut, C, CFut>(
+    reconnect: ReconnectConfig,
+    event_tx: &mpsc::Sender<ClientEvent>,
+    shutdown: &Arc<AtomicBool>,
+    mut before_reconnect: B,
+    mut run_once: C,
+) -> Result<(), ClientError>
+where
+    B: FnMut(u32) -> BFut,
+    BFut: Future<Output = Result<(), String>>,
+    C: FnMut(Arc<AtomicBool>) -> CFut,
+    CFut: Future<Output = Result<(), ClientError>>,
 {
     let mut established_once = false;
     let mut attempt: u32 = 0;
@@ -273,7 +355,7 @@ where
         }
 
         if attempt > 0 {
-            if !sleep_until_retry_or_shutdown(reconnect.retry_interval, &shutdown).await {
+            if !sleep_until_retry_or_shutdown(reconnect.retry_interval, shutdown).await {
                 return Ok(());
             }
 
@@ -293,15 +375,8 @@ where
             }
         }
 
-        let hello_seen = AtomicBool::new(false);
-        let res = run_client_loop_inner(
-            config.clone(),
-            event_tx.clone(),
-            shutdown.clone(),
-            Some(&hello_seen),
-            false,
-        )
-        .await;
+        let hello_seen = Arc::new(AtomicBool::new(false));
+        let res = run_once(hello_seen.clone()).await;
 
         match res {
             Ok(()) => return Ok(()),
@@ -347,7 +422,7 @@ async fn sleep_until_retry_or_shutdown(duration: Duration, shutdown: &AtomicBool
 }
 
 async fn run_client_loop_inner(
-    config: ClientConfig,
+    config: &ClientConfig,
     event_tx: mpsc::Sender<ClientEvent>,
     shutdown: Arc<AtomicBool>,
     hello_seen: Option<&AtomicBool>,
@@ -367,8 +442,74 @@ async fn run_client_loop_inner(
     stream.set_nodelay(true)?;
     info!(endpoint = %config.endpoint, "TCP connection established (TCP_NODELAY enabled)");
 
-    let (mut reader, mut writer) = stream.into_split();
+    let (reader, writer) = stream.into_split();
+    run_client_stream_loop(
+        reader,
+        writer,
+        config,
+        event_tx,
+        shutdown,
+        hello_seen,
+        emit_disconnected,
+    )
+    .await
+}
 
+async fn run_aoa_client_loop_inner(
+    config: &ClientConfig,
+    event_tx: mpsc::Sender<ClientEvent>,
+    shutdown: Arc<AtomicBool>,
+    hello_seen: Option<&AtomicBool>,
+    emit_disconnected: bool,
+) -> Result<(), ClientError> {
+    info!("Connecting to CamCraft Android sender over USB AOA");
+    let conn = tokio::task::spawn_blocking(crate::usb_aoa::connect_aoa_device)
+        .await
+        .map_err(|e| ClientError::Channel(format!("USB AOA connect task failed: {e}")))??;
+
+    if shutdown.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+
+    let dev_info = conn.device_info();
+    info!(
+        vid = %format!("{:04x}", dev_info.vid),
+        pid = %format!("{:04x}", dev_info.pid),
+        bus = dev_info.busnum,
+        dev = dev_info.devnum,
+        product = ?dev_info.product,
+        "USB AOA device connected"
+    );
+
+    let stream = conn.into_tokio_stream(shutdown.clone())?;
+    let (reader, writer) = stream.into_split();
+    run_client_stream_loop(
+        reader,
+        writer,
+        config,
+        event_tx,
+        shutdown,
+        hello_seen,
+        emit_disconnected,
+    )
+    .await
+}
+
+/// Runs the bidirectional CCFT v1 read/write/heartbeat/stats session over an arbitrary
+/// `AsyncRead` + `AsyncWrite` stream pair (TCP socket or USB AOA `UnixStream`).
+pub async fn run_client_stream_loop<R, W>(
+    mut reader: R,
+    mut writer: W,
+    config: &ClientConfig,
+    event_tx: mpsc::Sender<ClientEvent>,
+    shutdown: Arc<AtomicBool>,
+    hello_seen: Option<&AtomicBool>,
+    emit_disconnected: bool,
+) -> Result<(), ClientError>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     // Session-scoped stop flag so a single connection drop does not mutate caller's `shutdown`.
     let session_stop = Arc::new(AtomicBool::new(false));
 
@@ -837,5 +978,223 @@ mod tests {
         let chosen_timeout =
             pick_most_informative_connect_error(vec![unreachable_only, timed_out_2]);
         assert_eq!(chosen_timeout.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn run_client_stream_loop_end_to_end_over_duplex() {
+        use camcraft_protocol::{ActiveCameraState, CameraInfo, FrameFlags, ResolutionOption};
+
+        let (client_stream, peer_stream) = tokio::io::duplex(64 * 1024);
+        let (client_reader, client_writer) = tokio::io::split(client_stream);
+        let (mut peer_reader, mut peer_writer) = tokio::io::split(peer_stream);
+
+        let config = ClientConfig {
+            endpoint: "aoa://usb".to_owned(),
+            interface: None,
+            ping_interval: Duration::from_millis(25),
+            read_timeout: Duration::from_secs(3),
+            read_buffer_capacity: 64 * 1024,
+        };
+
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let hello_seen = Arc::new(AtomicBool::new(false));
+
+        let loop_shutdown = shutdown.clone();
+        let loop_hello_seen = hello_seen.clone();
+        let client_task = tokio::spawn(async move {
+            run_client_stream_loop(
+                client_reader,
+                client_writer,
+                &config,
+                event_tx,
+                loop_shutdown,
+                Some(loop_hello_seen.as_ref()),
+                true,
+            )
+            .await
+        });
+
+        let peer_task = tokio::spawn(async move {
+            let hello = ControlHello {
+                device_name: "AOA Duplex Pixel".to_owned(),
+                protocol_version: 1,
+                cameras: vec![CameraInfo {
+                    id: "0".to_owned(),
+                    facing: "back".to_owned(),
+                    label: "Main".to_owned(),
+                    resolutions: vec![ResolutionOption {
+                        width: 1920,
+                        height: 1080,
+                        max_fps: 60,
+                    }],
+                    max_zoom: 4.0,
+                    ev_range: (-2.0, 2.0),
+                    has_flash: true,
+                }],
+                active_state: ActiveCameraState {
+                    camera_id: "0".to_owned(),
+                    width: 1920,
+                    height: 1080,
+                    fps: 60,
+                    bitrate_kbps: 12_000,
+                    zoom_ratio: 1.0,
+                    exposure_ev: 0.0,
+                    autofocus: true,
+                    torch_on: false,
+                    mirror_horizontal: false,
+                    rotation_deg: 0,
+                    audio_enabled: true,
+                    audio_muted: false,
+                },
+            };
+
+            let mut out = BytesMut::new();
+            Packet::control_hello(100, &hello)
+                .expect("encode hello")
+                .encode(&mut out);
+            peer_writer.write_all(&out).await.expect("write hello");
+            peer_writer.flush().await.expect("flush hello");
+
+            // Wait for HEARTBEAT_PING from client and reply with HEARTBEAT_PONG.
+            let mut in_buf = BytesMut::with_capacity(1024);
+            let mut pong_sent = false;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !pong_sent && Instant::now() < deadline {
+                let n = tokio::time::timeout(
+                    Duration::from_millis(200),
+                    peer_reader.read_buf(&mut in_buf),
+                )
+                .await
+                .expect("ping read timeout")
+                .expect("ping read io");
+                if n == 0 {
+                    break;
+                }
+                while let Some(pkt) = Packet::decode(&mut in_buf).expect("decode ping") {
+                    if pkt.header.packet_type == PacketType::HeartbeatPing {
+                        out.clear();
+                        Packet::heartbeat_pong(pkt.header.pts_us).encode(&mut out);
+                        peer_writer.write_all(&out).await.expect("write pong");
+                        peer_writer.flush().await.expect("flush pong");
+                        pong_sent = true;
+                    }
+                }
+            }
+            assert!(
+                pong_sent,
+                "client should send HEARTBEAT_PING and receive PONG"
+            );
+
+            // Send VIDEO_CONFIG (SPS/PPS) and VIDEO_FRAME with keyframe flag.
+            out.clear();
+            Packet::video_config(
+                41_000,
+                Bytes::from_static(&[0x00, 0x00, 0x00, 0x01, 0x67, 0x42]),
+            )
+            .encode(&mut out);
+            Packet::video_frame(
+                FrameFlags::KEYFRAME,
+                42_000,
+                Bytes::from_static(&[0x00, 0x00, 0x00, 0x01, 0x65, 0x88]),
+            )
+            .encode(&mut out);
+            peer_writer
+                .write_all(&out)
+                .await
+                .expect("write video packets");
+            peer_writer.flush().await.expect("flush video packets");
+
+            // Keep writer alive briefly until client processes frame and requests shutdown.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let mut got_connected = false;
+        let mut got_hello = false;
+        let mut got_config = false;
+        let mut got_frame = false;
+        let deadline = Instant::now() + Duration::from_secs(3);
+
+        while Instant::now() < deadline && !(got_connected && got_hello && got_config && got_frame)
+        {
+            if let Ok(Some(ev)) =
+                tokio::time::timeout(Duration::from_millis(200), event_rx.recv()).await
+            {
+                match ev {
+                    ClientEvent::Connected(_) => got_connected = true,
+                    ClientEvent::Hello(h) => {
+                        assert_eq!(h.device_name, "AOA Duplex Pixel");
+                        got_hello = true;
+                    }
+                    ClientEvent::VideoConfig {
+                        header,
+                        payload_len,
+                        payload,
+                    } => {
+                        assert_eq!(header.pts_us, 41_000);
+                        assert_eq!(payload_len, 6);
+                        assert_eq!(&payload[..], &[0x00, 0x00, 0x00, 0x01, 0x67, 0x42]);
+                        got_config = true;
+                    }
+                    ClientEvent::VideoFrame {
+                        header,
+                        payload_len,
+                        payload,
+                    } => {
+                        assert!(header.flags.is_keyframe());
+                        assert_eq!(header.pts_us, 42_000);
+                        assert_eq!(payload_len, 6);
+                        assert_eq!(&payload[..], &[0x00, 0x00, 0x00, 0x01, 0x65, 0x88]);
+                        got_frame = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        assert!(got_connected);
+        assert!(got_hello);
+        assert!(got_config);
+        assert!(got_frame);
+        assert!(hello_seen.load(Ordering::Relaxed));
+
+        shutdown.store(true, Ordering::Relaxed);
+        let client_res = client_task.await.expect("join client task");
+        peer_task.await.expect("join peer task");
+        assert!(
+            client_res.is_ok(),
+            "expected clean shutdown: {client_res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_client_stream_loop_emits_disconnected_on_eof() {
+        let (client_stream, peer_stream) = tokio::io::duplex(4096);
+        let (client_reader, client_writer) = tokio::io::split(client_stream);
+        drop(peer_stream);
+
+        let config = ClientConfig::usb_default();
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let res = run_client_stream_loop(
+            client_reader,
+            client_writer,
+            &config,
+            event_tx,
+            shutdown,
+            None,
+            true,
+        )
+        .await;
+        assert!(matches!(res, Err(ClientError::ConnectionClosed)));
+
+        let mut saw_disconnected = false;
+        while let Ok(ev) = event_rx.try_recv() {
+            if matches!(ev, ClientEvent::Disconnected(_)) {
+                saw_disconnected = true;
+            }
+        }
+        assert!(saw_disconnected);
     }
 }
