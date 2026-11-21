@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3] - 2026-11-21
+
+### Fixed
+- **Cross-Distro Linux Packaging & FFmpeg SONAME Compatibility:**
+  - Bundled minimal LGPL FFmpeg 7.1.1 shared libraries (`h264` decoder/parser + `swscale` only) privately under `/usr/lib/camcraft/` with `$ORIGIN` RPATH (`packaging/linux/build-minimal-ffmpeg.sh`), eliminating cross-distro SONAME conflicts (`libavcodec.so.63` vs `.62`/`.60`/`.58`) across Fedora 40–45+, Ubuntu 22.04–26.04, Debian 12/13, and derivatives.
+  - Updated `camcraft.spec` and `build-deb.sh` so `.rpm` and `.deb` packages require only `glibc >= 2.35` and audio utilities without locking to distro-specific `libav*` SONAMEs.
+  - Updated `build-appimage.sh` and `.github/workflows/release.yml` to package the minimal private FFmpeg libraries directly instead of pulling host codec bloat, significantly reducing `.AppImage` size.
+
 ## [0.0.2] - 2026-11-21
 
 ### Added
@@ -47,6 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Maintainer-controlled GitHub Release CD (manual `workflow_dispatch` or `vX.Y.Z` tag push) producing Fedora x86_64 tarballs, generic Linux x86_64 tarballs, signed/fallback Android APKs, and `SHA256SUMS.txt`.
   - Secret-configured AI PR Review Agent (`AI_API_ENDPOINT`, `AI_API_KEY`, `AI_MODEL`).
 
-[Unreleased]: https://github.com/madhasoeki/CamCraft/compare/v0.0.2...HEAD
+[Unreleased]: https://github.com/madhasoeki/CamCraft/compare/v0.0.3...HEAD
+[0.0.3]: https://github.com/madhasoeki/CamCraft/releases/tag/v0.0.3
 [0.0.2]: https://github.com/madhasoeki/CamCraft/releases/tag/v0.0.2
 [0.0.1]: https://github.com/madhasoeki/CamCraft/releases/tag/v0.0.1

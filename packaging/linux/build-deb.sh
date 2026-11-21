@@ -16,6 +16,7 @@ RAW_VERSION="${RAW_VERSION#V}"
 DEB_VERSION="${RAW_VERSION//-/\~}"
 BIN_DIR="${2:-${BIN_DIR:-${REPO_ROOT}/desktop/target/release}}"
 OUT_DIR="${3:-${OUT_DIR:-${REPO_ROOT}/dist}}"
+PRIVLIB_DIR="${4:-${PRIVLIB_DIR:-}}"
 
 for bin in camcraft-gui camcraft-cli; do
     if [[ ! -x "${BIN_DIR}/${bin}" ]]; then
@@ -37,6 +38,27 @@ mkdir -p "${PKG_ROOT}/DEBIAN" "${OUT_DIR}"
 
 install -Dm755 "${BIN_DIR}/camcraft-gui" "${PKG_ROOT}/usr/bin/camcraft-gui"
 install -Dm755 "${BIN_DIR}/camcraft-cli" "${PKG_ROOT}/usr/bin/camcraft-cli"
+
+if [[ -n "${PRIVLIB_DIR}" ]]; then
+    if [[ ! -d "${PRIVLIB_DIR}" ]]; then
+        echo "error: missing private FFmpeg library directory '${PRIVLIB_DIR}'" >&2
+        exit 1
+    fi
+    install -d "${PKG_ROOT}/usr/lib/camcraft"
+    shopt -s nullglob
+    privlibs=("${PRIVLIB_DIR}"/lib*.so*)
+    shopt -u nullglob
+    if [[ "${#privlibs[@]}" -eq 0 ]]; then
+        echo "error: no shared libraries found in '${PRIVLIB_DIR}'" >&2
+        exit 1
+    fi
+    for lib_file in "${privlibs[@]}"; do
+        install -Dm755 "${lib_file}" "${PKG_ROOT}/usr/lib/camcraft/$(basename "${lib_file}")"
+    done
+    DEB_DEPENDS="libc6 (>= 2.35), pulseaudio-utils | pipewire-pulse"
+else
+    DEB_DEPENDS="libc6, libavcodec58 | libavcodec59 | libavcodec60 | libavcodec61 | libavcodec62, libavutil56 | libavutil57 | libavutil58 | libavutil59 | libavutil60, libswscale5 | libswscale6 | libswscale7 | libswscale8 | libswscale9, pulseaudio-utils | pipewire-pulse"
+fi
 
 install -Dm644 "${REPO_ROOT}/assets/branding/linux/org.artcraft.camcraft.desktop" \
     "${PKG_ROOT}/usr/share/applications/org.artcraft.camcraft.desktop"
@@ -74,7 +96,7 @@ Architecture: amd64
 Maintainer: ArtCraft <maintainers@artcraft.org>
 Homepage: https://github.com/madhasoeki/CamCraft
 Installed-Size: ${INSTALLED_SIZE}
-Depends: libc6, libavcodec58 | libavcodec59 | libavcodec60 | libavcodec61 | libavcodec62, libavutil56 | libavutil57 | libavutil58 | libavutil59 | libavutil60, libswscale5 | libswscale6 | libswscale7 | libswscale8 | libswscale9, pulseaudio-utils | pipewire-pulse
+Depends: ${DEB_DEPENDS}
 Recommends: pipewire, libpipewire-0.3-0 | libpipewire-0.3-0t64
 Suggests: v4l2loopback-dkms
 Description: Low-latency Android webcam and virtual microphone receiver for Linux

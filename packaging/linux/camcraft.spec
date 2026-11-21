@@ -1,4 +1,10 @@
 %global debug_package %{nil}
+%global __brp_check_rpaths %{nil}
+
+%if 0%{?_privlibdir:1}
+%global __provides_exclude_from ^/usr/lib/camcraft/.*\.so.*$
+%global __requires_exclude ^lib(avcodec|avutil|swscale|avformat)\.so.*$
+%endif
 
 # Capture invocation working directory during spec parsing for sensible defaults.
 %global camcraft_pwd %(pwd)
@@ -88,6 +94,13 @@ rm -rf "%{buildroot}"
 install -Dm755 "%{camcraft_bindir}/camcraft-gui" "%{buildroot}/usr/bin/camcraft-gui"
 install -Dm755 "%{camcraft_bindir}/camcraft-cli" "%{buildroot}/usr/bin/camcraft-cli"
 
+%if 0%{?_privlibdir:1}
+install -d "%{buildroot}/usr/lib/camcraft"
+for f in "%{_privlibdir}"/lib*.so*; do
+    install -Dm755 "$f" "%{buildroot}/usr/lib/camcraft/$(basename "$f")"
+done
+%endif
+
 install -Dm644 "%{camcraft_srcdir}/assets/branding/linux/org.artcraft.camcraft.desktop" \
     "%{buildroot}/usr/share/applications/org.artcraft.camcraft.desktop"
 install -Dm644 "%{camcraft_srcdir}/assets/branding/svg/camcraft-symbol-app-icon.svg" \
@@ -113,6 +126,10 @@ gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor >/dev/null 2>&1 || :
 %doc README.md
 %attr(0755,root,root) /usr/bin/camcraft-gui
 %attr(0755,root,root) /usr/bin/camcraft-cli
+%if 0%{?_privlibdir:1}
+%dir /usr/lib/camcraft
+%attr(0755,root,root) /usr/lib/camcraft/lib*.so*
+%endif
 %attr(0644,root,root) /usr/share/applications/org.artcraft.camcraft.desktop
 %attr(0644,root,root) /usr/share/icons/hicolor/scalable/apps/org.artcraft.camcraft.svg
 %attr(0644,root,root) /usr/share/icons/hicolor/256x256/apps/org.artcraft.camcraft.png

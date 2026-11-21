@@ -633,7 +633,7 @@ dependencies = [
 
 [[package]]
 name = "camcraft-cli"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "camcraft-core",
@@ -647,7 +647,7 @@ dependencies = [
 
 [[package]]
 name = "camcraft-core"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "bytes",
@@ -671,7 +671,7 @@ dependencies = [
 
 [[package]]
 name = "camcraft-gui"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "camcraft-core",
@@ -687,7 +687,7 @@ dependencies = [
 
 [[package]]
 name = "camcraft-protocol"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "bytes",
  "serde",

@@ -12,6 +12,7 @@ fi
 
 BIN_DIR="${2:-${BIN_DIR:-${REPO_ROOT}/desktop/target/release}}"
 OUT_DIR="${3:-${OUT_DIR:-${REPO_ROOT}/dist}}"
+PRIVLIB_DIR="${4:-${PRIVLIB_DIR:-}}"
 
 for bin in camcraft-gui camcraft-cli; do
     if [[ ! -x "${BIN_DIR}/${bin}" ]]; then
@@ -83,7 +84,7 @@ set -eu
 
 SELF="$(readlink -f "$0")"
 APPDIR="$(dirname "$SELF")"
-export LD_LIBRARY_PATH="${APPDIR}/usr/lib:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="${APPDIR}/usr/lib/camcraft:${APPDIR}/usr/lib:${LD_LIBRARY_PATH:-}"
 export XDG_DATA_DIRS="${APPDIR}/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
 
 ARGV0_BASE="$(basename "${ARGV0:-$0}")"
@@ -100,51 +101,69 @@ exec "${APPDIR}/usr/bin/camcraft-gui" "$@"
 EOF
 chmod 0755 "${APPDIR}/AppRun"
 
-# Seed queue ONLY with libavcodec.so*, libavutil.so*, libswscale.so* resolved from our binaries,
-# then walk transitive dependencies via ldd while strictly excluding core host/driver libraries.
-declare -A SEEN=()
-QUEUE=()
+if [[ -n "${PRIVLIB_DIR}" ]]; then
+    if [[ ! -d "${PRIVLIB_DIR}" ]]; then
+        echo "error: missing private FFmpeg library directory '${PRIVLIB_DIR}'" >&2
+        exit 1
+    fi
+    mkdir -p "${APPDIR}/usr/lib/camcraft"
+    shopt -s nullglob
+    privlibs=("${PRIVLIB_DIR}"/lib*.so*)
+    shopt -u nullglob
+    if [[ "${#privlibs[@]}" -eq 0 ]]; then
+        echo "error: no shared libraries found in '${PRIVLIB_DIR}'" >&2
+        exit 1
+    fi
+    for lib_file in "${privlibs[@]}"; do
+        install -Dm755 "${lib_file}" "${APPDIR}/usr/lib/camcraft/$(basename "${lib_file}")"
+    done
+else
+    # Seed queue ONLY with libavcodec.so*, libavutil.so*, libswscale.so* resolved from our binaries,
+    # then walk transitive dependencies via ldd while strictly excluding core host/driver libraries.
+    declare -A SEEN=()
+    QUEUE=()
 
-for bin in "${BIN_DIR}/camcraft-gui" "${BIN_DIR}/camcraft-cli"; do
-    while IFS= read -r lib_path; do
-        [[ -n "${lib_path}" && -f "${lib_path}" ]] || continue
-        base="$(basename "${lib_path}")"
-        if [[ "${base}" == libavcodec.so* || "${base}" == libavutil.so* || "${base}" == libswscale.so* ]]; then
-            if [[ -z "${SEEN[${base}]+x}" ]]; then
-                SEEN["${base}"]=1
-                QUEUE+=("${lib_path}")
+    for bin in "${BIN_DIR}/camcraft-gui" "${BIN_DIR}/camcraft-cli"; do
+        while IFS= read -r lib_path; do
+            [[ -n "${lib_path}" && -f "${lib_path}" ]] || continue
+            base="$(basename "${lib_path}")"
+            if [[ "${base}" == libavcodec.so* || "${base}" == libavutil.so* || "${base}" == libswscale.so* ]]; then
+                if [[ -z "${SEEN[${base}]+x}" ]]; then
+                    SEEN["${base}"]=1
+                    QUEUE+=("${lib_path}")
+                fi
             fi
-        fi
-    done < <(extract_ldd_paths "${bin}")
-done
+        done < <(extract_ldd_paths "${bin}")
+    done
 
-idx=0
-while (( idx < ${#QUEUE[@]} )); do
-    lib_path="${QUEUE[$idx]}"
-    idx=$((idx + 1))
-    base="$(basename "${lib_path}")"
+    idx=0
+    while (( idx < ${#QUEUE[@]} )); do
+        lib_path="${QUEUE[$idx]}"
+        idx=$((idx + 1))
+        base="$(basename "${lib_path}")"
 
-    if is_excluded_lib "${base}"; then
-        continue
-    fi
-
-    if [[ ! -e "${APPDIR}/usr/lib/${base}" ]]; then
-        cp -L "${lib_path}" "${APPDIR}/usr/lib/${base}"
-        chmod 0755 "${APPDIR}/usr/lib/${base}"
-    fi
-
-    while IFS= read -r dep_path; do
-        [[ -n "${dep_path}" && -f "${dep_path}" ]] || continue
-        dep_base="$(basename "${dep_path}")"
-        if is_excluded_lib "${dep_base}"; then
+        if is_excluded_lib "${base}"; then
             continue
         fi
-        if [[ -z "${SEEN[${dep_base}]+x}" ]]; then
-            SEEN["${dep_base}"]=1
-            QUEUE+=("${dep_path}")
+
+        if [[ ! -e "${APPDIR}/usr/lib/${base}" ]]; then
+            cp -L "${lib_path}" "${APPDIR}/usr/lib/${base}"
+            chmod 0755 "${APPDIR}/usr/lib/${base}"
         fi
-    done < <(extract_ldd_paths "${lib_path}")
-done
+
+        while IFS= read -r dep_path; do
+            [[ -n "${dep_path}" && -f "${dep_path}" ]] || continue
+            dep_base="$(basename "${dep_path}")"
+            if is_excluded_lib "${dep_base}"; then
+                continue
+            fi
+            if [[ -z "${SEEN[${dep_base}]+x}" ]]; then
+                SEEN["${dep_base}"]=1
+                QUEUE+=("${dep_path}")
+            fi
+        done < <(extract_ldd_paths "${lib_path}")
+    done
+fi
 
 OUT_APPIMAGE="${OUT_DIR}/CamCraft-${RAW_TAG}-x86_64.AppImage"
 rm -f "${OUT_APPIMAGE}"

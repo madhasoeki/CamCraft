@@ -11,9 +11,9 @@ android {
     compileSdk = 35
 
     val appVersionName = (project.findProperty("camcraftVersionName") as String?)
-        ?.takeIf { it.isNotBlank() } ?: "0.0.2"
+        ?.takeIf { it.isNotBlank() } ?: "0.0.3"
     val appVersionCode = (project.findProperty("camcraftVersionCode") as String?)
-        ?.toIntOrNull() ?: 2
+        ?.toIntOrNull() ?: 3
     val githubRepo = (project.findProperty("camcraftGithubRepo") as String?)
         ?.takeIf { it.isNotBlank() } ?: "madhasoeki/CamCraft"
 

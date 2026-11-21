@@ -100,33 +100,18 @@ jobs:
   build-desktop-fedora:
     name: Build Desktop (Fedora x86_64 RPM & Tarball)
     runs-on: ubuntu-latest
-    needs: prepare
+    needs: [prepare, build-desktop-linux]
     container: fedora:latest
     steps:
-      - name: Install Fedora system dependencies, rpm-build, and git
+      - name: Install Fedora RPM build tools
         run: |
           dnf install -y --setopt=install_weak_deps=False \
             git \
             tar \
             gzip \
             findutils \
-            curl \
-            ca-certificates \
-            gcc \
-            gcc-c++ \
-            clang \
-            llvm-devel \
-            pkgconf-pkg-config \
             rpm-build \
-            ffmpeg-free-devel \
-            alsa-lib-devel \
-            pulseaudio-libs-devel \
-            glib2-devel \
-            gtk3-devel \
-            libxcb-devel \
-            libxkbcommon-devel \
-            libxkbcommon-x11-devel \
-            wayland-devel
+            pipewire-utils
           dnf clean all
 
       - name: Checkout tagged commit
@@ -134,21 +119,20 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.tag }}
 
-      - name: Install Rust stable toolchain
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Build release binaries
-        working-directory: desktop
-        run: cargo build --release --locked -p camcraft-gui -p camcraft-cli
+      - name: Download portable desktop binaries and private FFmpeg libs
+        uses: actions/download-artifact@v8
+        with:
+          name: desktop-bundle
+          path: dist/bundle
 
       - name: Package Fedora desktop archive
         run: |
+          chmod 0755 dist/bundle/bin/camcraft-gui dist/bundle/bin/camcraft-cli dist/bundle/privlib/lib*.so*
           PKG_DIR="dist/camcraft-desktop-fedora-x86_64"
-          mkdir -p "$PKG_DIR"
-          cp desktop/target/release/camcraft-gui "$PKG_DIR/"
-          cp desktop/target/release/camcraft-cli "$PKG_DIR/"
+          mkdir -p "$PKG_DIR/lib/camcraft"
+          cp dist/bundle/bin/camcraft-gui "$PKG_DIR/"
+          cp dist/bundle/bin/camcraft-cli "$PKG_DIR/"
+          cp -a dist/bundle/privlib/lib*.so* "$PKG_DIR/lib/camcraft/"
           cp scripts/setup-fedora-dev.sh "$PKG_DIR/"
           cp packaging/linux/70-camcraft-aoa.rules "$PKG_DIR/"
           cp assets/branding/linux/org.artcraft.camcraft.desktop "$PKG_DIR/"
@@ -168,8 +152,27 @@ jobs:
             --define "_topdir ${RPM_TOPDIR}" \
             --define "_sourcedir ${PWD}" \
             --define "_version ${VERSION}" \
-            --define "_bindir ${PWD}/desktop/target/release"
+            --define "_bindir ${PWD}/dist/bundle/bin" \
+            --define "_privlibdir ${PWD}/dist/bundle/privlib"
           find "${RPM_TOPDIR}/RPMS" -name "*.rpm" -exec cp -v {} dist/ \;
+
+      - name: Verify RPM dependencies and install smoke test
+        run: |
+          RPM_FILE="$(ls dist/camcraft-*.rpm | head -n 1)"
+          echo "=== RPM Requires ==="
+          rpm -qpR "$RPM_FILE"
+          echo "=== RPM Provides ==="
+          rpm -qp --provides "$RPM_FILE"
+          if rpm -qpR "$RPM_FILE" | grep -qE '^lib(avcodec|avutil|swscale|avformat)\.so'; then
+            echo "::error::RPM unexpectedly requires system FFmpeg SONAMEs!"
+            exit 1
+          fi
+          if rpm -qp --provides "$RPM_FILE" | grep -qE '^lib(avcodec|avutil|swscale|avformat)\.so'; then
+            echo "::error::RPM unexpectedly provides private FFmpeg SONAMEs!"
+            exit 1
+          fi
+          dnf install -y "$RPM_FILE"
+          /usr/bin/camcraft-cli status
 
       - name: Upload Fedora desktop artifacts
         uses: actions/upload-artifact@v7
@@ -195,6 +198,7 @@ jobs:
             git \
             tar \
             gzip \
+            xz-utils \
             findutils \
             curl \
             ca-certificates \
@@ -202,13 +206,11 @@ jobs:
             dpkg-dev \
             desktop-file-utils \
             build-essential \
+            nasm \
+            patchelf \
             pkg-config \
             clang \
             libclang-dev \
-            libavcodec-dev \
-            libavformat-dev \
-            libavutil-dev \
-            libswscale-dev \
             libasound2-dev \
             libpulse-dev \
             libglib2.0-dev \
@@ -226,6 +228,11 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.tag }}
 
+      - name: Build minimal LGPL FFmpeg 7.1.1 shared libraries
+        run: |
+          chmod +x packaging/linux/build-minimal-ffmpeg.sh
+          ./packaging/linux/build-minimal-ffmpeg.sh /tmp/camcraft-ffmpeg /tmp/camcraft-privlib
+
       - name: Install Rust stable toolchain
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
@@ -238,20 +245,30 @@ jobs:
 
       - name: Build release binaries
         working-directory: desktop
-        run: cargo build --release --locked -p camcraft-gui -p camcraft-cli
+        env:
+          PKG_CONFIG_PATH: /tmp/camcraft-ffmpeg/lib/pkgconfig
+          RUSTFLAGS: "-C link-arg=-Wl,-rpath,$ORIGIN/../lib/camcraft:$ORIGIN/lib/camcraft"
+        run: |
+          cargo build --release --locked -p camcraft-gui -p camcraft-cli
+          for bin in target/release/camcraft-gui target/release/camcraft-cli; do
+            echo "=== readelf -d ${bin} ==="
+            readelf -d "${bin}" | grep -E 'NEEDED|RPATH|RUNPATH'
+          done
 
-      - name: Package generic Linux desktop archive
+      - name: Package generic Linux desktop archive and smoke-test $ORIGIN RPATH
         run: |
           PKG_DIR="dist/camcraft-desktop-linux-x86_64"
-          mkdir -p "$PKG_DIR"
+          mkdir -p "$PKG_DIR/lib/camcraft"
           cp desktop/target/release/camcraft-gui "$PKG_DIR/"
           cp desktop/target/release/camcraft-cli "$PKG_DIR/"
+          cp -a /tmp/camcraft-privlib/lib*.so* "$PKG_DIR/lib/camcraft/"
           cp packaging/linux/70-camcraft-aoa.rules "$PKG_DIR/"
           cp assets/branding/linux/org.artcraft.camcraft.desktop "$PKG_DIR/"
           cp assets/branding/svg/camcraft-symbol-app-icon.svg "$PKG_DIR/org.artcraft.camcraft.svg"
           cp assets/branding/png/camcraft-app-icon-256.png "$PKG_DIR/org.artcraft.camcraft.png"
           cp README.md LICENSE-MIT LICENSE-APACHE "$PKG_DIR/"
           chmod +x "$PKG_DIR/camcraft-gui" "$PKG_DIR/camcraft-cli"
+          env -u LD_LIBRARY_PATH "$PKG_DIR/camcraft-cli" status
           tar -C dist -czf "dist/camcraft-desktop-linux-x86_64.tar.gz" "camcraft-desktop-linux-x86_64"
 
       - name: Package Debian/Ubuntu .deb
@@ -259,7 +276,8 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           chmod +x packaging/linux/build-deb.sh
-          ./packaging/linux/build-deb.sh "$VERSION" desktop/target/release dist
+          ./packaging/linux/build-deb.sh "$VERSION" desktop/target/release dist /tmp/camcraft-privlib
+          dpkg-deb -I dist/*.deb
 
       - name: Install appimagetool and package AppImage
         env:
@@ -268,7 +286,14 @@ jobs:
           curl -fsSL -o /usr/local/bin/appimagetool \
             "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
           chmod +x /usr/local/bin/appimagetool packaging/linux/build-appimage.sh
-          ./packaging/linux/build-appimage.sh "$TAG" desktop/target/release dist
+          ./packaging/linux/build-appimage.sh "$TAG" desktop/target/release dist /tmp/camcraft-privlib
+
+      - name: Stage portable desktop bundle for RPM packaging
+        run: |
+          mkdir -p dist/bundle/bin dist/bundle/privlib
+          cp desktop/target/release/camcraft-gui dist/bundle/bin/
+          cp desktop/target/release/camcraft-cli dist/bundle/bin/
+          cp -a /tmp/camcraft-privlib/lib*.so* dist/bundle/privlib/
 
       - name: Upload generic Linux desktop artifacts
         uses: actions/upload-artifact@v7
@@ -278,6 +303,14 @@ jobs:
             dist/camcraft-desktop-linux-x86_64.tar.gz
             dist/*.deb
             dist/*.AppImage
+          if-no-files-found: error
+
+      - name: Upload portable desktop bundle for Fedora RPM job
+        uses: actions/upload-artifact@v7
+        with:
+          name: desktop-bundle
+          path: dist/bundle
+          retention-days: 1
           if-no-files-found: error
 
   build-android:
