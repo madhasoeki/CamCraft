@@ -40,3 +40,7 @@ dist/
 release-artifacts/
 *.tar.gz
 *.rpm
+
+# Python bytecode
+__pycache__/
+*.pyc
