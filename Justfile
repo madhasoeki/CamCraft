@@ -71,6 +71,21 @@ cli-usb:
 run-cli-usb: usb-tunnel
     cd desktop && cargo run --release -p camcraft-cli -- connect --usb --vcam /dev/video10
 
+# Bangun paket RPM lokal di direktori dist/ menggunakan rpmbuild
+build-rpm:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    VERSION="$(awk -F'"' '/^version = / {print $2; exit}' desktop/Cargo.toml)"
+    RPM_TOPDIR="${PWD}/dist/rpmbuild"
+    mkdir -p "${RPM_TOPDIR}"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+    (cd desktop && cargo build --release --locked -p camcraft-gui -p camcraft-cli)
+    rpmbuild -bb packaging/linux/camcraft.spec \
+        --define "_topdir ${RPM_TOPDIR}" \
+        --define "_sourcedir ${PWD}" \
+        --define "_version ${VERSION}" \
+        --define "_bindir ${PWD}/desktop/target/release"
+    find "${RPM_TOPDIR}/RPMS" -name "*.rpm" -exec cp -v {} dist/ \;
+
 # -----------------------------------------------------------------------------
 # 3. Perintah Android (Kotlin Native Sender)
 # -----------------------------------------------------------------------------

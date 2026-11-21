@@ -1,0 +1,55 @@
+# CamCraft USB Android Open Accessory (AOA) & Android OEM udev rules
+# Allows active-seat desktop users to open Android USB devices via usbdevfs
+# for AOA v1 negotiation and streaming without root privileges.
+
+ACTION=="remove", GOTO="camcraft_aoa_rules_end"
+SUBSYSTEM!="usb", GOTO="camcraft_aoa_rules_end"
+ENV{DEVTYPE}!="usb_device", GOTO="camcraft_aoa_rules_end"
+
+# Google Android Open Accessory (AOA) product IDs (18d1:2d00..2d05)
+ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d00", MODE="0660", TAG+="uaccess"
+ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d01", MODE="0660", TAG+="uaccess"
+ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d02", MODE="0660", TAG+="uaccess"
+ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d03", MODE="0660", TAG+="uaccess"
+ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d04", MODE="0660", TAG+="uaccess"
+ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d05", MODE="0660", TAG+="uaccess"
+
+# Major Android OEM vendor IDs (normal USB mode prior to AOA switch)
+# Google
+ATTR{idVendor}=="18d1", MODE="0660", TAG+="uaccess"
+# Samsung
+ATTR{idVendor}=="04e8", MODE="0660", TAG+="uaccess"
+# Xiaomi / Redmi / POCO
+ATTR{idVendor}=="2717", MODE="0660", TAG+="uaccess"
+# OnePlus
+ATTR{idVendor}=="2a70", MODE="0660", TAG+="uaccess"
+# OPPO / Realme
+ATTR{idVendor}=="22d9", MODE="0660", TAG+="uaccess"
+# Motorola
+ATTR{idVendor}=="22b8", MODE="0660", TAG+="uaccess"
+# Sony
+ATTR{idVendor}=="0fce", MODE="0660", TAG+="uaccess"
+# Huawei / Honor
+ATTR{idVendor}=="12d1", MODE="0660", TAG+="uaccess"
+# ASUS
+ATTR{idVendor}=="0b05", MODE="0660", TAG+="uaccess"
+# Meizu / Android OEM (0x2970)
+ATTR{idVendor}=="2970", MODE="0660", TAG+="uaccess"
+# vivo / iQOO
+ATTR{idVendor}=="2d95", MODE="0660", TAG+="uaccess"
+# Lenovo
+ATTR{idVendor}=="17ef", MODE="0660", TAG+="uaccess"
+# LG
+ATTR{idVendor}=="1004", MODE="0660", TAG+="uaccess"
+# HTC
+ATTR{idVendor}=="0bb4", MODE="0660", TAG+="uaccess"
+# ZTE / Nubia
+ATTR{idVendor}=="19d2", MODE="0660", TAG+="uaccess"
+# Fairphone
+ATTR{idVendor}=="2ae5", MODE="0660", TAG+="uaccess"
+# MediaTek
+ATTR{idVendor}=="0e8d", MODE="0660", TAG+="uaccess"
+# Qualcomm
+ATTR{idVendor}=="05c6", MODE="0660", TAG+="uaccess"
+
+LABEL="camcraft_aoa_rules_end"

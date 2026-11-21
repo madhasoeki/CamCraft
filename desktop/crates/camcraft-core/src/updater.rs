@@ -1,10 +1,12 @@
 //! In-app GitHub Releases update checker, SHA-256 verifier, and self-updater.
 
 use std::cmp::Ordering;
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use flate2::read::GzDecoder;
@@ -220,6 +222,15 @@ fn compare_pre_segment(a: &str, b: &str) -> Ordering {
     }
 }
 
+/// How the currently running CamCraft desktop binary was installed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallKind {
+    AppImage(PathBuf),
+    RpmPackage,
+    DebPackage,
+    PortableArchive,
+}
+
 /// Metadata describing an available desktop release update.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseInfo {
@@ -250,12 +261,23 @@ pub struct DownloadProgress {
     pub total_bytes: u64,
 }
 
+/// Concrete installation action taken by [`download_and_install_update`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallAction {
+    ReplacedInPlace,
+    DownloadedPackage {
+        package_path: PathBuf,
+        install_command: String,
+    },
+}
+
 /// Result returned by [`download_and_install_update`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallOutcome {
     pub version: String,
     pub binary_path: PathBuf,
     pub sibling_updated: bool,
+    pub action: InstallAction,
 }
 
 #[derive(Debug, Deserialize)]
@@ -288,31 +310,107 @@ pub fn is_fedora_like_os() -> bool {
     is_fedora_os_release(&content)
 }
 
-fn is_fedora_os_release(content: &str) -> bool {
+fn os_release_tokens(content: &str, key: &str) -> Vec<String> {
+    let prefix = format!("{key}=");
     for raw_line in content.lines() {
         let line = raw_line.trim();
-        if let Some(val) = line.strip_prefix("ID=") {
+        if let Some(val) = line.strip_prefix(&prefix) {
             let clean = val
                 .trim_matches('"')
                 .trim_matches('\'')
                 .to_ascii_lowercase();
-            if clean == "fedora" {
-                return true;
-            }
-        } else if let Some(val) = line.strip_prefix("ID_LIKE=") {
-            let clean = val
-                .trim_matches('"')
-                .trim_matches('\'')
-                .to_ascii_lowercase();
-            if clean
-                .split_whitespace()
-                .any(|tok| tok == "fedora" || tok == "rhel")
-            {
-                return true;
-            }
+            return clean.split_whitespace().map(str::to_owned).collect();
         }
     }
-    false
+    Vec::new()
+}
+
+fn os_release_matches_any(content: &str, ids: &[&str], id_likes: &[&str]) -> bool {
+    let id_tokens = os_release_tokens(content, "ID");
+    if id_tokens.iter().any(|tok| ids.contains(&tok.as_str())) {
+        return true;
+    }
+    let like_tokens = os_release_tokens(content, "ID_LIKE");
+    like_tokens
+        .iter()
+        .any(|tok| id_likes.contains(&tok.as_str()))
+}
+
+fn is_fedora_os_release(content: &str) -> bool {
+    os_release_matches_any(content, &["fedora"], &["fedora", "rhel"])
+}
+
+fn is_rpm_os_release(content: &str) -> bool {
+    is_fedora_os_release(content)
+        || os_release_matches_any(
+            content,
+            &[
+                "rhel",
+                "centos",
+                "rocky",
+                "almalinux",
+                "ol",
+                "nobara",
+                "bazzite",
+                "opensuse-tumbleweed",
+                "opensuse-leap",
+                "sles",
+            ],
+            &["fedora", "rhel", "centos", "suse", "opensuse"],
+        )
+}
+
+fn is_deb_os_release(content: &str) -> bool {
+    os_release_matches_any(
+        content,
+        &[
+            "debian",
+            "ubuntu",
+            "linuxmint",
+            "pop",
+            "elementary",
+            "zorin",
+            "kali",
+            "raspbian",
+            "mx",
+        ],
+        &["debian", "ubuntu"],
+    )
+}
+
+/// Detects the current installation method using `$APPIMAGE`, `current_exe()`, and `/etc/os-release`.
+#[must_use]
+pub fn detect_install_kind() -> InstallKind {
+    let appimage_env = std::env::var_os("APPIMAGE").map(PathBuf::from);
+    let exe_path = std::env::current_exe().unwrap_or_default();
+    let os_release = fs::read_to_string("/etc/os-release").unwrap_or_default();
+    detect_install_kind_from(appimage_env.as_deref(), &exe_path, &os_release)
+}
+
+/// Pure, testable installation-kind detector given explicit environment inputs.
+#[must_use]
+pub fn detect_install_kind_from(
+    appimage_env: Option<&Path>,
+    exe_path: &Path,
+    os_release: &str,
+) -> InstallKind {
+    if let Some(appimage_path) = appimage_env
+        && !appimage_path.as_os_str().is_empty()
+    {
+        return InstallKind::AppImage(appimage_path.to_path_buf());
+    }
+
+    let is_system_bin = exe_path.starts_with("/usr/bin") || exe_path.starts_with("/bin");
+    if is_system_bin {
+        if is_rpm_os_release(os_release) {
+            return InstallKind::RpmPackage;
+        }
+        if is_deb_os_release(os_release) {
+            return InstallKind::DebPackage;
+        }
+    }
+
+    InstallKind::PortableArchive
 }
 
 /// Returns ordered candidate archive filenames for the given Linux variant and architecture.
@@ -335,6 +433,65 @@ pub fn preferred_desktop_asset_names(is_fedora: bool, arch: &str) -> Vec<String>
     }
 }
 
+/// Selects the best matching GitHub Release asset name for `install_kind`, falling back to `.tar.gz`.
+#[must_use]
+pub fn select_asset_for_install_kind<'a, S: AsRef<str>>(
+    asset_names: &'a [S],
+    install_kind: &InstallKind,
+    is_fedora: bool,
+    arch: &str,
+) -> Option<&'a str> {
+    let find_matching = |pred: &dyn Fn(&str) -> bool| -> Option<&'a str> {
+        asset_names
+            .iter()
+            .map(AsRef::as_ref)
+            .find(|name| pred(name))
+    };
+
+    match install_kind {
+        InstallKind::AppImage(_) => {
+            if let Some(matched) = find_matching(&|n| {
+                n.ends_with(".AppImage") && (arch.is_empty() || n.contains(arch))
+            })
+            .or_else(|| find_matching(&|n| n.ends_with(".AppImage")))
+            {
+                return Some(matched);
+            }
+        }
+        InstallKind::RpmPackage => {
+            if let Some(matched) = find_matching(&|n| {
+                n.ends_with(".rpm")
+                    && !n.ends_with(".src.rpm")
+                    && (arch.is_empty() || n.contains(arch))
+            })
+            .or_else(|| find_matching(&|n| n.ends_with(".rpm") && !n.ends_with(".src.rpm")))
+            {
+                return Some(matched);
+            }
+        }
+        InstallKind::DebPackage => {
+            let deb_arch = match arch {
+                "x86_64" => "amd64",
+                "aarch64" => "arm64",
+                other => other,
+            };
+            let arch_suffix = format!("_{deb_arch}.deb");
+            if let Some(matched) =
+                find_matching(&|n| !deb_arch.is_empty() && n.ends_with(&arch_suffix))
+                    .or_else(|| find_matching(&|n| n.ends_with(".deb")))
+            {
+                return Some(matched);
+            }
+        }
+        InstallKind::PortableArchive => {}
+    }
+
+    let candidates = preferred_desktop_asset_names(is_fedora, arch);
+    candidates
+        .iter()
+        .find_map(|cand| find_matching(&|name| name == cand))
+}
+
 fn build_http_agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(10)))
@@ -347,6 +504,14 @@ fn build_http_agent() -> ureq::Agent {
 
 /// Queries GitHub Releases (`releases/latest`) and compares versions using SemVer.
 pub fn check_for_update(config: &UpdateConfig) -> Result<UpdateCheckOutcome, UpdateError> {
+    check_for_update_with_kind(config, &detect_install_kind(), is_fedora_like_os())
+}
+
+fn check_for_update_with_kind(
+    config: &UpdateConfig,
+    install_kind: &InstallKind,
+    is_fedora: bool,
+) -> Result<UpdateCheckOutcome, UpdateError> {
     let current_sv = SemVer::parse(&config.current_version)?;
     let base = config.api_base_url.trim_end_matches('/');
     let url = format!("{base}/repos/{}/releases/latest", config.repo);
@@ -399,10 +564,20 @@ pub fn check_for_update(config: &UpdateConfig) -> Result<UpdateCheckOutcome, Upd
         });
     }
 
-    let candidates = preferred_desktop_asset_names(is_fedora_like_os(), std::env::consts::ARCH);
-    let selected_asset = candidates
+    let asset_names: Vec<&str> = release.assets.iter().map(|a| a.name.as_str()).collect();
+    let selected_name = select_asset_for_install_kind(
+        &asset_names,
+        install_kind,
+        is_fedora,
+        std::env::consts::ARCH,
+    )
+    .ok_or_else(|| UpdateError::NoMatchingAsset {
+        version: release.tag_name.clone(),
+    })?;
+    let selected_asset = release
+        .assets
         .iter()
-        .find_map(|cand| release.assets.iter().find(|a| a.name == *cand))
+        .find(|a| a.name == selected_name)
         .ok_or_else(|| UpdateError::NoMatchingAsset {
             version: release.tag_name.clone(),
         })?;
@@ -484,7 +659,7 @@ impl StagingDirGuard {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
         let path = parent.join(format!(".camcraft-update-{pid}-{nanos}"));
-        fs::create_dir_all(&path).map_err(|err| map_dir_write_error(&path, err))?;
+        fs::create_dir_all(&path).map_err(|err| map_dir_write_error(parent, err))?;
         Ok(Self { path })
     }
 }
@@ -506,13 +681,51 @@ fn map_dir_write_error(path: &Path, err: std::io::Error) -> UpdateError {
     }
 }
 
-/// Downloads the release archive, verifies `SHA256SUMS.txt` when present, extracts
-/// desktop binaries into a staging folder, and atomically replaces the running executable.
-pub fn download_and_install_update<F>(
+fn package_update_cache_dir_from(xdg_cache_home: Option<&OsStr>, home: Option<&OsStr>) -> PathBuf {
+    if let Some(xdg) = xdg_cache_home
+        && !xdg.is_empty()
+    {
+        return PathBuf::from(xdg).join("camcraft").join("updates");
+    }
+    if let Some(home_dir) = home
+        && !home_dir.is_empty()
+    {
+        return PathBuf::from(home_dir)
+            .join(".cache")
+            .join("camcraft")
+            .join("updates");
+    }
+    PathBuf::from("/tmp/camcraft-updates")
+}
+
+fn sanitize_asset_filename(asset_name: &str) -> String {
+    Path::new(asset_name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+        .unwrap_or("camcraft-update")
+        .to_owned()
+}
+
+fn set_executable_permissions(path: &Path) -> Result<(), UpdateError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms)?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+fn download_and_verify_to_file<F>(
     release: &ReleaseInfo,
-    primary_binary_name: &str,
-    mut on_progress: F,
-) -> Result<InstallOutcome, UpdateError>
+    dest_path: &Path,
+    permission_dir: &Path,
+    on_progress: &mut F,
+) -> Result<(), UpdateError>
 where
     F: FnMut(DownloadProgress),
 {
@@ -523,21 +736,10 @@ where
         });
     }
 
-    let current_exe = std::env::current_exe()?;
-    let exe_dir = current_exe.parent().ok_or_else(|| {
-        UpdateError::Io(std::io::Error::new(
-            ErrorKind::NotFound,
-            "current executable has no parent directory",
-        ))
-    })?;
-
-    let staging = StagingDirGuard::create_in(exe_dir)?;
-    let archive_path = staging.path.join(&release.asset_name);
-
     let agent = build_http_agent();
     let user_agent = format!("CamCraft/{CURRENT_VERSION}");
 
-    info!(url = %release.download_url, asset = %release.asset_name, "Downloading CamCraft update archive");
+    info!(url = %release.download_url, asset = %release.asset_name, "Downloading CamCraft update asset");
     let mut response = agent
         .get(&release.download_url)
         .header("User-Agent", &user_agent)
@@ -572,7 +774,7 @@ where
     }
 
     let mut out_file =
-        File::create(&archive_path).map_err(|err| map_dir_write_error(exe_dir, err))?;
+        File::create(dest_path).map_err(|err| map_dir_write_error(permission_dir, err))?;
     let mut reader = response.body_mut().as_reader();
     let mut buf = [0_u8; DOWNLOAD_CHUNK_BYTES];
     let mut hasher = Sha256::new();
@@ -630,10 +832,220 @@ where
                 actual: actual_sha256,
             });
         }
-        info!(sha256 = %actual_sha256, "Verified archive SHA-256 checksum");
+        info!(sha256 = %actual_sha256, "Verified release asset SHA-256 checksum");
     } else {
         warn!("Release does not provide SHA256SUMS.txt; skipping checksum verification");
     }
+
+    Ok(())
+}
+
+/// Downloads, verifies, and applies (or stages for system install) a desktop update according
+/// to the detected [`InstallKind`].
+pub fn download_and_install_update<F>(
+    release: &ReleaseInfo,
+    primary_binary_name: &str,
+    on_progress: F,
+) -> Result<InstallOutcome, UpdateError>
+where
+    F: FnMut(DownloadProgress),
+{
+    download_and_install_update_with_options(
+        release,
+        primary_binary_name,
+        &detect_install_kind(),
+        None,
+        true,
+        on_progress,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemPackageKind {
+    Rpm,
+    Deb,
+}
+
+fn download_and_install_update_with_options<F>(
+    release: &ReleaseInfo,
+    primary_binary_name: &str,
+    install_kind: &InstallKind,
+    cache_dir_override: Option<&Path>,
+    open_with_xdg: bool,
+    mut on_progress: F,
+) -> Result<InstallOutcome, UpdateError>
+where
+    F: FnMut(DownloadProgress),
+{
+    if release.asset_name.ends_with(".AppImage")
+        && let InstallKind::AppImage(appimage_path) = install_kind
+    {
+        return install_appimage_update(appimage_path, release, &mut on_progress);
+    }
+
+    if release.asset_name.ends_with(".rpm") {
+        return install_system_package_update(
+            SystemPackageKind::Rpm,
+            release,
+            cache_dir_override,
+            open_with_xdg,
+            &mut on_progress,
+        );
+    }
+
+    if release.asset_name.ends_with(".deb") {
+        return install_system_package_update(
+            SystemPackageKind::Deb,
+            release,
+            cache_dir_override,
+            open_with_xdg,
+            &mut on_progress,
+        );
+    }
+
+    install_portable_archive_update(release, primary_binary_name, &mut on_progress)
+}
+
+fn install_appimage_update<F>(
+    appimage_path: &Path,
+    release: &ReleaseInfo,
+    on_progress: &mut F,
+) -> Result<InstallOutcome, UpdateError>
+where
+    F: FnMut(DownloadProgress),
+{
+    let parent = appimage_path.parent().ok_or_else(|| {
+        UpdateError::Io(std::io::Error::new(
+            ErrorKind::NotFound,
+            "AppImage path has no parent directory",
+        ))
+    })?;
+
+    // Stage in the same directory so `fs::rename` is an atomic same-filesystem replacement.
+    let staging = StagingDirGuard::create_in(parent)?;
+    let staged_appimage = staging
+        .path
+        .join(sanitize_asset_filename(&release.asset_name));
+    download_and_verify_to_file(release, &staged_appimage, parent, on_progress)?;
+    set_executable_permissions(&staged_appimage)?;
+
+    fs::rename(&staged_appimage, appimage_path).map_err(|err| map_dir_write_error(parent, err))?;
+
+    info!(
+        version = %release.version,
+        appimage = %appimage_path.display(),
+        "Replaced AppImage in place"
+    );
+    Ok(InstallOutcome {
+        version: release.version.clone(),
+        binary_path: appimage_path.to_path_buf(),
+        sibling_updated: false,
+        action: InstallAction::ReplacedInPlace,
+    })
+}
+
+fn install_system_package_update<F>(
+    pkg_kind: SystemPackageKind,
+    release: &ReleaseInfo,
+    cache_dir_override: Option<&Path>,
+    open_with_xdg: bool,
+    on_progress: &mut F,
+) -> Result<InstallOutcome, UpdateError>
+where
+    F: FnMut(DownloadProgress),
+{
+    let cache_dir = match cache_dir_override {
+        Some(dir) => dir.to_path_buf(),
+        None => package_update_cache_dir_from(
+            std::env::var_os("XDG_CACHE_HOME").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+        ),
+    };
+    fs::create_dir_all(&cache_dir)?;
+
+    let safe_name = sanitize_asset_filename(&release.asset_name);
+    let staging = StagingDirGuard::create_in(&cache_dir)?;
+    let staged_pkg = staging.path.join(&safe_name);
+    download_and_verify_to_file(release, &staged_pkg, &cache_dir, on_progress)?;
+
+    let package_path = cache_dir.join(&safe_name);
+    fs::rename(&staged_pkg, &package_path)?;
+
+    let install_command = match pkg_kind {
+        SystemPackageKind::Rpm => {
+            format!("sudo dnf install -y {}", shell_quote_path(&package_path))
+        }
+        SystemPackageKind::Deb => {
+            format!("sudo apt install -y {}", shell_quote_path(&package_path))
+        }
+    };
+
+    if open_with_xdg
+        && let Err(err) = Command::new("xdg-open")
+            .arg(&package_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+    {
+        debug!(
+            error = %err,
+            path = %package_path.display(),
+            "xdg-open launch failed or unavailable; manual install command provided"
+        );
+    }
+
+    info!(
+        version = %release.version,
+        package = %package_path.display(),
+        install_command = %install_command,
+        "Downloaded verified system package update"
+    );
+    Ok(InstallOutcome {
+        version: release.version.clone(),
+        binary_path: package_path.clone(),
+        sibling_updated: false,
+        action: InstallAction::DownloadedPackage {
+            package_path,
+            install_command,
+        },
+    })
+}
+
+fn shell_quote_path(path: &Path) -> String {
+    let raw = path.display().to_string();
+    if raw
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b'~'))
+    {
+        raw
+    } else {
+        let escaped = raw.replace('\'', "'\\''");
+        format!("'{escaped}'")
+    }
+}
+
+fn install_portable_archive_update<F>(
+    release: &ReleaseInfo,
+    primary_binary_name: &str,
+    on_progress: &mut F,
+) -> Result<InstallOutcome, UpdateError>
+where
+    F: FnMut(DownloadProgress),
+{
+    let current_exe = std::env::current_exe()?;
+    let exe_dir = current_exe.parent().ok_or_else(|| {
+        UpdateError::Io(std::io::Error::new(
+            ErrorKind::NotFound,
+            "current executable has no parent directory",
+        ))
+    })?;
+
+    let staging = StagingDirGuard::create_in(exe_dir)?;
+    let archive_path = staging
+        .path
+        .join(sanitize_asset_filename(&release.asset_name));
+    download_and_verify_to_file(release, &archive_path, exe_dir, on_progress)?;
 
     extract_binaries_from_tar_gz(&archive_path, &staging.path)?;
 
@@ -674,6 +1086,7 @@ where
         version: release.version.clone(),
         binary_path: current_exe,
         sibling_updated,
+        action: InstallAction::ReplacedInPlace,
     })
 }
 
@@ -723,14 +1136,7 @@ fn extract_binaries_from_tar_gz(
             out.write_all(&buf[..n])?;
         }
         out.flush()?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = out.metadata()?.permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&dest, perms)?;
-        }
+        set_executable_permissions(&dest)?;
     }
 
     Ok(())
@@ -738,6 +1144,7 @@ fn extract_binaries_from_tar_gz(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
@@ -814,6 +1221,146 @@ mod tests {
         assert!(!is_fedora_os_release("ID=ubuntu\nID_LIKE=debian\n"));
     }
 
+    #[test]
+    fn detect_install_kind_handles_appimage_rpm_deb_and_portable() {
+        assert_eq!(
+            detect_install_kind_from(
+                Some(Path::new("/home/user/Applications/CamCraft.AppImage")),
+                Path::new("/tmp/.mount_CamCraXYZ/usr/bin/camcraft-gui"),
+                "ID=ubuntu\nID_LIKE=debian\n",
+            ),
+            InstallKind::AppImage(PathBuf::from("/home/user/Applications/CamCraft.AppImage"))
+        );
+
+        assert_eq!(
+            detect_install_kind_from(
+                Some(Path::new("")),
+                Path::new("/usr/bin/camcraft-gui"),
+                "ID=fedora\n",
+            ),
+            InstallKind::RpmPackage
+        );
+
+        assert_eq!(
+            detect_install_kind_from(
+                None,
+                Path::new("/bin/camcraft-cli"),
+                "ID=nobara\nID_LIKE=\"fedora\"\n",
+            ),
+            InstallKind::RpmPackage
+        );
+
+        assert_eq!(
+            detect_install_kind_from(
+                None,
+                Path::new("/usr/bin/camcraft-gui"),
+                "ID=ubuntu\nID_LIKE=debian\n",
+            ),
+            InstallKind::DebPackage
+        );
+
+        assert_eq!(
+            detect_install_kind_from(None, Path::new("/usr/bin/camcraft-gui"), "ID=debian\n",),
+            InstallKind::DebPackage
+        );
+
+        assert_eq!(
+            detect_install_kind_from(
+                None,
+                Path::new("/home/user/.local/bin/camcraft-gui"),
+                "ID=fedora\n",
+            ),
+            InstallKind::PortableArchive
+        );
+
+        assert_eq!(
+            detect_install_kind_from(None, Path::new("/usr/bin/camcraft-gui"), "ID=arch\n",),
+            InstallKind::PortableArchive
+        );
+    }
+
+    #[test]
+    fn select_asset_for_install_kind_matches_packages_and_falls_back_to_tarball() {
+        let full_assets = [
+            "SHA256SUMS.txt",
+            "camcraft-0.2.0-1.src.rpm",
+            "camcraft-0.2.0-1.x86_64.rpm",
+            "camcraft_0.2.0_amd64.deb",
+            "CamCraft-v0.2.0-x86_64.AppImage",
+            "camcraft-desktop-fedora-x86_64.tar.gz",
+            "camcraft-desktop-linux-x86_64.tar.gz",
+        ];
+
+        assert_eq!(
+            select_asset_for_install_kind(
+                &full_assets,
+                &InstallKind::AppImage(PathBuf::from("/tmp/CamCraft.AppImage")),
+                false,
+                "x86_64"
+            ),
+            Some("CamCraft-v0.2.0-x86_64.AppImage")
+        );
+        assert_eq!(
+            select_asset_for_install_kind(&full_assets, &InstallKind::RpmPackage, true, "x86_64"),
+            Some("camcraft-0.2.0-1.x86_64.rpm")
+        );
+        assert_eq!(
+            select_asset_for_install_kind(&full_assets, &InstallKind::DebPackage, false, "x86_64"),
+            Some("camcraft_0.2.0_amd64.deb")
+        );
+        assert_eq!(
+            select_asset_for_install_kind(
+                &full_assets,
+                &InstallKind::PortableArchive,
+                true,
+                "x86_64"
+            ),
+            Some("camcraft-desktop-fedora-x86_64.tar.gz")
+        );
+
+        let legacy_tarball_only = [
+            "camcraft-desktop-fedora-x86_64.tar.gz",
+            "camcraft-desktop-linux-x86_64.tar.gz",
+        ];
+        assert_eq!(
+            select_asset_for_install_kind(
+                &legacy_tarball_only,
+                &InstallKind::AppImage(PathBuf::from("/tmp/CamCraft.AppImage")),
+                false,
+                "x86_64"
+            ),
+            Some("camcraft-desktop-linux-x86_64.tar.gz")
+        );
+        assert_eq!(
+            select_asset_for_install_kind(
+                &legacy_tarball_only,
+                &InstallKind::RpmPackage,
+                true,
+                "x86_64"
+            ),
+            Some("camcraft-desktop-fedora-x86_64.tar.gz")
+        );
+    }
+
+    #[test]
+    fn package_cache_dir_respects_xdg_and_home_fallbacks() {
+        assert_eq!(
+            package_update_cache_dir_from(
+                Some(OsStr::new("/var/cache/custom")),
+                Some(OsStr::new("/home/alice")),
+            ),
+            PathBuf::from("/var/cache/custom/camcraft/updates")
+        );
+        assert_eq!(
+            package_update_cache_dir_from(Some(OsStr::new("")), Some(OsStr::new("/home/alice"))),
+            PathBuf::from("/home/alice/.cache/camcraft/updates")
+        );
+        assert_eq!(
+            package_update_cache_dir_from(None, None),
+            PathBuf::from("/tmp/camcraft-updates")
+        );
+    }
+
     fn spawn_single_http_server(status_line: &str, body: String) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -831,6 +1378,57 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    fn spawn_route_http_server(
+        routes: HashMap<String, Vec<u8>>,
+        expected_requests: usize,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for _ in 0..expected_requests {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut req_buf = [0_u8; 4096];
+                let n = stream.read(&mut req_buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&req_buf[..n]);
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                if let Some(body) = routes.get(path) {
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(body);
+                } else {
+                    let msg = b"Not Found";
+                    let header = format!(
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        msg.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(msg);
+                }
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 
     #[test]
@@ -902,5 +1500,279 @@ mod tests {
             }
             UpdateCheckOutcome::UpToDate { .. } => panic!("expected UpdateAvailable"),
         }
+    }
+
+    #[test]
+    fn check_for_update_with_kind_picks_package_or_appimage_asset() {
+        let payload = r#"{
+            "tag_name": "v0.3.0",
+            "body": "Packaging release.",
+            "html_url": "https://github.com/test/repo/releases/tag/v0.3.0",
+            "draft": false,
+            "assets": [
+                {
+                    "name": "CamCraft-v0.3.0-x86_64.AppImage",
+                    "browser_download_url": "https://example.invalid/CamCraft.AppImage",
+                    "size": 9000
+                },
+                {
+                    "name": "camcraft-0.3.0-1.x86_64.rpm",
+                    "browser_download_url": "https://example.invalid/camcraft.rpm",
+                    "size": 8000
+                },
+                {
+                    "name": "camcraft_0.3.0_amd64.deb",
+                    "browser_download_url": "https://example.invalid/camcraft.deb",
+                    "size": 7000
+                },
+                {
+                    "name": "camcraft-desktop-fedora-x86_64.tar.gz",
+                    "browser_download_url": "https://example.invalid/fedora.tar.gz",
+                    "size": 6000
+                },
+                {
+                    "name": "SHA256SUMS.txt",
+                    "browser_download_url": "https://example.invalid/SHA256SUMS.txt",
+                    "size": 256
+                }
+            ]
+        }"#
+        .to_owned();
+
+        let base_app = spawn_single_http_server("200 OK", payload.clone());
+        let cfg_app = UpdateConfig {
+            repo: "test/repo".into(),
+            current_version: "0.0.1".into(),
+            api_base_url: base_app,
+        };
+        let app_outcome = check_for_update_with_kind(
+            &cfg_app,
+            &InstallKind::AppImage(PathBuf::from("/tmp/CamCraft.AppImage")),
+            false,
+        )
+        .unwrap();
+        let UpdateCheckOutcome::UpdateAvailable(app_info) = app_outcome else {
+            panic!("expected UpdateAvailable");
+        };
+        assert_eq!(app_info.asset_name, "CamCraft-v0.3.0-x86_64.AppImage");
+
+        let base_rpm = spawn_single_http_server("200 OK", payload.clone());
+        let cfg_rpm = UpdateConfig {
+            repo: "test/repo".into(),
+            current_version: "0.0.1".into(),
+            api_base_url: base_rpm,
+        };
+        let rpm_outcome =
+            check_for_update_with_kind(&cfg_rpm, &InstallKind::RpmPackage, true).unwrap();
+        let UpdateCheckOutcome::UpdateAvailable(rpm_info) = rpm_outcome else {
+            panic!("expected UpdateAvailable");
+        };
+        assert_eq!(rpm_info.asset_name, "camcraft-0.3.0-1.x86_64.rpm");
+
+        let base_deb = spawn_single_http_server("200 OK", payload);
+        let cfg_deb = UpdateConfig {
+            repo: "test/repo".into(),
+            current_version: "0.0.1".into(),
+            api_base_url: base_deb,
+        };
+        let deb_outcome =
+            check_for_update_with_kind(&cfg_deb, &InstallKind::DebPackage, false).unwrap();
+        let UpdateCheckOutcome::UpdateAvailable(deb_info) = deb_outcome else {
+            panic!("expected UpdateAvailable");
+        };
+        assert_eq!(deb_info.asset_name, "camcraft_0.3.0_amd64.deb");
+    }
+
+    struct TempDirCleanup(PathBuf);
+
+    impl TempDirCleanup {
+        fn new(prefix: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let dir = std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDirCleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn appimage_update_verifies_checksum_and_replaces_in_place() {
+        let tmp = TempDirCleanup::new("camcraft-appimage-test");
+        let target_appimage = tmp.0.join("CamCraft.AppImage");
+        fs::write(&target_appimage, b"old-appimage-bytes").unwrap();
+
+        let new_bytes = b"new-verified-appimage-payload".to_vec();
+        let asset_name = "CamCraft-v0.2.0-x86_64.AppImage";
+        let sums = format!("{}  {asset_name}\n", sha256_hex(&new_bytes));
+
+        let mut routes = HashMap::new();
+        routes.insert("/CamCraft.AppImage".to_owned(), new_bytes.clone());
+        routes.insert("/SHA256SUMS.txt".to_owned(), sums.into_bytes());
+        let base_url = spawn_route_http_server(routes, 2);
+
+        let release = ReleaseInfo {
+            tag_name: "v0.2.0".into(),
+            version: "0.2.0".into(),
+            release_notes: String::new(),
+            html_url: String::new(),
+            asset_name: asset_name.into(),
+            download_url: format!("{base_url}/CamCraft.AppImage"),
+            asset_size: new_bytes.len() as u64,
+            checksums_url: Some(format!("{base_url}/SHA256SUMS.txt")),
+        };
+
+        let mut progress_seen = Vec::new();
+        let outcome = download_and_install_update_with_options(
+            &release,
+            "camcraft-gui",
+            &InstallKind::AppImage(target_appimage.clone()),
+            None,
+            false,
+            |p| progress_seen.push(p.downloaded_bytes),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.action, InstallAction::ReplacedInPlace);
+        assert_eq!(outcome.binary_path, target_appimage);
+        assert!(!outcome.sibling_updated);
+        assert_eq!(fs::read(&target_appimage).unwrap(), new_bytes);
+        assert_eq!(progress_seen.last().copied(), Some(new_bytes.len() as u64));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&target_appimage).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755);
+        }
+    }
+
+    #[test]
+    fn appimage_update_rejects_bad_checksum_without_overwriting() {
+        let tmp = TempDirCleanup::new("camcraft-appimage-badsum");
+        let target_appimage = tmp.0.join("CamCraft.AppImage");
+        fs::write(&target_appimage, b"original-good-appimage").unwrap();
+
+        let new_bytes = b"corrupted-appimage".to_vec();
+        let asset_name = "CamCraft-v0.2.0-x86_64.AppImage";
+        let bad_sums = format!("{}  {asset_name}\n", "0".repeat(64));
+
+        let mut routes = HashMap::new();
+        routes.insert("/CamCraft.AppImage".to_owned(), new_bytes.clone());
+        routes.insert("/SHA256SUMS.txt".to_owned(), bad_sums.into_bytes());
+        let base_url = spawn_route_http_server(routes, 2);
+
+        let release = ReleaseInfo {
+            tag_name: "v0.2.0".into(),
+            version: "0.2.0".into(),
+            release_notes: String::new(),
+            html_url: String::new(),
+            asset_name: asset_name.into(),
+            download_url: format!("{base_url}/CamCraft.AppImage"),
+            asset_size: new_bytes.len() as u64,
+            checksums_url: Some(format!("{base_url}/SHA256SUMS.txt")),
+        };
+
+        let err = download_and_install_update_with_options(
+            &release,
+            "camcraft-gui",
+            &InstallKind::AppImage(target_appimage.clone()),
+            None,
+            false,
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(matches!(err, UpdateError::ChecksumMismatch { .. }));
+        assert_eq!(
+            fs::read(&target_appimage).unwrap(),
+            b"original-good-appimage"
+        );
+    }
+
+    #[test]
+    fn rpm_and_deb_updates_download_to_cache_dir_without_permission_denied() {
+        let tmp = TempDirCleanup::new("camcraft-pkg-test");
+
+        let rpm_bytes = b"fake-rpm-payload".to_vec();
+        let rpm_name = "camcraft-0.2.0-1.x86_64.rpm";
+        let deb_bytes = b"fake-deb-payload".to_vec();
+        let deb_name = "camcraft_0.2.0_amd64.deb";
+        let sums = format!(
+            "{}  {rpm_name}\n{}  {deb_name}\n",
+            sha256_hex(&rpm_bytes),
+            sha256_hex(&deb_bytes)
+        );
+
+        let mut routes = HashMap::new();
+        routes.insert(format!("/{rpm_name}"), rpm_bytes.clone());
+        routes.insert(format!("/{deb_name}"), deb_bytes.clone());
+        routes.insert("/SHA256SUMS.txt".to_owned(), sums.into_bytes());
+        let base_url = spawn_route_http_server(routes, 4);
+
+        let rpm_release = ReleaseInfo {
+            tag_name: "v0.2.0".into(),
+            version: "0.2.0".into(),
+            release_notes: String::new(),
+            html_url: String::new(),
+            asset_name: rpm_name.into(),
+            download_url: format!("{base_url}/{rpm_name}"),
+            asset_size: rpm_bytes.len() as u64,
+            checksums_url: Some(format!("{base_url}/SHA256SUMS.txt")),
+        };
+
+        let rpm_outcome = download_and_install_update_with_options(
+            &rpm_release,
+            "camcraft-gui",
+            &InstallKind::RpmPackage,
+            Some(&tmp.0),
+            false,
+            |_| {},
+        )
+        .unwrap();
+        let expected_rpm_path = tmp.0.join(rpm_name);
+        assert_eq!(
+            rpm_outcome.action,
+            InstallAction::DownloadedPackage {
+                package_path: expected_rpm_path.clone(),
+                install_command: format!("sudo dnf install -y {}", expected_rpm_path.display()),
+            }
+        );
+        assert_eq!(fs::read(&expected_rpm_path).unwrap(), rpm_bytes);
+
+        let deb_release = ReleaseInfo {
+            tag_name: "v0.2.0".into(),
+            version: "0.2.0".into(),
+            release_notes: String::new(),
+            html_url: String::new(),
+            asset_name: deb_name.into(),
+            download_url: format!("{base_url}/{deb_name}"),
+            asset_size: deb_bytes.len() as u64,
+            checksums_url: Some(format!("{base_url}/SHA256SUMS.txt")),
+        };
+
+        let deb_outcome = download_and_install_update_with_options(
+            &deb_release,
+            "camcraft-cli",
+            &InstallKind::DebPackage,
+            Some(&tmp.0),
+            false,
+            |_| {},
+        )
+        .unwrap();
+        let expected_deb_path = tmp.0.join(deb_name);
+        assert_eq!(
+            deb_outcome.action,
+            InstallAction::DownloadedPackage {
+                package_path: expected_deb_path.clone(),
+                install_command: format!("sudo apt install -y {}", expected_deb_path.display()),
+            }
+        );
+        assert_eq!(fs::read(&expected_deb_path).unwrap(), deb_bytes);
     }
 }

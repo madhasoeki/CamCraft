@@ -98,12 +98,12 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   build-desktop-fedora:
-    name: Build Desktop (Fedora x86_64)
+    name: Build Desktop (Fedora x86_64 RPM & Tarball)
     runs-on: ubuntu-latest
     needs: prepare
     container: fedora:latest
     steps:
-      - name: Install Fedora system dependencies & git
+      - name: Install Fedora system dependencies, rpm-build, and git
         run: |
           dnf install -y --setopt=install_weak_deps=False \
             git \
@@ -117,6 +117,7 @@ jobs:
             clang \
             llvm-devel \
             pkgconf-pkg-config \
+            rpm-build \
             ffmpeg-free-devel \
             alsa-lib-devel \
             pulseaudio-libs-devel \
@@ -149,6 +150,7 @@ jobs:
           cp desktop/target/release/camcraft-gui "$PKG_DIR/"
           cp desktop/target/release/camcraft-cli "$PKG_DIR/"
           cp scripts/setup-fedora-dev.sh "$PKG_DIR/"
+          cp packaging/linux/70-camcraft-aoa.rules "$PKG_DIR/"
           cp assets/branding/linux/org.artcraft.camcraft.desktop "$PKG_DIR/"
           cp assets/branding/svg/camcraft-symbol-app-icon.svg "$PKG_DIR/org.artcraft.camcraft.svg"
           cp assets/branding/png/camcraft-app-icon-256.png "$PKG_DIR/org.artcraft.camcraft.png"
@@ -156,36 +158,56 @@ jobs:
           chmod +x "$PKG_DIR/camcraft-gui" "$PKG_DIR/camcraft-cli" "$PKG_DIR/setup-fedora-dev.sh"
           tar -C dist -czf "dist/camcraft-desktop-fedora-x86_64.tar.gz" "camcraft-desktop-fedora-x86_64"
 
-      - name: Upload Fedora desktop artifact
+      - name: Package Fedora RPM
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          RPM_TOPDIR="${PWD}/dist/rpmbuild"
+          mkdir -p "${RPM_TOPDIR}"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          rpmbuild -bb packaging/linux/camcraft.spec \
+            --define "_topdir ${RPM_TOPDIR}" \
+            --define "_sourcedir ${PWD}" \
+            --define "_version ${VERSION}" \
+            --define "_bindir ${PWD}/desktop/target/release"
+          find "${RPM_TOPDIR}/RPMS" -name "*.rpm" -exec cp -v {} dist/ \;
+
+      - name: Upload Fedora desktop artifacts
         uses: actions/upload-artifact@v4
         with:
           name: desktop-fedora
-          path: dist/camcraft-desktop-fedora-x86_64.tar.gz
+          path: |
+            dist/camcraft-desktop-fedora-x86_64.tar.gz
+            dist/*.rpm
           if-no-files-found: error
 
   build-desktop-linux:
-    name: Build Desktop (Generic Linux x86_64)
+    name: Build Desktop (Ubuntu 22.04 AppImage, DEB & Tarball)
     runs-on: ubuntu-latest
     needs: prepare
+    container: ubuntu:22.04
     steps:
-      - name: Checkout tagged commit
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.prepare.outputs.tag }}
-
-      - name: Install Linux multimedia and desktop build dependencies
+      - name: Install Ubuntu 22.04 multimedia, packaging, and desktop build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git \
+            tar \
+            gzip \
+            findutils \
+            curl \
+            ca-certificates \
+            file \
+            dpkg-dev \
+            desktop-file-utils \
+            build-essential \
             pkg-config \
             clang \
             libclang-dev \
             libavcodec-dev \
-            libavdevice-dev \
-            libavfilter-dev \
             libavformat-dev \
             libavutil-dev \
-            libswresample-dev \
             libswscale-dev \
             libasound2-dev \
             libpulse-dev \
@@ -197,9 +219,17 @@ jobs:
             libxkbcommon-dev \
             libxkbcommon-x11-dev \
             libwayland-dev
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Checkout tagged commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
 
       - name: Install Rust stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@v2
@@ -216,6 +246,7 @@ jobs:
           mkdir -p "$PKG_DIR"
           cp desktop/target/release/camcraft-gui "$PKG_DIR/"
           cp desktop/target/release/camcraft-cli "$PKG_DIR/"
+          cp packaging/linux/70-camcraft-aoa.rules "$PKG_DIR/"
           cp assets/branding/linux/org.artcraft.camcraft.desktop "$PKG_DIR/"
           cp assets/branding/svg/camcraft-symbol-app-icon.svg "$PKG_DIR/org.artcraft.camcraft.svg"
           cp assets/branding/png/camcraft-app-icon-256.png "$PKG_DIR/org.artcraft.camcraft.png"
@@ -223,11 +254,30 @@ jobs:
           chmod +x "$PKG_DIR/camcraft-gui" "$PKG_DIR/camcraft-cli"
           tar -C dist -czf "dist/camcraft-desktop-linux-x86_64.tar.gz" "camcraft-desktop-linux-x86_64"
 
-      - name: Upload generic Linux desktop artifact
+      - name: Package Debian/Ubuntu .deb
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          chmod +x packaging/linux/build-deb.sh
+          ./packaging/linux/build-deb.sh "$VERSION" desktop/target/release dist
+
+      - name: Install appimagetool and package AppImage
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          curl -fsSL -o /usr/local/bin/appimagetool \
+            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+          chmod +x /usr/local/bin/appimagetool packaging/linux/build-appimage.sh
+          ./packaging/linux/build-appimage.sh "$TAG" desktop/target/release dist
+
+      - name: Upload generic Linux desktop artifacts
         uses: actions/upload-artifact@v4
         with:
           name: desktop-linux
-          path: dist/camcraft-desktop-linux-x86_64.tar.gz
+          path: |
+            dist/camcraft-desktop-linux-x86_64.tar.gz
+            dist/*.deb
+            dist/*.AppImage
           if-no-files-found: error
 
   build-android:
@@ -310,14 +360,23 @@ jobs:
           merge-multiple: true
 
       - name: Generate SHA256SUMS.txt
-        env:
-          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           cd release-assets
-          sha256sum \
-            "camcraft-desktop-fedora-x86_64.tar.gz" \
-            "camcraft-desktop-linux-x86_64.tar.gz" \
-            "camcraft-android-${TAG}.apk" > SHA256SUMS.txt
+          shopt -s nullglob
+          ASSETS=(
+            CamCraft-*.AppImage
+            camcraft-*.rpm
+            camcraft_*.deb
+            camcraft-desktop-fedora-x86_64.tar.gz
+            camcraft-desktop-linux-x86_64.tar.gz
+            camcraft-android-*.apk
+          )
+          if [ "${#ASSETS[@]}" -lt 6 ]; then
+            echo "::error::Expected AppImage, RPM, DEB, Fedora tarball, Linux tarball, and APK; found: ${ASSETS[*]}"
+            ls -la
+            exit 1
+          fi
+          sha256sum "${ASSETS[@]}" > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Compose release notes & publish GitHub Release
@@ -346,26 +405,38 @@ jobs:
           pathlib.Path(out_path).write_text(extracted, encoding="utf-8")
           PY
 
-          if [ -s "$NOTES_FILE" ]; then
-            {
+          APPIMAGE_FILE=$(basename release-assets/CamCraft-*.AppImage)
+          RPM_FILE=$(basename release-assets/camcraft-*.rpm)
+          DEB_FILE=$(basename release-assets/camcraft_*.deb)
+          APK_FILE=$(basename release-assets/camcraft-android-*.apk)
+
+          {
+            if [ -s "$NOTES_FILE" ]; then
               echo ""
-              echo "### Assets & Checksums"
-              echo "- **Fedora Desktop:** \`camcraft-desktop-fedora-x86_64.tar.gz\` (\`camcraft-gui\`, \`camcraft-cli\`, \`setup-fedora-dev.sh\`)"
-              echo "- **Generic Linux Desktop:** \`camcraft-desktop-linux-x86_64.tar.gz\` (\`camcraft-gui\`, \`camcraft-cli\`)"
-              echo "- **Android APK:** \`camcraft-android-${TAG}.apk\`"
-              if [ "$SIGNING_MODE" = "debug-fallback" ]; then
-                echo ""
-                echo "> **Note:** This APK was built with the fallback debug signing key because repository release keystore secrets were not configured."
-              fi
+            fi
+            echo "## Downloads & Quick Install"
+            echo ""
+            echo "| Platform | Package | Quick Start |"
+            echo "| --- | --- | --- |"
+            echo "| **Any Linux (Universal)** | \`${APPIMAGE_FILE}\` | \`chmod +x ${APPIMAGE_FILE} && ./${APPIMAGE_FILE}\` |"
+            echo "| **Fedora / RHEL (x86_64)** | \`${RPM_FILE}\` | \`sudo dnf install -y ./${RPM_FILE}\` |"
+            echo "| **Debian / Ubuntu (amd64)** | \`${DEB_FILE}\` | \`sudo apt install -y ./${DEB_FILE}\` |"
+            echo "| **Android (Universal APK)** | \`${APK_FILE}\` | Install on Android 10+ (API 29+) |"
+            echo ""
+            echo "### Portable Tarballs & Checksums"
+            echo "- **Fedora Desktop Tarball:** \`camcraft-desktop-fedora-x86_64.tar.gz\` (\`camcraft-gui\`, \`camcraft-cli\`, \`setup-fedora-dev.sh\`, \`70-camcraft-aoa.rules\`)"
+            echo "- **Generic Linux Tarball:** \`camcraft-desktop-linux-x86_64.tar.gz\` (\`camcraft-gui\`, \`camcraft-cli\`, \`70-camcraft-aoa.rules\`)"
+            echo "- **Checksums:** \`SHA256SUMS.txt\` (verified automatically by the in-app updater)"
+            if [ "$SIGNING_MODE" = "debug-fallback" ]; then
               echo ""
-              echo "\`\`\`text"
-              cat release-assets/SHA256SUMS.txt
-              echo "\`\`\`"
-            } >> "$NOTES_FILE"
-            NOTES_ARGS=(--notes-file "$NOTES_FILE")
-          else
-            NOTES_ARGS=(--generate-notes)
-          fi
+              echo "> **Note:** This APK was built with the fallback debug signing key because repository release keystore secrets were not configured."
+            fi
+            echo ""
+            echo "### SHA-256 Checksums"
+            echo "\`\`\`text"
+            cat release-assets/SHA256SUMS.txt
+            echo "\`\`\`"
+          } >> "$NOTES_FILE"
 
           EXTRA_FLAGS=()
           if [ "$PRERELEASE" = "true" ]; then
@@ -377,12 +448,10 @@ jobs:
 
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" release-assets/* --clobber
-            if [ -s "$NOTES_FILE" ]; then
-              gh release edit "$TAG" --title "CamCraft ${TAG}" "${NOTES_ARGS[@]}"
-            fi
+            gh release edit "$TAG" --title "CamCraft ${TAG}" --notes-file "$NOTES_FILE"
           else
             gh release create "$TAG" release-assets/* \
               --title "CamCraft ${TAG}" \
-              "${NOTES_ARGS[@]}" \
+              --notes-file "$NOTES_FILE" \
               "${EXTRA_FLAGS[@]}"
           fi
