@@ -3,7 +3,7 @@
 # Preserve annotations and metadata required by kotlinx.serialization & CameraX
 -keepattributes *Annotation*, InnerClasses, Signature, EnclosingMethod
 
-# CamCraft CCFT v1 wire protocol & JSON control channel models
+# CamCraft CCFT v1 wire protocol, JSON control channel, & GitHub release updater models
 -keep class org.artcraft.camcraft.protocol.** { *; }
 -keepclassmembers class org.artcraft.camcraft.protocol.** {
     *** Companion;
@@ -11,6 +11,15 @@
 }
 -keep @kotlinx.serialization.Serializable class org.artcraft.camcraft.protocol.** { *; }
 -keepclassmembers @kotlinx.serialization.Serializable class org.artcraft.camcraft.protocol.** {
+    static final *;
+}
+-keep class org.artcraft.camcraft.update.** { *; }
+-keepclassmembers class org.artcraft.camcraft.update.** {
+    *** Companion;
+    kotlinx.serialization.KSerializer serializer(...);
+}
+-keep @kotlinx.serialization.Serializable class org.artcraft.camcraft.update.** { *; }
+-keepclassmembers @kotlinx.serialization.Serializable class org.artcraft.camcraft.update.** {
     static final *;
 }
 

@@ -6,7 +6,7 @@
 use camcraft_protocol::{CameraInfo, ControlCmd};
 use eframe::egui::{self, Color32, Pos2, Rect, Stroke, Vec2};
 
-use crate::session::{GuiCommand, PerformanceProfile};
+use crate::session::{GuiCommand, PerformanceProfile, UpdateUiState};
 use crate::theme::{
     self, COLOR_ACCENT_BLUE, COLOR_BG_CANVAS, COLOR_BG_STAGE, COLOR_BORDER_SUBTLE,
     COLOR_STATUS_AMBER, COLOR_STATUS_EMERALD, COLOR_STATUS_ROSE, COLOR_SURFACE_CARD,
@@ -106,7 +106,7 @@ pub(crate) fn render_telemetry_bar(app: &mut CamCraftApp, ui: &mut egui::Ui) {
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
                 // Brand mark: CamCraft + STUDIO tag
-                theme::icon_widget(ui, 16.0, StudioIcon::Camera, COLOR_ACCENT_BLUE);
+                theme::icon_widget(ui, 18.0, StudioIcon::BrandMark, COLOR_ACCENT_BLUE);
                 ui.label(
                     egui::RichText::new("CamCraft")
                         .color(COLOR_TEXT_PRIMARY)
@@ -281,6 +281,243 @@ pub(crate) fn render_telemetry_bar(app: &mut CamCraftApp, ui: &mut egui::Ui) {
                 ui.label(egui::RichText::new(msg).color(msg_color).small());
             }
         });
+}
+
+/// Renders a compact non-intrusive update notification/progress banner below the telemetry header.
+pub(crate) fn render_update_banner(app: &mut CamCraftApp, ui: &mut egui::Ui) {
+    if app.update_banner_dismissed {
+        return;
+    }
+
+    let state = app.update_state.clone();
+    let should_render = matches!(
+        state,
+        UpdateUiState::Available(_)
+            | UpdateUiState::Downloading { .. }
+            | UpdateUiState::Installing { .. }
+            | UpdateUiState::RestartRequired { .. }
+            | UpdateUiState::Failed { .. }
+    );
+    if !should_render {
+        return;
+    }
+
+    let accent_border = match &state {
+        UpdateUiState::RestartRequired { .. } => COLOR_STATUS_EMERALD.gamma_multiply(0.5),
+        UpdateUiState::Failed { .. } => COLOR_STATUS_ROSE.gamma_multiply(0.55),
+        _ => COLOR_ACCENT_BLUE.gamma_multiply(0.5),
+    };
+
+    ui.add_space(6.0);
+    egui::Frame::new()
+        .fill(COLOR_SURFACE_CARD)
+        .stroke(Stroke::new(1.0, accent_border))
+        .corner_radius(8.0)
+        .inner_margin(egui::Margin::symmetric(12, 7))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            match state {
+                UpdateUiState::Available(release) => {
+                    ui.horizontal(|ui| {
+                        theme::icon_widget(ui, 15.0, StudioIcon::Download, COLOR_ACCENT_BLUE);
+                        theme::pill_badge(
+                            ui,
+                            &format!("Update v{}", release.version),
+                            COLOR_ACCENT_BLUE,
+                            COLOR_ACCENT_BLUE.gamma_multiply(0.16),
+                        );
+                        let summary = summarize_release_notes(&release.release_notes);
+                        if !summary.is_empty() {
+                            ui.label(
+                                egui::RichText::new(summary)
+                                    .color(COLOR_TEXT_SECONDARY)
+                                    .small(),
+                            );
+                        } else {
+                            ui.label(
+                                egui::RichText::new(
+                                    "A newer CamCraft release is ready to install.",
+                                )
+                                .color(COLOR_TEXT_SECONDARY)
+                                .small(),
+                            );
+                        }
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let update_btn = egui::Button::new(
+                                egui::RichText::new("Update Now")
+                                    .color(COLOR_TEXT_PRIMARY)
+                                    .strong(),
+                            )
+                            .fill(COLOR_ACCENT_BLUE);
+                            if ui.add_sized([102.0, 24.0], update_btn).clicked() {
+                                app.session.send(GuiCommand::InstallUpdate(release));
+                            }
+                            if ui
+                                .add_sized(
+                                    [56.0, 24.0],
+                                    egui::Button::new(
+                                        egui::RichText::new("Later")
+                                            .color(COLOR_TEXT_SECONDARY)
+                                            .small(),
+                                    )
+                                    .fill(COLOR_SURFACE_ELEVATED),
+                                )
+                                .clicked()
+                            {
+                                app.update_banner_dismissed = true;
+                            }
+                        });
+                    });
+                }
+                UpdateUiState::Downloading {
+                    version,
+                    progress,
+                    downloaded_bytes,
+                    total_bytes,
+                } => {
+                    ui.horizontal(|ui| {
+                        theme::icon_widget(ui, 15.0, StudioIcon::Download, COLOR_ACCENT_BLUE);
+                        ui.label(
+                            egui::RichText::new(format!("Downloading CamCraft v{version}..."))
+                                .color(COLOR_TEXT_PRIMARY)
+                                .strong(),
+                        );
+                        let dl_mb = downloaded_bytes as f64 / (1024.0 * 1024.0);
+                        let total_mb = total_bytes as f64 / (1024.0 * 1024.0);
+                        ui.label(
+                            egui::RichText::new(format!("{dl_mb:.1} / {total_mb:.1} MB"))
+                                .color(COLOR_TEXT_SECONDARY)
+                                .monospace()
+                                .small(),
+                        );
+                        ui.add_space(6.0);
+                        ui.add(
+                            egui::ProgressBar::new(progress)
+                                .desired_width(ui.available_width().max(120.0))
+                                .fill(COLOR_ACCENT_BLUE)
+                                .show_percentage(),
+                        );
+                    });
+                }
+                UpdateUiState::Installing { version } => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Verifying SHA-256 & installing v{version}..."
+                            ))
+                            .color(COLOR_TEXT_PRIMARY)
+                            .strong(),
+                        );
+                    });
+                }
+                UpdateUiState::RestartRequired { version } => {
+                    ui.horizontal(|ui| {
+                        theme::pill_badge(
+                            ui,
+                            &format!("Updated to v{version}"),
+                            COLOR_STATUS_EMERALD,
+                            COLOR_STATUS_EMERALD.gamma_multiply(0.16),
+                        );
+                        ui.label(
+                            egui::RichText::new(
+                                "Restart CamCraft to switch to the updated binary.",
+                            )
+                            .color(COLOR_TEXT_PRIMARY)
+                            .small(),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let restart_btn = egui::Button::new(
+                                egui::RichText::new("Restart Now")
+                                    .color(COLOR_BG_STAGE)
+                                    .strong(),
+                            )
+                            .fill(COLOR_STATUS_EMERALD);
+                            if ui.add_sized([104.0, 24.0], restart_btn).clicked() {
+                                app.restart_after_update(ui.ctx());
+                            }
+                            if ui
+                                .add_sized(
+                                    [56.0, 24.0],
+                                    egui::Button::new(
+                                        egui::RichText::new("Later")
+                                            .color(COLOR_TEXT_SECONDARY)
+                                            .small(),
+                                    )
+                                    .fill(COLOR_SURFACE_ELEVATED),
+                                )
+                                .clicked()
+                            {
+                                app.update_banner_dismissed = true;
+                            }
+                        });
+                    });
+                }
+                UpdateUiState::Failed {
+                    message,
+                    retry_release,
+                } => {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("Update failed: {message}"))
+                                .color(COLOR_STATUS_ROSE)
+                                .small(),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add_sized(
+                                    [62.0, 24.0],
+                                    egui::Button::new(
+                                        egui::RichText::new("Dismiss")
+                                            .color(COLOR_TEXT_SECONDARY)
+                                            .small(),
+                                    )
+                                    .fill(COLOR_SURFACE_ELEVATED),
+                                )
+                                .clicked()
+                            {
+                                app.update_banner_dismissed = true;
+                            }
+                            if ui
+                                .add_sized(
+                                    [62.0, 24.0],
+                                    egui::Button::new(
+                                        egui::RichText::new("Retry")
+                                            .color(COLOR_TEXT_PRIMARY)
+                                            .small(),
+                                    )
+                                    .fill(COLOR_ACCENT_BLUE),
+                                )
+                                .clicked()
+                            {
+                                if let Some(rel) = retry_release {
+                                    app.session.send(GuiCommand::InstallUpdate(rel));
+                                } else {
+                                    app.session
+                                        .send(GuiCommand::CheckForUpdates { silent: false });
+                                }
+                            }
+                        });
+                    });
+                }
+                UpdateUiState::Idle | UpdateUiState::Checking | UpdateUiState::UpToDate => {}
+            }
+        });
+}
+
+fn summarize_release_notes(notes: &str) -> String {
+    let first_line = notes
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with("---"))
+        .unwrap_or("")
+        .trim_start_matches(['-', '*', ' ']);
+    let mut out: String = first_line.chars().take(76).collect();
+    if first_line.chars().count() > 76 {
+        out.push_str("...");
+    }
+    out
 }
 
 /// Renders the Left 70% Cinema Preview Canvas.
@@ -605,7 +842,7 @@ fn render_disconnected_quickstart_card(app: &mut CamCraftApp, ui: &mut egui::Ui,
     render_centered_stage_card(ui, stage_rect, |ui| {
         ui.set_max_width(420.0);
         ui.horizontal(|ui| {
-            theme::icon_widget(ui, 18.0, StudioIcon::Camera, COLOR_ACCENT_BLUE);
+            theme::icon_widget(ui, 22.0, StudioIcon::BrandMark, COLOR_ACCENT_BLUE);
             ui.label(
                 egui::RichText::new("CamCraft Studio Preview")
                     .color(COLOR_TEXT_PRIMARY)
@@ -939,6 +1176,78 @@ fn render_connect_tab(app: &mut CamCraftApp, ui: &mut egui::Ui) {
         {
             app.set_preview_enabled(!pause_preview);
         }
+    });
+
+    ui.add_space(10.0);
+    theme::card_frame().show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        ui.horizontal(|ui| {
+            theme::icon_widget(ui, 14.0, StudioIcon::Download, COLOR_ACCENT_BLUE);
+            theme::section_title(ui, "App Version & Updates");
+        });
+        ui.add_space(6.0);
+
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!("CamCraft v{}", env!("CARGO_PKG_VERSION")))
+                    .color(COLOR_TEXT_PRIMARY)
+                    .monospace()
+                    .strong(),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (badge_text, badge_color) = match &app.update_state {
+                    UpdateUiState::Checking => ("Checking...", COLOR_STATUS_AMBER),
+                    UpdateUiState::UpToDate => ("Up to date", COLOR_STATUS_EMERALD),
+                    UpdateUiState::Available(r) => {
+                        return theme::pill_badge(
+                            ui,
+                            &format!("v{} available", r.version),
+                            COLOR_ACCENT_BLUE,
+                            COLOR_ACCENT_BLUE.gamma_multiply(0.16),
+                        );
+                    }
+                    UpdateUiState::Downloading { .. } | UpdateUiState::Installing { .. } => {
+                        ("Updating...", COLOR_ACCENT_BLUE)
+                    }
+                    UpdateUiState::RestartRequired { .. } => {
+                        ("Restart ready", COLOR_STATUS_EMERALD)
+                    }
+                    UpdateUiState::Failed { .. } => ("Check failed", COLOR_STATUS_ROSE),
+                    UpdateUiState::Idle => ("Ready", COLOR_TEXT_MUTED),
+                };
+                theme::pill_badge(
+                    ui,
+                    badge_text,
+                    badge_color,
+                    badge_color.gamma_multiply(0.14),
+                )
+            });
+        });
+
+        ui.add_space(8.0);
+        let check_busy = matches!(
+            app.update_state,
+            UpdateUiState::Checking
+                | UpdateUiState::Downloading { .. }
+                | UpdateUiState::Installing { .. }
+        );
+        ui.add_enabled_ui(!check_busy, |ui| {
+            if theme::icon_action_button(
+                ui,
+                StudioIcon::Refresh,
+                "Check for Updates",
+                COLOR_SURFACE_ELEVATED,
+                COLOR_TEXT_PRIMARY,
+                Vec2::new(ui.available_width(), 28.0),
+            )
+            .on_hover_text("Check GitHub Releases for a newer CamCraft version")
+            .clicked()
+            {
+                app.update_banner_dismissed = false;
+                app.session
+                    .send(GuiCommand::CheckForUpdates { silent: false });
+            }
+        });
     });
 }
 

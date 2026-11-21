@@ -1,7 +1,7 @@
-//! Core receiver pipeline for CamCraft desktop (Fedora Linux).
+//! Core receiver pipeline for CamCraft desktop (Linux).
 //!
-//! Modules follow `docs/DESIGN.md` §3.1 (`net`, `adb`, `decoder`, `vcam`, `vmic`)
-//! and will be implemented incrementally across Stages 2-8.
+//! Modules follow `docs/DESIGN.md` §3.1 (`net`, `adb`, `client`, `decoder`, `discovery`, `vcam`, `vmic`)
+//! plus `updater` for in-app GitHub Release updates.
 
 use thiserror::Error;
 
@@ -29,11 +29,11 @@ pub enum CoreError {
     #[error("virtual microphone error: {0}")]
     Vmic(#[from] vmic::VmicError),
 
+    #[error("updater error: {0}")]
+    Update(#[from] updater::UpdateError),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-
-    #[error("operation not yet implemented in Stage 0 scaffolding: {0}")]
-    Unimplemented(&'static str),
 }
 
 /// Platform-independent sink abstraction for decoded video frames (`docs/PRD.md` §6.3).
@@ -233,6 +233,9 @@ pub mod vcam;
 
 /// PipeWire / PulseAudio virtual microphone sink (Stage 7+).
 pub mod vmic;
+
+/// In-app GitHub Releases auto-updater and self-replace helper.
+pub mod updater;
 
 #[cfg(test)]
 mod tests {

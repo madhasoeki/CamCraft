@@ -18,6 +18,7 @@ use camcraft_core::decoder::{
     spawn_decoder_worker_optimized,
 };
 use camcraft_core::discovery::{DiscoveryEvent, MdnsScanner};
+use camcraft_core::updater::{self, ReleaseInfo, UpdateCheckOutcome, UpdateConfig};
 use camcraft_core::vcam::{V4l2LoopbackSink, VirtualCameraSink, find_camcraft_v4l2_device};
 use camcraft_core::vmic::{
     AudioLevelMetrics, AudioWorkerSender, DEFAULT_SOURCE_DESCRIPTION, VirtualMicSink,
@@ -99,6 +100,31 @@ impl PerformanceProfile {
     }
 }
 
+/// Lifecycle state of the in-app desktop updater exposed to the GUI.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UpdateUiState {
+    Idle,
+    Checking,
+    UpToDate,
+    Available(ReleaseInfo),
+    Downloading {
+        version: String,
+        progress: f32,
+        downloaded_bytes: u64,
+        total_bytes: u64,
+    },
+    Installing {
+        version: String,
+    },
+    RestartRequired {
+        version: String,
+    },
+    Failed {
+        message: String,
+        retry_release: Option<ReleaseInfo>,
+    },
+}
+
 /// Commands sent from the UI thread to the background session worker.
 #[derive(Debug, Clone)]
 pub enum GuiCommand {
@@ -119,6 +145,10 @@ pub enum GuiCommand {
         enabled: bool,
         muted: bool,
     },
+    CheckForUpdates {
+        silent: bool,
+    },
+    InstallUpdate(ReleaseInfo),
 }
 
 /// Status updates sent from the background session worker to the UI thread.
@@ -151,6 +181,7 @@ pub enum GuiUpdate {
         active: bool,
         error: Option<String>,
     },
+    UpdateState(UpdateUiState),
     Disconnected(String),
     Error(String),
 }
@@ -400,6 +431,14 @@ async fn run_session_supervisor(
         }
     };
 
+    // Delay silent startup update check slightly so UI paints and mDNS starts first.
+    let update_tx_startup = update_tx.clone();
+    let ctx_startup = ctx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        run_update_check(true, update_tx_startup, ctx_startup).await;
+    });
+
     loop {
         tokio::select! {
             maybe_cmd = cmd_rx.recv() => {
@@ -551,6 +590,20 @@ async fn run_session_supervisor(
                                 });
                             }
                         }
+                    }
+                    GuiCommand::CheckForUpdates { silent } => {
+                        let update_tx_c = update_tx.clone();
+                        let ctx_c = ctx.clone();
+                        tokio::spawn(async move {
+                            run_update_check(silent, update_tx_c, ctx_c).await;
+                        });
+                    }
+                    GuiCommand::InstallUpdate(release) => {
+                        let update_tx_c = update_tx.clone();
+                        let ctx_c = ctx.clone();
+                        tokio::spawn(async move {
+                            run_update_install(release, update_tx_c, ctx_c).await;
+                        });
                     }
                 }
             }
@@ -1033,6 +1086,155 @@ fn format_disconnect_reason(reason: &str) -> String {
 fn emit(tx: &Sender<GuiUpdate>, ctx: &egui::Context, update: GuiUpdate) {
     let _ = tx.send(update);
     ctx.request_repaint();
+}
+
+async fn run_update_check(silent: bool, update_tx: Sender<GuiUpdate>, ctx: egui::Context) {
+    if !silent {
+        emit(
+            &update_tx,
+            &ctx,
+            GuiUpdate::UpdateState(UpdateUiState::Checking),
+        );
+    }
+    let result =
+        tokio::task::spawn_blocking(|| updater::check_for_update(&UpdateConfig::default())).await;
+    match result {
+        Ok(Ok(UpdateCheckOutcome::UpdateAvailable(info))) => {
+            emit(
+                &update_tx,
+                &ctx,
+                GuiUpdate::UpdateState(UpdateUiState::Available(info)),
+            );
+        }
+        Ok(Ok(UpdateCheckOutcome::UpToDate { .. })) => {
+            if !silent {
+                emit(
+                    &update_tx,
+                    &ctx,
+                    GuiUpdate::UpdateState(UpdateUiState::UpToDate),
+                );
+            }
+        }
+        Ok(Err(err)) => {
+            if silent {
+                tracing::debug!(error = %err, "Silent startup update check did not complete");
+            } else {
+                emit(
+                    &update_tx,
+                    &ctx,
+                    GuiUpdate::UpdateState(UpdateUiState::Failed {
+                        message: err.to_string(),
+                        retry_release: None,
+                    }),
+                );
+            }
+        }
+        Err(join_err) => {
+            if !silent {
+                emit(
+                    &update_tx,
+                    &ctx,
+                    GuiUpdate::UpdateState(UpdateUiState::Failed {
+                        message: format!("Update check task failed: {join_err}"),
+                        retry_release: None,
+                    }),
+                );
+            }
+        }
+    }
+}
+
+async fn run_update_install(
+    release: ReleaseInfo,
+    update_tx: Sender<GuiUpdate>,
+    ctx: egui::Context,
+) {
+    let version = release.version.clone();
+    emit(
+        &update_tx,
+        &ctx,
+        GuiUpdate::UpdateState(UpdateUiState::Downloading {
+            version: version.clone(),
+            progress: 0.0,
+            downloaded_bytes: 0,
+            total_bytes: release.asset_size,
+        }),
+    );
+
+    let release_for_task = release.clone();
+    let update_tx_prog = update_tx.clone();
+    let ctx_prog = ctx.clone();
+    let version_prog = version.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        let mut last_pct: u32 = 0;
+        let mut last_emit = Instant::now();
+        let mut installing_sent = false;
+        updater::download_and_install_update(&release_for_task, "camcraft-gui", |prog| {
+            let total = prog.total_bytes.max(1);
+            let frac = (prog.downloaded_bytes as f32 / total as f32).clamp(0.0, 1.0);
+            let pct = (frac * 100.0) as u32;
+            if prog.total_bytes > 0 && prog.downloaded_bytes >= prog.total_bytes {
+                if !installing_sent {
+                    installing_sent = true;
+                    emit(
+                        &update_tx_prog,
+                        &ctx_prog,
+                        GuiUpdate::UpdateState(UpdateUiState::Installing {
+                            version: version_prog.clone(),
+                        }),
+                    );
+                }
+                return;
+            }
+            if pct > last_pct || last_emit.elapsed() >= Duration::from_millis(100) {
+                last_pct = pct;
+                last_emit = Instant::now();
+                emit(
+                    &update_tx_prog,
+                    &ctx_prog,
+                    GuiUpdate::UpdateState(UpdateUiState::Downloading {
+                        version: version_prog.clone(),
+                        progress: frac,
+                        downloaded_bytes: prog.downloaded_bytes,
+                        total_bytes: prog.total_bytes,
+                    }),
+                );
+            }
+        })
+    })
+    .await;
+
+    match res {
+        Ok(Ok(outcome)) => {
+            emit(
+                &update_tx,
+                &ctx,
+                GuiUpdate::UpdateState(UpdateUiState::RestartRequired {
+                    version: outcome.version,
+                }),
+            );
+        }
+        Ok(Err(err)) => {
+            emit(
+                &update_tx,
+                &ctx,
+                GuiUpdate::UpdateState(UpdateUiState::Failed {
+                    message: err.to_string(),
+                    retry_release: Some(release),
+                }),
+            );
+        }
+        Err(join_err) => {
+            emit(
+                &update_tx,
+                &ctx,
+                GuiUpdate::UpdateState(UpdateUiState::Failed {
+                    message: format!("Update install task failed: {join_err}"),
+                    retry_release: Some(release),
+                }),
+            );
+        }
+    }
 }
 
 #[cfg(test)]

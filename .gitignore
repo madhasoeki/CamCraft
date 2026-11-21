@@ -34,3 +34,9 @@ Thumbs.db
 
 # Kotlin compiler session data
 android/.kotlin/
+
+# Release & packaging artifacts
+dist/
+release-artifacts/
+*.tar.gz
+*.rpm

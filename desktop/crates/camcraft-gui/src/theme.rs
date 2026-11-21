@@ -45,6 +45,7 @@ const VU_SEGMENT_COUNT: usize = 24;
 /// Vector icons painted cleanly with [`egui::Painter`] (no emoji glyphs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StudioIcon {
+    BrandMark,
     Usb,
     Wifi,
     Camera,
@@ -58,6 +59,7 @@ pub enum StudioIcon {
     Play,
     Grid,
     Refresh,
+    Download,
 }
 
 /// Applies the ArtCraft Studio v2 dark theme, 4px/8px spacing rhythm, and crisp
@@ -446,6 +448,9 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: StudioIcon, color: 
     let stroke = Stroke::new(sw, color);
 
     match icon {
+        StudioIcon::BrandMark => {
+            paint_brand_mark(painter, rect);
+        }
         StudioIcon::Usb => {
             // Vertical trunk + circle base + fork branches
             let top = Pos2::new(c.x, c.y - r * 0.9);
@@ -656,7 +661,105 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: StudioIcon, color: 
             painter.line_segment([tip, Pos2::new(tip.x - r * 0.38, tip.y - r * 0.1)], stroke);
             painter.line_segment([tip, Pos2::new(tip.x - r * 0.05, tip.y - r * 0.42)], stroke);
         }
+        StudioIcon::Download => {
+            let shaft_top = Pos2::new(c.x, c.y - r * 0.82);
+            let shaft_bot = Pos2::new(c.x, c.y + r * 0.34);
+            painter.line_segment([shaft_top, shaft_bot], stroke);
+            painter.line_segment(
+                [Pos2::new(c.x - r * 0.38, c.y - r * 0.04), shaft_bot],
+                stroke,
+            );
+            painter.line_segment(
+                [Pos2::new(c.x + r * 0.38, c.y - r * 0.04), shaft_bot],
+                stroke,
+            );
+            let tray_left_top = Pos2::new(c.x - r * 0.72, c.y + r * 0.44);
+            let tray_left_bot = Pos2::new(c.x - r * 0.72, c.y + r * 0.78);
+            let tray_right_bot = Pos2::new(c.x + r * 0.72, c.y + r * 0.78);
+            let tray_right_top = Pos2::new(c.x + r * 0.72, c.y + r * 0.44);
+            painter.line(
+                vec![tray_left_top, tray_left_bot, tray_right_bot, tray_right_top],
+                stroke,
+            );
+        }
     }
+}
+
+/// Paints the full-colour ArtCraft Studio v2 CamCraft Miter Frame emblem inside `rect`.
+fn paint_brand_mark(painter: &egui::Painter, rect: Rect) {
+    let side = rect.width().min(rect.height());
+    let s = side / 256.0;
+    let c = rect.center();
+    let pt = |x: f32, y: f32| Pos2::new(c.x + (x - 128.0) * s, c.y + (y - 128.0) * s);
+
+    // Top-left viewfinder bracket (#F8FAFC)
+    let mut tl_corner = Vec::with_capacity(8);
+    tl_corner.push(pt(56.0, 74.0));
+    for i in 0..=6 {
+        let ang = PI + FRAC_PI_2 * (i as f32 / 6.0);
+        tl_corner.push(pt(56.0 + 36.0 * ang.cos(), 74.0 + 36.0 * ang.sin()));
+    }
+    painter.add(egui::Shape::convex_polygon(
+        tl_corner,
+        COLOR_TEXT_PRIMARY,
+        Stroke::NONE,
+    ));
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            pt(56.0, 38.0),
+            pt(202.36, 38.0),
+            pt(166.44, 74.0),
+            pt(56.0, 74.0),
+        ],
+        COLOR_TEXT_PRIMARY,
+        Stroke::NONE,
+    ));
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            pt(20.0, 74.0),
+            pt(56.0, 74.0),
+            pt(56.0, 173.0),
+            pt(20.0, 208.65),
+        ],
+        COLOR_TEXT_PRIMARY,
+        Stroke::NONE,
+    ));
+
+    // Bottom-right bridge bracket (#3B82F6)
+    let mut br_corner = Vec::with_capacity(8);
+    br_corner.push(pt(200.0, 182.0));
+    for i in 0..=6 {
+        let ang = FRAC_PI_2 * (i as f32 / 6.0);
+        br_corner.push(pt(200.0 + 36.0 * ang.cos(), 182.0 + 36.0 * ang.sin()));
+    }
+    painter.add(egui::Shape::convex_polygon(
+        br_corner,
+        COLOR_ACCENT_BLUE,
+        Stroke::NONE,
+    ));
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            pt(89.56, 182.0),
+            pt(200.0, 182.0),
+            pt(200.0, 218.0),
+            pt(53.64, 218.0),
+        ],
+        COLOR_ACCENT_BLUE,
+        Stroke::NONE,
+    ));
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            pt(200.0, 83.0),
+            pt(236.0, 47.35),
+            pt(236.0, 182.0),
+            pt(200.0, 182.0),
+        ],
+        COLOR_ACCENT_BLUE,
+        Stroke::NONE,
+    ));
+
+    // Center live emerald optical lens core (#10B981)
+    painter.circle_filled(c, 34.0 * s, COLOR_STATUS_EMERALD);
 }
 
 fn paint_arc(

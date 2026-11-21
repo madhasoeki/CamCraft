@@ -43,6 +43,10 @@ usb-tunnel:
 # 2. Perintah Rust Desktop (Fedora Receiver)
 # -----------------------------------------------------------------------------
 
+# Periksa format kode Rust (rustfmt)
+rust-fmt:
+    cd desktop && cargo fmt --all -- --check
+
 # Periksa kompilasi seluruh workspace Rust
 rust-check:
     cd desktop && cargo check --workspace --all-targets
@@ -83,18 +87,26 @@ android-lint:
 android-build:
     cd android && ./gradlew assembleDebug
 
+# Build APK Release Android (R8 minified)
+android-release:
+    cd android && ./gradlew assembleRelease
+
 # Build dan langsung instal APK Debug ke HP Android yang terhubung via USB
 android-install:
     cd android && ./gradlew installDebug
 
 # -----------------------------------------------------------------------------
-# 4. Graphify & Verifikasi Monorepo Menyeluruh
+# 4. Graphify, PR Agent & Verifikasi Monorepo Menyeluruh
 # -----------------------------------------------------------------------------
+
+# Jalankan unit test PR Agent
+pr-agent-test:
+    python3 -m unittest discover -s .github/scripts -p "test_*.py" -v
 
 # Perbarui knowledge graph Graphify untuk kode + dokumen
 graph:
     graphify .
 
-# Jalankan pemeriksaan kualitas menyeluruh (Rust + Android)
-check-all: rust-check rust-lint rust-test android-test
-    @echo "Seluruh pemeriksaan Rust & Android berhasil!"
+# Jalankan pemeriksaan kualitas menyeluruh (Rust + Android + PR Agent)
+check-all: rust-fmt rust-check rust-lint rust-test android-test pr-agent-test
+    @echo "Seluruh pemeriksaan Rust, Android, & PR Agent berhasil!"

@@ -26,6 +26,7 @@ use camcraft_core::decoder::{
     spawn_decoder_worker_optimized,
 };
 use camcraft_core::discovery::{DiscoveredDevice, DiscoveryEvent, MdnsScanner};
+use camcraft_core::updater::{self, UpdateCheckOutcome, UpdateConfig};
 use camcraft_core::vcam::{V4l2LoopbackSink, VirtualCameraSink, find_camcraft_v4l2_device};
 use camcraft_core::vmic::{
     AudioWorkerSender, VirtualMicSink, ensure_virtual_mic, spawn_audio_worker,
@@ -53,6 +54,13 @@ enum Command {
         /// How many seconds to scan for mDNS advertisements.
         #[arg(long, default_value_t = 5)]
         timeout: u64,
+    },
+
+    /// Check GitHub Releases and optionally install desktop updates in-place.
+    Update {
+        /// Only check if a newer release exists without downloading or installing.
+        #[arg(long)]
+        check: bool,
     },
 
     /// Print compiled CamCraft protocol and core configuration.
@@ -125,11 +133,15 @@ async fn main() -> Result<()> {
         Command::Discover { timeout } => {
             run_discover(timeout).await?;
         }
+        Command::Update { check } => {
+            run_update(check).await?;
+        }
         Command::Status => {
             info!(
+                version = env!("CARGO_PKG_VERSION"),
                 protocol_version = camcraft_protocol::PROTOCOL_VERSION,
                 default_port = camcraft_protocol::DEFAULT_PORT,
-                "CamCraft CLI receiver ready (v0.1: Virtual Camera, Virtual Mic, Wi-Fi/USB Auto-Reconnect)"
+                "CamCraft CLI receiver ready (Virtual Camera, Virtual Mic, Wi-Fi/USB Auto-Reconnect)"
             );
         }
     }
@@ -588,6 +600,78 @@ async fn run_discover(timeout_secs: u64) -> Result<()> {
                 dev.endpoint()
             );
         }
+    }
+
+    Ok(())
+}
+
+async fn run_update(check_only: bool) -> Result<()> {
+    let config = UpdateConfig::default();
+    println!(
+        "Checking {} for updates (installed: v{})...",
+        config.repo, config.current_version
+    );
+
+    let outcome = tokio::task::spawn_blocking(move || updater::check_for_update(&config))
+        .await
+        .context("Update check task panicked")?
+        .context("Failed to check for updates")?;
+
+    let release = match outcome {
+        UpdateCheckOutcome::UpToDate {
+            current_version,
+            latest_version,
+        } => {
+            println!(
+                "CamCraft v{current_version} is already up to date (latest: {latest_version})."
+            );
+            return Ok(());
+        }
+        UpdateCheckOutcome::UpdateAvailable(info) => info,
+    };
+
+    println!(
+        "Update available: v{} ({})",
+        release.version, release.asset_name
+    );
+    if !release.release_notes.trim().is_empty() {
+        println!("\nRelease Notes:\n{}\n", release.release_notes.trim());
+    }
+
+    if check_only {
+        println!(
+            "Run `camcraft-cli update` without `--check` to download and install v{}.",
+            release.version
+        );
+        return Ok(());
+    }
+
+    let install_outcome = tokio::task::spawn_blocking(move || {
+        let mut last_pct: u32 = 0;
+        updater::download_and_install_update(&release, "camcraft-cli", |prog| {
+            let total = prog.total_bytes.max(1);
+            let pct = ((prog.downloaded_bytes.saturating_mul(100)) / total) as u32;
+            if pct >= last_pct + 10 || pct == 100 {
+                last_pct = pct;
+                println!(
+                    "  Downloading... {pct}% ({:.1} / {:.1} MB)",
+                    prog.downloaded_bytes as f64 / (1024.0 * 1024.0),
+                    total as f64 / (1024.0 * 1024.0)
+                );
+            }
+        })
+    })
+    .await
+    .context("Update install task panicked")?
+    .context("Failed to install update")?;
+
+    println!(
+        "Successfully updated {} to v{}.",
+        install_outcome.binary_path.display(),
+        install_outcome.version
+    );
+    if install_outcome.sibling_updated {
+        println!("Sibling `camcraft-gui` binary in the same folder was also updated.");
     }
 
     Ok(())

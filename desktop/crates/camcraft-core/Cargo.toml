@@ -12,10 +12,16 @@ bytes.workspace = true
 camcraft-protocol = { path = "../camcraft-protocol" }
 crossbeam-channel.workspace = true
 ffmpeg-next.workspace = true
+flate2.workspace = true
 libc.workspace = true
+self-replace.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 socket2.workspace = true
+tar.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+ureq.workspace = true
 v4l.workspace = true

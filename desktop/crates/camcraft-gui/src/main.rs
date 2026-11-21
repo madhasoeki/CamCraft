@@ -12,7 +12,9 @@ use camcraft_core::discovery::{DiscoveredDevice, DiscoveryEvent};
 use camcraft_core::vmic::{AudioLevelMetrics, DEFAULT_SOURCE_DESCRIPTION};
 use camcraft_protocol::{ActiveCameraState, CameraInfo, ControlCmd, ControlHello, DEFAULT_PORT};
 use eframe::egui;
-use session::{ConnectionMode, GuiCommand, GuiSession, GuiUpdate, PerformanceProfile};
+use session::{
+    ConnectionMode, GuiCommand, GuiSession, GuiUpdate, PerformanceProfile, UpdateUiState,
+};
 use theme::COLOR_BG_CANVAS;
 use tracing::info;
 
@@ -23,6 +25,14 @@ pub(crate) const STANDARD_RESOLUTIONS: &[(u32, u32, &str)] = &[
     (1920, 1080, "1920x1080 (1080p)"),
     (3840, 2160, "3840x2160 (4K UHD)"),
 ];
+
+fn app_window_icon() -> std::sync::Arc<egui::IconData> {
+    std::sync::Arc::new(egui::IconData {
+        rgba: include_bytes!("../assets/icon-64.rgba").to_vec(),
+        width: 64,
+        height: 64,
+    })
+}
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -40,6 +50,8 @@ fn main() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("CamCraft — ArtCraft Studio")
+            .with_app_id("org.artcraft.camcraft")
+            .with_icon(app_window_icon())
             .with_inner_size([1240.0, 760.0])
             .with_min_inner_size([960.0, 600.0]),
         ..Default::default()
@@ -133,6 +145,10 @@ pub(crate) struct CamCraftApp {
     pub(crate) frame_height: u32,
     pub(crate) decode_time_ms: f32,
     pub(crate) stats: StreamStats,
+
+    // In-app updater state
+    pub(crate) update_state: UpdateUiState,
+    pub(crate) update_banner_dismissed: bool,
 }
 
 impl CamCraftApp {
@@ -184,6 +200,8 @@ impl CamCraftApp {
             frame_height: 0,
             decode_time_ms: 0.0,
             stats: StreamStats::default(),
+            update_state: UpdateUiState::Idle,
+            update_banner_dismissed: false,
         }
     }
 
@@ -275,6 +293,19 @@ impl CamCraftApp {
                     }
                     self.vmic_active = active;
                     self.vmic_error = error;
+                }
+                GuiUpdate::UpdateState(next) => {
+                    if matches!(
+                        next,
+                        UpdateUiState::Available(_)
+                            | UpdateUiState::Downloading { .. }
+                            | UpdateUiState::Installing { .. }
+                            | UpdateUiState::RestartRequired { .. }
+                            | UpdateUiState::Failed { .. }
+                    ) {
+                        self.update_banner_dismissed = false;
+                    }
+                    self.update_state = next;
                 }
                 GuiUpdate::Disconnected(reason) => {
                     self.reset_disconnected_state(Some(reason));
@@ -545,6 +576,20 @@ impl CamCraftApp {
     pub(crate) fn is_busy(&self) -> bool {
         !matches!(self.status, ConnectionStatus::Disconnected)
     }
+
+    pub(crate) fn restart_after_update(&mut self, ctx: &egui::Context) {
+        self.session.send(GuiCommand::Disconnect);
+        match std::env::current_exe().and_then(|exe| std::process::Command::new(exe).spawn()) {
+            Ok(_) => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(err) => {
+                self.status_message = Some(format!(
+                    "Updated successfully, but failed to auto-restart ({err}). Please reopen CamCraft manually."
+                ));
+            }
+        }
+    }
 }
 
 impl eframe::App for CamCraftApp {
@@ -579,6 +624,7 @@ impl eframe::App for CamCraftApp {
             )
             .show(ui, |ui| {
                 panels::render_telemetry_bar(self, ui);
+                panels::render_update_banner(self, ui);
             });
 
         let total_w = ui.available_width();

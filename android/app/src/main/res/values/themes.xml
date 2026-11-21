@@ -1,3 +1,6 @@
 <resources>
-    <style name="Theme.CamCraft" parent="android:Theme.Material.NoActionBar" />
+    <style name="Theme.CamCraft" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#0D0F14</item>
+        <item name="android:colorBackground">#0D0F14</item>
+    </style>
 </resources>

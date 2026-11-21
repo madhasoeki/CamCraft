@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=CamCraft
+GenericName=Webcam & Virtual Microphone Studio
+Comment=Turn your Android phone into a low-latency 1080p-4K 60fps Linux webcam and microphone
+Exec=camcraft-gui
+Icon=org.artcraft.camcraft
+Terminal=false
+Categories=AudioVideo;Video;Utility;
+Keywords=webcam;camera;microphone;android;v4l2;pipewire;streaming;
+StartupNotify=true
+StartupWMClass=org.artcraft.camcraft

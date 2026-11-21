@@ -1,0 +1,48 @@
+name: Bug Report
+description: Report a crash, streaming artifact, or connection issue in CamCraft
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and what you expected to happen.
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Desktop GUI (camcraft-gui)
+        - Desktop CLI (camcraft-cli)
+        - Android App
+        - Virtual Camera / PipeWire Mic
+        - In-App Updater
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: CamCraft Version
+      placeholder: e.g. v0.0.1
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Linux distro/kernel/desktop session (Wayland/X11), Android phone model & OS version, connection type (USB ADB or Wi-Fi).
+      placeholder: |
+        - OS: Fedora 44 (Wayland)
+        - Phone: Pixel 8 (Android 15)
+        - Transport: USB ADB / Wi-Fi 5GHz
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Steps to Reproduce & Logs
+      description: Steps to trigger the issue and any relevant `RUST_LOG=debug` or `adb logcat` output.
+      render: shell

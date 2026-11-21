@@ -8,7 +8,7 @@ Dokumen ini adalah sumber instruksi utama bagi agen AI (**Hydrogen / Antigravity
 
 - **Nama Proyek:** CamCraft (bagian dari ekosistem **ArtCraft**).
 - **Tujuan Utama:** Aplikasi open-source pengubah smartphone menjadi webcam dan mikrofon PC beresolusi tinggi (1080p–4K @ 60fps) secara lokal dengan latensi sangat rendah (< 35 ms melalui USB, < 60 ms melalui Wi-Fi).
-- **Target Platform Tahap Awal (MVP v0.1):**
+- **Target Platform Saat Ini:**
   - **Host / Receiver:** Fedora Linux (Wayland/X11, `v4l2loopback` untuk kamera virtual, PipeWire/PulseAudio untuk mikrofon virtual) — ditulis dengan **Native Rust (2024 Edition)**.
   - **Client / Sender:** Android (minSdk 29 / Android 10+, targetSdk 35+) — ditulis dengan **Native Kotlin**, **Jetpack Compose**, **CameraX**, dan **`MediaCodec`**.
 
@@ -34,7 +34,6 @@ Pertahankan struktur direktori berikut secara ketat:
 camcraft/
 ├── AGENTS.md                     # Instruksi agen AI ini
 ├── Justfile                      # Task runner tunggal (cargo, gradle, adb, v4l2loopback)
-├── PROMPTS.md                    # Kumpulan prompt vibecoding per tahap
 ├── docs/
 │   ├── PRD.md                    # Product Requirements Document
 │   ├── DESIGN.md                 # System Architecture & Technical Design
@@ -46,9 +45,9 @@ camcraft/
 │   ├── Cargo.toml
 │   └── crates/
 │       ├── camcraft-protocol/    # Pure Rust crate: CCFT v1 binary framing & Control JSON serde
-│       ├── camcraft-core/        # Tokio TCP/UDP receiver, H.264/Opus decoder, v4l2/PipeWire sink
-│       ├── camcraft-cli/         # Headless daemon / CLI runner untuk testing cepat
-│       └── camcraft-gui/         # Native GUI (iced/egui) untuk preview & remote camera control
+│       ├── camcraft-core/        # Tokio TCP/UDP receiver, H.264/Opus decoder, v4l2/PipeWire sink, & updater
+│       ├── camcraft-cli/         # Headless daemon / CLI runner untuk testing cepat & update
+│       └── camcraft-gui/         # Native GUI (eframe/egui) untuk preview, remote camera control, & update
 └── android/                      # Android Gradle Project (Kotlin Sender)
     ├── settings.gradle.kts
     ├── build.gradle.kts
@@ -57,8 +56,9 @@ camcraft/
         └── src/main/java/org/artcraft/camcraft/
             ├── protocol/         # Kotlin CCFT v1 packet framing & Control JSON serialization
             ├── camera/           # CameraX lifecycle, lens switching, manual ISO/exposure/zoom
-            ├── encoder/          # MediaCodec H.264/HEVC surface encoder & AudioRecord Opus encoder
+            ├── encoder/          # MediaCodec H.264/HEVC surface encoder & AudioRecord PCM engine
             ├── network/          # Coroutine TCP/UDP socket client, Heartbeat, & mDNS discovery
+            ├── update/           # In-app GitHub Release update checker & APK installer
             └── ui/               # Jetpack Compose UI (dumb UI, state di ViewModel)
 ```
 

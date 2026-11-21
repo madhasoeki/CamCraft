@@ -1,0 +1,43 @@
+{
+  "brand": "CamCraft",
+  "tagline": "Local 1080p–4K @ 60 FPS Linux Webcam & Mic",
+  "brief": "Free & open-source local webcam and microphone turning Android smartphones into native Fedora Linux v4l2loopback and PipeWire studio devices without paywalls or cloud relays.",
+  "adjectives": [
+    "precise",
+    "low-latency",
+    "local",
+    "studio-grade",
+    "native"
+  ],
+  "criteria": "Distinct from generic 6-blade aperture clichés, legible at 16 px in Linux trays and browser tabs, consistent across Android Adaptive Icons, Rust egui desktop UI, and GitHub.",
+  "industry": "software",
+  "nav": [
+    "Highlights",
+    "Install",
+    "Releases"
+  ],
+  "brand_color": "#3B82F6",
+  "tile_color": "#0D0F14",
+  "greyscale": false,
+  "final": true,
+  "designer": "ArtCraft Identity Studio (VectorCraft)",
+  "concepts": [
+    {
+      "name": "Miter Frame",
+      "symbol": "../svg/camcraft-symbol-color.svg",
+      "symbol_on_dark": "../svg/camcraft-symbol-color-dark.svg",
+      "symbol_on_tile": "../svg/camcraft-symbol-color-dark.svg",
+      "lockup": "../svg/camcraft-horizontal-color.svg",
+      "lockup_on_dark": "../svg/camcraft-horizontal-color-dark.svg",
+      "stacked": "../svg/camcraft-stacked-color.svg",
+      "stacked_on_dark": "../svg/camcraft-stacked-color-dark.svg",
+      "idea": "Two 45-degree mitered cinema viewfinder brackets lock around a live emerald optical lens core.",
+      "rationale": [
+        "45° machined miter joinery expresses 'Craft' and the low-latency bridge between Android and Fedora Linux.",
+        "Three-tier ArtCraft Studio v2 palette (#0D0F14 / #F8FAFC, #3B82F6 Electric Blue, #10B981 Signal Emerald) retains instant recognition from 16 px tray icons up to 1280 px banners.",
+        "Optically tuned small-size cut and irradiation-thinned reversed white master ensure crisp reproduction on OLED, print, and Light/Dark themes."
+      ]
+    }
+  ],
+  "recommendation": "Miter Frame — ready for full rollout across Android Adaptive Icons, Fedora camcraft-gui, Web/PWA, and GitHub README."
+}

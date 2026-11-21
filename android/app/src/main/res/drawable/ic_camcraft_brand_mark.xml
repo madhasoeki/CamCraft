@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="256dp"
+    android:height="256dp"
+    android:viewportWidth="256"
+    android:viewportHeight="256">
+    <!-- Miter Frame top-left viewfinder bracket -->
+    <path
+        android:fillColor="#F8FAFC"
+        android:pathData="M20 74 C20 54.118 36.118 38 56 38 L200 38 C200.794 38 201.582 38.026 202.364 38.076 L166.44 74 L70 74 C62.268 74 56 80.268 56 88 L56 168 C56 172.488 58.112 176.482 61.396 179.044 L31.793 208.647 C24.548 202.061 20 192.562 20 182 Z" />
+    <!-- Miter Frame bottom-right bridge bracket -->
+    <path
+        android:fillColor="#3B82F6"
+        android:pathData="M194.604 76.956 L224.207 47.353 C231.452 53.939 236 63.438 236 74 L236 182 C236 201.882 219.882 218 200 218 L56 218 C55.206 218 54.418 217.974 53.636 217.924 L89.56 182 L186 182 C193.732 182 200 175.732 200 168 L200 88 C200 83.512 197.888 79.518 194.604 76.956 Z" />
+    <!-- Center live emerald optical lens core -->
+    <path
+        android:fillColor="#10B981"
+        android:pathData="M128,128m-34,0a34,34 0,1 1,68 0a34,34 0,1 1,-68 0" />
+</vector>

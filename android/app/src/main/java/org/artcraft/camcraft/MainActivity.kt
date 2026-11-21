@@ -32,6 +32,7 @@ import org.artcraft.camcraft.ui.OledSaverOverlay
 import org.artcraft.camcraft.ui.rememberDeviceTelemetry
 import org.artcraft.camcraft.ui.theme.ArtCraftColors
 import org.artcraft.camcraft.ui.theme.CamCraftTheme
+import org.artcraft.camcraft.update.AppUpdateManager
 
 class MainActivity : ComponentActivity() {
 
@@ -55,6 +56,7 @@ class MainActivity : ComponentActivity() {
             navigationBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
         )
         CamCraftStreamService.refreshLocalIp(this)
+        AppUpdateManager.checkOnStartup()
 
         if (intent?.getBooleanExtra("autostart", false) == true) {
             startServerWithPermissionCheck()
@@ -62,6 +64,7 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             val serviceState by CamCraftStreamService.serviceState.collectAsStateWithLifecycle()
+            val updateState by AppUpdateManager.state.collectAsStateWithLifecycle()
             val deviceTelemetry = rememberDeviceTelemetry()
             var isDimmed by rememberSaveable { mutableStateOf(false) }
             var isForeground by remember { mutableStateOf(true) }
@@ -101,6 +104,10 @@ class MainActivity : ComponentActivity() {
                         onTapToFocus = { CamCraftStreamService.focusAtPoint(it) },
                         showViewfinder = !isDimmed && isForeground,
                         telemetry = deviceTelemetry,
+                        updateState = updateState,
+                        onUpdateAction = { AppUpdateManager.downloadAndInstall(this@MainActivity) },
+                        onDismissUpdate = { AppUpdateManager.dismiss() },
+                        onCheckUpdates = { AppUpdateManager.checkManually() },
                         modifier = Modifier.safeDrawingPadding(),
                     )
 
@@ -119,6 +126,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         CamCraftStreamService.refreshLocalIp(this)
+        AppUpdateManager.onResumeCheckPendingInstall(this)
     }
 
     override fun onNewIntent(intent: Intent) {

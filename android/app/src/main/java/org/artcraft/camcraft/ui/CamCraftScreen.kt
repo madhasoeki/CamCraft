@@ -6,6 +6,7 @@ import androidx.camera.core.MeteringPoint
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -28,6 +29,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -51,6 +53,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
@@ -65,6 +68,8 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import java.util.Locale
 import kotlinx.coroutines.delay
+import org.artcraft.camcraft.BuildConfig
+import org.artcraft.camcraft.R
 import org.artcraft.camcraft.network.StreamConnectionStatus
 import org.artcraft.camcraft.network.StreamServiceState
 import org.artcraft.camcraft.protocol.CameraInfo
@@ -73,6 +78,7 @@ import org.artcraft.camcraft.ui.components.CamCraftIcons
 import org.artcraft.camcraft.ui.theme.ArtCraftColors
 import org.artcraft.camcraft.ui.theme.CamCraftTheme
 import org.artcraft.camcraft.ui.theme.TabularMonoStyle
+import org.artcraft.camcraft.update.UpdateUiState
 
 /**
  * Stateless ArtCraft Studio v2 main screen.
@@ -94,6 +100,11 @@ fun CamCraftScreen(
     onTapToFocus: (MeteringPoint) -> Unit = {},
     showViewfinder: Boolean = true,
     telemetry: DeviceTelemetry? = null,
+    updateState: UpdateUiState = UpdateUiState.Idle,
+    appVersionName: String = BuildConfig.VERSION_NAME,
+    onUpdateAction: () -> Unit = {},
+    onDismissUpdate: () -> Unit = {},
+    onCheckUpdates: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val isRunning = state.status == StreamConnectionStatus.LISTENING ||
@@ -121,6 +132,15 @@ fun CamCraftScreen(
             height = state.activeState.height,
             fps = state.activeState.fps,
             telemetry = telemetry,
+            updateState = updateState,
+            appVersionName = appVersionName,
+            onCheckUpdates = onCheckUpdates,
+        )
+
+        UpdateBanner(
+            updateState = updateState,
+            onUpdateAction = onUpdateAction,
+            onDismiss = onDismissUpdate,
         )
 
         ViewfinderStage(
@@ -181,6 +201,9 @@ private fun TopStatusHeader(
     height: Int,
     fps: Int,
     telemetry: DeviceTelemetry?,
+    updateState: UpdateUiState,
+    appVersionName: String,
+    onCheckUpdates: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -260,31 +283,77 @@ private fun TopStatusHeader(
                         .padding(end = 8.dp),
                     verticalArrangement = Arrangement.spacedBy(5.dp),
                 ) {
-                    Surface(
-                        color = statusColor.copy(alpha = 0.14f),
-                        shape = RoundedCornerShape(999.dp),
-                        border = BorderStroke(1.dp, statusColor.copy(alpha = 0.35f)),
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        Image(
+                            painter = painterResource(id = R.drawable.ic_camcraft_brand_mark),
+                            contentDescription = "CamCraft",
+                            modifier = Modifier.size(20.dp),
+                        )
+
+                        Surface(
+                            color = statusColor.copy(alpha = 0.14f),
+                            shape = RoundedCornerShape(999.dp),
+                            border = BorderStroke(1.dp, statusColor.copy(alpha = 0.35f)),
                         ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(7.dp)
-                                    .background(statusColor, CircleShape),
-                            )
-                            Icon(
-                                imageVector = statusIcon,
-                                contentDescription = null,
-                                tint = statusColor,
-                                modifier = Modifier.size(13.dp),
-                            )
+                            Row(
+                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(7.dp)
+                                        .background(statusColor, CircleShape),
+                                )
+                                Icon(
+                                    imageVector = statusIcon,
+                                    contentDescription = null,
+                                    tint = statusColor,
+                                    modifier = Modifier.size(13.dp),
+                                )
+                                Text(
+                                    text = statusLabel,
+                                    color = ArtCraftColors.TextPrimary,
+                                    style = MaterialTheme.typography.labelSmall,
+                                )
+                            }
+                        }
+
+                        val versionLabel = when (updateState) {
+                            UpdateUiState.Checking -> "Checking..."
+                            UpdateUiState.UpToDate -> "v$appVersionName ✓"
+                            is UpdateUiState.Available -> "v$appVersionName ↑"
+                            else -> "v$appVersionName"
+                        }
+                        val versionAccent = when (updateState) {
+                            UpdateUiState.UpToDate -> ArtCraftColors.StatusEmerald
+                            is UpdateUiState.Available -> ArtCraftColors.AccentBlue
+                            UpdateUiState.Checking -> ArtCraftColors.StatusAmber
+                            else -> ArtCraftColors.BorderSubtle
+                        }
+                        Surface(
+                            color = ArtCraftColors.SurfaceCardHighlight,
+                            shape = RoundedCornerShape(999.dp),
+                            border = BorderStroke(1.dp, versionAccent),
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(999.dp))
+                                .clickable(
+                                    enabled = updateState !is UpdateUiState.Checking &&
+                                        updateState !is UpdateUiState.Downloading,
+                                    role = Role.Button,
+                                    onClickLabel = "Check for app updates",
+                                    onClick = onCheckUpdates,
+                                ),
+                        ) {
                             Text(
-                                text = statusLabel,
-                                color = ArtCraftColors.TextPrimary,
-                                style = MaterialTheme.typography.labelSmall,
+                                text = versionLabel,
+                                color = ArtCraftColors.TextSecondary,
+                                fontSize = 11.sp,
+                                style = TabularMonoStyle,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
                             )
                         }
                     }
@@ -451,6 +520,150 @@ private fun TopStatusHeader(
                         )
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun UpdateBanner(
+    updateState: UpdateUiState,
+    onUpdateAction: () -> Unit,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val visible = updateState is UpdateUiState.Available ||
+        updateState is UpdateUiState.Downloading ||
+        updateState is UpdateUiState.ReadyToInstall ||
+        updateState is UpdateUiState.NeedsInstallPermission ||
+        updateState is UpdateUiState.Error
+    if (!visible) return
+
+    val accent = when (updateState) {
+        is UpdateUiState.ReadyToInstall -> ArtCraftColors.StatusEmerald
+        is UpdateUiState.NeedsInstallPermission -> ArtCraftColors.StatusAmber
+        is UpdateUiState.Error -> ArtCraftColors.StatusRose
+        else -> ArtCraftColors.AccentBlue
+    }
+
+    Surface(
+        color = ArtCraftColors.SurfaceCard,
+        shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(1.dp, accent.copy(alpha = 0.45f)),
+        modifier = modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Icon(
+                    imageVector = CamCraftIcons.Download,
+                    contentDescription = null,
+                    tint = accent,
+                    modifier = Modifier.size(16.dp),
+                )
+
+                Column(modifier = Modifier.weight(1f)) {
+                    val title = when (updateState) {
+                        is UpdateUiState.Available -> "Update v${updateState.release.version} available"
+                        is UpdateUiState.Downloading -> "Downloading v${updateState.version}..."
+                        is UpdateUiState.ReadyToInstall -> "v${updateState.release.version} ready to install"
+                        is UpdateUiState.NeedsInstallPermission -> "Allow unknown app installs"
+                        is UpdateUiState.Error -> "Update failed"
+                    }
+                    val detail = when (updateState) {
+                        is UpdateUiState.Available -> updateState.release.releaseNotes
+                            .lineSequence()
+                            .map { it.trim() }
+                            .firstOrNull { it.isNotEmpty() && !it.startsWith('#') }
+                            ?: "Tap Update to install directly without leaving CamCraft."
+                        is UpdateUiState.Downloading -> {
+                            val dlMb = updateState.downloadedBytes / (1024f * 1024f)
+                            val totMb = updateState.totalBytes / (1024f * 1024f)
+                            String.format(Locale.US, "%.1f / %.1f MB", dlMb, totMb)
+                        }
+                        is UpdateUiState.ReadyToInstall -> "SHA-256 verified. Tap Install to finish."
+                        is UpdateUiState.NeedsInstallPermission -> "Grant permission in Settings to install APK."
+                        is UpdateUiState.Error -> updateState.message
+                    }
+                    Text(
+                        text = title,
+                        color = ArtCraftColors.TextPrimary,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        text = detail,
+                        color = ArtCraftColors.TextSecondary,
+                        fontSize = 11.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+
+                val actionLabel = when (updateState) {
+                    is UpdateUiState.Available -> "Update"
+                    is UpdateUiState.ReadyToInstall -> "Install"
+                    is UpdateUiState.NeedsInstallPermission -> "Allow"
+                    is UpdateUiState.Error -> if (updateState.retryRelease != null) "Retry" else null
+                    else -> null
+                }
+                if (actionLabel != null) {
+                    Button(
+                        onClick = onUpdateAction,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = accent,
+                            contentColor = ArtCraftColors.TextPrimary,
+                        ),
+                        shape = RoundedCornerShape(8.dp),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                        modifier = Modifier.heightIn(min = 32.dp),
+                    ) {
+                        Text(
+                            text = actionLabel,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
+                }
+
+                if (updateState !is UpdateUiState.Downloading) {
+                    Text(
+                        text = "×",
+                        color = ArtCraftColors.TextMuted,
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier
+                            .clip(CircleShape)
+                            .clickable(
+                                role = Role.Button,
+                                onClickLabel = "Dismiss update banner",
+                                onClick = onDismiss,
+                            )
+                            .padding(horizontal = 6.dp, vertical = 2.dp),
+                    )
+                }
+            }
+
+            if (updateState is UpdateUiState.Downloading) {
+                LinearProgressIndicator(
+                    progress = { updateState.progress.coerceIn(0f, 1f) },
+                    color = ArtCraftColors.AccentBlue,
+                    trackColor = ArtCraftColors.BgStage,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(4.dp)
+                        .clip(RoundedCornerShape(999.dp)),
+                )
             }
         }
     }
@@ -937,17 +1150,16 @@ private fun IdleStageContent(
             }
             StreamConnectionStatus.STOPPED -> {
                 Surface(
-                    color = ArtCraftColors.SurfaceCardHighlight,
-                    shape = CircleShape,
+                    color = ArtCraftColors.BgCarbon,
+                    shape = RoundedCornerShape(16.dp),
                     border = BorderStroke(1.dp, ArtCraftColors.BorderSubtle),
-                    modifier = Modifier.size(56.dp),
+                    modifier = Modifier.size(64.dp),
                 ) {
                     Box(contentAlignment = Alignment.Center) {
-                        Icon(
-                            imageVector = CamCraftIcons.Usb,
-                            contentDescription = null,
-                            tint = ArtCraftColors.TextSecondary,
-                            modifier = Modifier.size(26.dp),
+                        Image(
+                            painter = painterResource(id = R.drawable.ic_camcraft_brand_mark),
+                            contentDescription = "CamCraft logo",
+                            modifier = Modifier.size(42.dp),
                         )
                     }
                 }

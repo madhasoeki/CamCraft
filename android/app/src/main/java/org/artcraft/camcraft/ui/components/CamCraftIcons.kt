@@ -405,4 +405,22 @@ object CamCraftIcons {
             }
         }
     }
+
+    val Download: ImageVector by lazy {
+        strokeIcon("Download") {
+            strokePath {
+                moveTo(12f, 3f)
+                lineTo(12f, 15f)
+                moveTo(7.5f, 10.5f)
+                lineTo(12f, 15f)
+                lineTo(16.5f, 10.5f)
+                moveTo(4f, 16.5f)
+                lineTo(4f, 19.5f)
+                quadTo(4f, 20.5f, 5f, 20.5f)
+                lineTo(19f, 20.5f)
+                quadTo(20f, 20.5f, 20f, 19.5f)
+                lineTo(20f, 16.5f)
+            }
+        }
+    }
 }
