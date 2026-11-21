@@ -27,11 +27,8 @@ jobs:
             clang \
             libclang-dev \
             libavcodec-dev \
-            libavdevice-dev \
-            libavfilter-dev \
             libavformat-dev \
             libavutil-dev \
-            libswresample-dev \
             libswscale-dev \
             libasound2-dev \
             libpulse-dev \
