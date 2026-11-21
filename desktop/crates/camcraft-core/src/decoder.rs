@@ -721,10 +721,10 @@ impl H264Decoder {
         }
 
         // Configure bounded slice threading for parallel slice decoding without introducing frame latency
-        context.set_threading(ffmpeg_next::codec::threading::Config {
-            kind: ffmpeg_next::codec::threading::Type::Slice,
-            count: opts.thread_count.clamp(1, 4),
-        });
+        let mut threading =
+            ffmpeg_next::codec::threading::Config::kind(ffmpeg_next::codec::threading::Type::Slice);
+        threading.count = opts.thread_count.clamp(1, 4);
+        context.set_threading(threading);
 
         let decoder = context.decoder().video().map_err(DecoderError::Ffmpeg)?;
 
