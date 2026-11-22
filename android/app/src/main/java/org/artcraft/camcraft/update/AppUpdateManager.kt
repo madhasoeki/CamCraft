@@ -3,7 +3,9 @@ package org.artcraft.camcraft.update
 import android.content.Context
 import android.os.SystemClock
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -162,9 +164,12 @@ internal class UpdateCheckCoordinator(
     private var checkJob: Job? = null
     private var escalatedToManual = false
 
+    internal val isCheckInFlight: Boolean
+        get() = synchronized(lock) { checkJob != null }
+
     fun check(silent: Boolean) {
         synchronized(lock) {
-            if (checkJob?.isActive == true) {
+            if (checkJob != null) {
                 if (!silent) {
                     escalatedToManual = true
                     val cur = stateFlow.value
@@ -183,34 +188,60 @@ internal class UpdateCheckCoordinator(
                 stateFlow.value = UpdateUiState.Checking
             }
 
-            checkJob = scope.launch {
-                val outcome = runCatching { performCheck() }
-                val treatAsManual = synchronized(lock) {
-                    val manual = escalatedToManual
-                    escalatedToManual = false
-                    manual
+            lateinit var launchedJob: Job
+            launchedJob = scope.launch(start = CoroutineStart.LAZY) {
+                val outcome = try {
+                    Result.success(performCheck())
+                } catch (ce: CancellationException) {
+                    synchronized(lock) {
+                        if (checkJob === launchedJob) {
+                            escalatedToManual = false
+                            checkJob = null
+                        }
+                    }
+                    throw ce
+                } catch (t: Throwable) {
+                    Result.failure(t)
                 }
-                outcome
-                    .onSuccess { result ->
-                        when (result) {
-                            is UpdateCheckResult.UpdateAvailable -> {
-                                stateFlow.value = UpdateUiState.Available(result.release)
-                            }
-                            is UpdateCheckResult.UpToDate -> {
-                                if (treatAsManual) {
-                                    stateFlow.value = UpdateUiState.UpToDate
+
+                synchronized(lock) {
+                    val treatAsManual = escalatedToManual
+                    escalatedToManual = false
+                    checkJob = null
+                    outcome
+                        .onSuccess { result ->
+                            when (result) {
+                                is UpdateCheckResult.UpdateAvailable -> {
+                                    stateFlow.value = UpdateUiState.Available(result.release)
+                                }
+                                is UpdateCheckResult.UpToDate -> {
+                                    if (treatAsManual) {
+                                        stateFlow.value = UpdateUiState.UpToDate
+                                    }
                                 }
                             }
                         }
-                    }
-                    .onFailure { err ->
-                        if (treatAsManual) {
-                            stateFlow.value = UpdateUiState.Error(
-                                message = err.message ?: "Unable to check for updates",
-                            )
+                        .onFailure { err ->
+                            if (treatAsManual) {
+                                stateFlow.value = UpdateUiState.Error(
+                                    message = err.message ?: "Unable to check for updates",
+                                )
+                            }
+                        }
+                }
+            }
+            checkJob = launchedJob
+            launchedJob.invokeOnCompletion { cause ->
+                if (cause != null) {
+                    synchronized(lock) {
+                        if (checkJob === launchedJob) {
+                            escalatedToManual = false
+                            checkJob = null
                         }
                     }
+                }
             }
+            launchedJob.start()
         }
     }
 }

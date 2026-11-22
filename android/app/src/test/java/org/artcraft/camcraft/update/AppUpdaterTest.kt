@@ -1,10 +1,22 @@
 package org.artcraft.camcraft.update
 
+import java.util.concurrent.CyclicBarrier
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -194,5 +206,124 @@ class AppUpdaterTest {
         val errResolved = errState.first { it !is UpdateUiState.Checking }
         assertTrue(errResolved is UpdateUiState.Error)
         assertEquals("network offline", (errResolved as UpdateUiState.Error).message)
+    }
+
+    @Test
+    fun updateCheckCoordinatorBackToBackManualChecksAroundCompletionNeverStuckOnChecking() = runBlocking {
+        val testScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            repeat(200) {
+                val state = MutableStateFlow<UpdateUiState>(UpdateUiState.Idle)
+                val firstEntered = CompletableDeferred<Unit>()
+                val gate = CompletableDeferred<UpdateCheckResult>()
+                val calls = AtomicInteger(0)
+
+                val coordinator = UpdateCheckCoordinator(
+                    stateFlow = state,
+                    scope = testScope,
+                    performCheck = {
+                        if (calls.incrementAndGet() == 1) {
+                            firstEntered.complete(Unit)
+                            gate.await()
+                        } else {
+                            UpdateCheckResult.UpToDate("0.0.3", "0.0.3")
+                        }
+                    },
+                )
+
+                coordinator.check(silent = true)
+                withTimeout(2_000) { firstEntered.await() }
+
+                val barrier = CyclicBarrier(3)
+                val manualA = Thread {
+                    barrier.await(2, TimeUnit.SECONDS)
+                    coordinator.check(silent = false)
+                }
+                val manualB = Thread {
+                    barrier.await(2, TimeUnit.SECONDS)
+                    coordinator.check(silent = false)
+                }
+                manualA.start()
+                manualB.start()
+                barrier.await(2, TimeUnit.SECONDS)
+                gate.complete(UpdateCheckResult.UpToDate("0.0.3", "0.0.3"))
+
+                manualA.join(2_000)
+                manualB.join(2_000)
+                assertFalse(manualA.isAlive)
+                assertFalse(manualB.isAlive)
+
+                withTimeout(2_000) {
+                    while (coordinator.isCheckInFlight) {
+                        delay(1)
+                    }
+                }
+                assertEquals(UpdateUiState.UpToDate, state.value)
+            }
+        } finally {
+            testScope.cancel()
+        }
+    }
+
+    @Test
+    fun updateCheckCoordinatorCancellationResetsCheckJobAndEscalationCleanly() = runBlocking {
+        val state = MutableStateFlow<UpdateUiState>(UpdateUiState.Idle)
+        val calls = AtomicInteger(0)
+        val firstStarted = CompletableDeferred<Unit>()
+        val cancelTrigger = CompletableDeferred<Unit>()
+        val secondCompleted = CompletableDeferred<Unit>()
+
+        val coordinator = UpdateCheckCoordinator(
+            stateFlow = state,
+            scope = this,
+            performCheck = {
+                when (calls.incrementAndGet()) {
+                    1 -> {
+                        firstStarted.complete(Unit)
+                        cancelTrigger.await()
+                        currentCoroutineContext().cancel()
+                        awaitCancellation()
+                    }
+                    2 -> {
+                        UpdateCheckResult.UpToDate("0.0.3", "0.0.3").also {
+                            secondCompleted.complete(Unit)
+                        }
+                    }
+                    else -> UpdateCheckResult.UpToDate("0.0.3", "0.0.3")
+                }
+            },
+        )
+
+        // Start a manual check (escalatedToManual = true, checkJob != null) and cancel it mid-flight.
+        coordinator.check(silent = false)
+        withTimeout(2_000) { firstStarted.await() }
+        assertEquals(UpdateUiState.Checking, state.value)
+        assertTrue(coordinator.isCheckInFlight)
+
+        cancelTrigger.complete(Unit)
+        withTimeout(2_000) {
+            while (coordinator.isCheckInFlight) {
+                delay(5)
+            }
+        }
+        assertFalse(coordinator.isCheckInFlight)
+
+        // Subsequent silent check must start (checkJob cleared) and stay silent (escalatedToManual cleared).
+        state.value = UpdateUiState.Idle
+        coordinator.check(silent = true)
+        withTimeout(2_000) {
+            secondCompleted.await()
+            while (coordinator.isCheckInFlight) {
+                delay(5)
+            }
+        }
+        assertEquals(2, calls.get())
+        assertEquals(UpdateUiState.Idle, state.value)
+
+        // Subsequent manual check must surface UpToDate normally.
+        coordinator.check(silent = false)
+        val resolved = withTimeout(2_000) { state.first { it is UpdateUiState.UpToDate } }
+        assertEquals(3, calls.get())
+        assertEquals(UpdateUiState.UpToDate, resolved)
     }
 }
