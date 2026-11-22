@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Desktop Media Pipeline (`PipeWireCameraSink` & `DecoderSender`):**
+  - Fixed `PwPropertiesNewFn` FFI signature to use C variadic ABI (`...`), guarded PipeWire stream resolution changes with a renegotiation flag cleared on `add_buffer` so downscales cannot emit mismatched frames into stale buffers (`BUG-11`).
+  - Synchronized `DecoderSender` queue mutations and smart-drop evictions behind `op_lock` so concurrent cloned senders cannot drop `EnterStandby` or `Stop` commands (`BUG-12`).
+
 ## [0.0.3] - 2026-11-21
 
 ### Fixed

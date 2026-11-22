@@ -7,8 +7,8 @@
 //! - Runs in a dedicated worker thread (`camcraft-vdec`) with a bounded queue (`crossbeam_channel::bounded(3)`).
 //! - Drops stale non-keyframes on backpressure to prevent latency accumulation.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -1240,6 +1240,7 @@ pub struct DecoderSender {
     cmd_rx_drain: Receiver<DecoderCommand>,
     next_seq: Arc<AtomicU64>,
     capacity: usize,
+    op_lock: Arc<Mutex<()>>,
 }
 
 impl DecoderSender {
@@ -1259,6 +1260,7 @@ impl DecoderSender {
             cmd_rx_drain: rx.clone(),
             next_seq: Arc::new(AtomicU64::new(0)),
             capacity: cap,
+            op_lock: Arc::new(Mutex::new(())),
         };
         (sender, rx)
     }
@@ -1266,6 +1268,8 @@ impl DecoderSender {
     /// Drains queued commands up to capacity, drops the oldest `Frame` (or an older duplicate
     /// `Config` if no `Frame` is present) while preserving relative order of `Config`/`Flush`/`Stop`,
     /// and re-inserts the remaining commands.
+    ///
+    /// Caller must hold `self.op_lock`.
     fn drop_one_stale_frame(&self) -> bool {
         let mut drained: Vec<Option<DecoderCommand>> = Vec::with_capacity(self.capacity);
         while drained.len() < self.capacity {
@@ -1308,8 +1312,10 @@ impl DecoderSender {
         freed
     }
 
-    /// Fallback used by `push_config` / `stop` when no frames are queued: drops the oldest
-    /// queued `Config` while preserving relative order of remaining commands.
+    /// Fallback used by `push_config` / `enter_standby` / `stop` when no frames are queued:
+    /// drops the oldest queued `Config` while preserving relative order of remaining commands.
+    ///
+    /// Caller must hold `self.op_lock`.
     fn drop_oldest_config(&self) -> bool {
         let mut drained: Vec<Option<DecoderCommand>> = Vec::with_capacity(self.capacity);
         while drained.len() < self.capacity {
@@ -1337,8 +1343,39 @@ impl DecoderSender {
         freed
     }
 
+    /// Fallback used by `enter_standby` / `stop` when queue is full of `EnterStandby` commands.
+    ///
+    /// Caller must hold `self.op_lock`.
+    fn drop_oldest_standby(&self) -> bool {
+        let mut drained: Vec<Option<DecoderCommand>> = Vec::with_capacity(self.capacity);
+        while drained.len() < self.capacity {
+            match self.cmd_rx_drain.try_recv() {
+                Ok(cmd) => drained.push(Some(cmd)),
+                Err(_) => break,
+            }
+        }
+
+        let mut freed = false;
+        for slot in &mut drained {
+            if matches!(slot, Some(DecoderCommand::EnterStandby)) {
+                *slot = None;
+                freed = true;
+                break;
+            }
+        }
+
+        for slot in &mut drained {
+            if let Some(cmd) = slot.take() {
+                let _ = self.cmd_tx.try_send(cmd);
+            }
+        }
+
+        freed
+    }
+
     /// Pushes a `VIDEO_CONFIG` packet into the queue without blocking the async network loop.
     pub fn push_config(&self, pts_us: u64, data: Bytes) -> Result<(), DecoderError> {
+        let _guard = self.op_lock.lock().unwrap_or_else(|p| p.into_inner());
         let cmd = DecoderCommand::Config { pts_us, data };
         match self.cmd_tx.try_send(cmd) {
             Ok(()) => Ok(()),
@@ -1386,6 +1423,7 @@ impl DecoderSender {
         flags: FrameFlags,
         data: Bytes,
     ) -> Result<bool, DecoderError> {
+        let _guard = self.op_lock.lock().unwrap_or_else(|p| p.into_inner());
         let is_keyframe = flags.is_keyframe();
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let cmd = DecoderCommand::Frame {
@@ -1424,9 +1462,10 @@ impl DecoderSender {
 
     /// Switches the decoder worker into standby mode without closing the virtual camera sink.
     pub fn enter_standby(&self) {
+        let _guard = self.op_lock.lock().unwrap_or_else(|p| p.into_inner());
         if let Err(TrySendError::Full(cmd)) = self.cmd_tx.try_send(DecoderCommand::EnterStandby) {
-            if !self.drop_one_stale_frame() {
-                let _ = self.drop_oldest_config();
+            if !self.drop_one_stale_frame() && !self.drop_oldest_config() {
+                let _ = self.drop_oldest_standby();
             }
             let _ = self.cmd_tx.try_send(cmd);
         }
@@ -1434,9 +1473,10 @@ impl DecoderSender {
 
     /// Requests the decoder worker to flush and terminate without blocking.
     pub fn stop(&self) {
+        let _guard = self.op_lock.lock().unwrap_or_else(|p| p.into_inner());
         if let Err(TrySendError::Full(cmd)) = self.cmd_tx.try_send(DecoderCommand::Stop) {
-            if !self.drop_one_stale_frame() {
-                let _ = self.drop_oldest_config();
+            if !self.drop_one_stale_frame() && !self.drop_oldest_config() {
+                let _ = self.drop_oldest_standby();
             }
             let _ = self.cmd_tx.try_send(cmd);
         }
@@ -2473,5 +2513,87 @@ mod tests {
             .chain(201..=204)
             .collect();
         assert_eq!(dst, expected_mh_r180);
+    }
+
+    #[test]
+    fn decoder_sender_concurrent_clones_never_drop_standby_or_stop() {
+        for round in 0..20 {
+            let (tx, rx) = DecoderSender::new_with_capacity(3);
+            let barrier = Arc::new(std::sync::Barrier::new(4));
+
+            let mut handles = Vec::new();
+            for worker_idx in 0..3u64 {
+                let tx_c = tx.clone();
+                let b_c = barrier.clone();
+                handles.push(std::thread::spawn(move || {
+                    b_c.wait();
+                    for i in 0..200u64 {
+                        if i % 15 == 0 {
+                            let _ =
+                                tx_c.push_config(i, Bytes::from_static(b"\x00\x00\x00\x01\x67"));
+                        } else {
+                            let is_idr = (i + worker_idx).is_multiple_of(3);
+                            let _ = tx_c.push_frame(
+                                i,
+                                is_idr,
+                                Bytes::from_static(b"\x00\x00\x00\x01\x65"),
+                            );
+                        }
+                    }
+                }));
+            }
+
+            barrier.wait();
+            std::thread::yield_now();
+            tx.enter_standby();
+            for h in handles {
+                h.join().expect("producer thread panicked");
+            }
+            tx.stop();
+
+            let mut drained = Vec::new();
+            while let Ok(cmd) = rx.try_recv() {
+                drained.push(cmd);
+            }
+            assert!(
+                drained.len() <= 3,
+                "round {round}: capacity invariant violated: len={}",
+                drained.len()
+            );
+            assert!(
+                drained.iter().any(|c| matches!(c, DecoderCommand::Stop)),
+                "round {round}: DecoderCommand::Stop was lost"
+            );
+
+            // Also verify EnterStandby survives while concurrent clones saturate the queue,
+            // and Stop can still land even when queue is full of EnterStandby/Config.
+            let (tx2, rx2) = DecoderSender::new_with_capacity(2);
+            let done = Arc::new(AtomicBool::new(false));
+            let done_c = done.clone();
+            let tx2_c = tx2.clone();
+            let spammer = std::thread::spawn(move || {
+                let mut i = 0u64;
+                while !done_c.load(Ordering::Relaxed) {
+                    let _ = tx2_c.push_frame(i, true, Bytes::from_static(b"\x00\x00\x00\x01\x65"));
+                    let _ = tx2_c.push_config(i, Bytes::from_static(b"\x00\x00\x00\x01\x67"));
+                    i += 1;
+                }
+            });
+            std::thread::sleep(Duration::from_millis(2));
+            done.store(true, Ordering::Relaxed);
+            spammer.join().expect("spammer panicked");
+
+            tx2.enter_standby();
+            let mut cmds2 = Vec::new();
+            while let Ok(c) = rx2.try_recv() {
+                cmds2.push(c);
+            }
+            assert!(
+                cmds2
+                    .iter()
+                    .any(|c| matches!(c, DecoderCommand::EnterStandby)),
+                "round {round}: EnterStandby was lost"
+            );
+        }
     }
 }
