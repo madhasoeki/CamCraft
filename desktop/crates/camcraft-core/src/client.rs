@@ -421,6 +421,12 @@ async fn sleep_until_retry_or_shutdown(duration: Duration, shutdown: &AtomicBool
     false
 }
 
+async fn wait_for_shutdown(shutdown: &AtomicBool) {
+    while !shutdown.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 async fn run_client_loop_inner(
     config: &ClientConfig,
     event_tx: mpsc::Sender<ClientEvent>,
@@ -433,12 +439,14 @@ async fn run_client_loop_inner(
         interface = ?config.interface,
         "Connecting to CamCraft Android sender"
     );
-    let stream = connect_tcp(
-        &config.endpoint,
-        config.interface.as_deref(),
-        CONNECT_TIMEOUT,
-    )
-    .await?;
+    let stream = tokio::select! {
+        res = connect_tcp(
+            &config.endpoint,
+            config.interface.as_deref(),
+            CONNECT_TIMEOUT,
+        ) => res?,
+        () = wait_for_shutdown(&shutdown) => return Ok(()),
+    };
     stream.set_nodelay(true)?;
     info!(endpoint = %config.endpoint, "TCP connection established (TCP_NODELAY enabled)");
 
@@ -463,13 +471,17 @@ async fn run_aoa_client_loop_inner(
     emit_disconnected: bool,
 ) -> Result<(), ClientError> {
     info!("Connecting to CamCraft Android sender over USB AOA");
-    let conn = tokio::task::spawn_blocking(crate::usb_aoa::connect_aoa_device)
-        .await
-        .map_err(|e| ClientError::Channel(format!("USB AOA connect task failed: {e}")))??;
+    let connect_shutdown = shutdown.clone();
+    let conn_res = tokio::task::spawn_blocking(move || {
+        crate::usb_aoa::connect_aoa_device_with_shutdown(&connect_shutdown)
+    })
+    .await
+    .map_err(|e| ClientError::Channel(format!("USB AOA connect task failed: {e}")))?;
 
     if shutdown.load(Ordering::Relaxed) {
         return Ok(());
     }
+    let conn = conn_res?;
 
     let dev_info = conn.device_info();
     info!(
@@ -481,9 +493,9 @@ async fn run_aoa_client_loop_inner(
         "USB AOA device connected"
     );
 
-    let stream = conn.into_tokio_stream(shutdown.clone())?;
+    let (stream, aoa_handle) = conn.into_tokio_stream_with_handle(shutdown.clone())?;
     let (reader, writer) = stream.into_split();
-    run_client_stream_loop(
+    let loop_res = run_client_stream_loop(
         reader,
         writer,
         config,
@@ -492,7 +504,10 @@ async fn run_aoa_client_loop_inner(
         hello_seen,
         emit_disconnected,
     )
-    .await
+    .await;
+
+    let _ = tokio::task::spawn_blocking(move || aoa_handle.stop_and_join()).await;
+    loop_res
 }
 
 /// Runs the bidirectional CCFT v1 read/write/heartbeat/stats session over an arbitrary
@@ -651,9 +666,10 @@ where
                         debug!(rtt_ms = %format!("{:.2}", last_rtt_ms), "Received HEARTBEAT_PONG (0xFF)");
                     }
                     PacketType::HeartbeatPing => {
-                        // In case remote also sends pings, respond with pong
+                        // In case remote also sends pings, respond with pong without blocking
+                        // the receiver loop if outbound writes are stalled.
                         let pong = Packet::heartbeat_pong(packet.header.pts_us);
-                        let _ = cmd_tx.send(pong).await;
+                        let _ = cmd_tx.try_send(pong);
                     }
                     PacketType::VideoFrame => {
                         let payload_len = packet.payload.len();
@@ -1196,5 +1212,142 @@ mod tests {
             }
         }
         assert!(saw_disconnected);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_ping_does_not_block_receiver_when_writer_stalled_and_cmd_tx_full() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        struct StalledWriter;
+        impl AsyncWrite for StalledWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<Result<usize, std::io::Error>> {
+                Poll::Pending
+            }
+
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Result<(), std::io::Error>> {
+                Poll::Pending
+            }
+
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Result<(), std::io::Error>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let (client_reader, mut peer_writer) = tokio::io::duplex(4096);
+        let config = ClientConfig {
+            endpoint: "127.0.0.1:9876".to_owned(),
+            interface: None,
+            ping_interval: Duration::from_secs(60),
+            read_timeout: Duration::from_millis(120),
+            read_buffer_capacity: 4096,
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let loop_shutdown = shutdown.clone();
+
+        let client_task = tokio::spawn(async move {
+            run_client_stream_loop(
+                client_reader,
+                StalledWriter,
+                &config,
+                event_tx,
+                loop_shutdown,
+                None,
+                true,
+            )
+            .await
+        });
+
+        let sender = match tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("connected event timeout")
+            .expect("connected event channel closed")
+        {
+            ClientEvent::Connected(s) => s,
+            other => panic!("expected ClientEvent::Connected, got {other:?}"),
+        };
+
+        // 1 item is pulled by writer_task (stalled inside StalledWriter::poll_write),
+        // then 32 more fill the bounded cmd_tx channel completely.
+        for _ in 0..33 {
+            tokio::time::timeout(Duration::from_millis(200), sender.send_ping())
+                .await
+                .expect("send_ping fill timeout")
+                .expect("send_ping error");
+        }
+
+        // Send HeartbeatPing from peer while outbound channel is completely full.
+        let mut ping_bytes = BytesMut::new();
+        Packet::heartbeat_ping(12345).encode(&mut ping_bytes);
+        peer_writer
+            .write_all(&ping_bytes)
+            .await
+            .expect("write ping");
+        peer_writer.flush().await.expect("flush ping");
+
+        // Receiver loop must stay responsive and honor shutdown without deadlocking on cmd_tx.
+        shutdown.store(true, Ordering::Relaxed);
+        let res = tokio::time::timeout(Duration::from_secs(1), client_task)
+            .await
+            .expect("client_task must not hang when writer stalled and cmd_tx full")
+            .expect("client_task join error");
+        assert!(res.is_ok(), "expected clean shutdown exit, got {res:?}");
+
+        // Verify read_timeout also fires promptly if shutdown is false.
+        let (client_reader_2, mut peer_writer_2) = tokio::io::duplex(4096);
+        let config_2 = ClientConfig {
+            endpoint: "127.0.0.1:9876".to_owned(),
+            interface: None,
+            ping_interval: Duration::from_secs(60),
+            read_timeout: Duration::from_millis(80),
+            read_buffer_capacity: 4096,
+        };
+        let (event_tx_2, mut event_rx_2) = mpsc::channel(32);
+        let shutdown_2 = Arc::new(AtomicBool::new(false));
+        let client_task_2 = tokio::spawn(async move {
+            run_client_stream_loop(
+                client_reader_2,
+                StalledWriter,
+                &config_2,
+                event_tx_2,
+                shutdown_2,
+                None,
+                true,
+            )
+            .await
+        });
+        let sender_2 = match tokio::time::timeout(Duration::from_secs(1), event_rx_2.recv())
+            .await
+            .expect("connected event timeout")
+            .expect("connected event closed")
+        {
+            ClientEvent::Connected(s) => s,
+            other => panic!("expected Connected, got {other:?}"),
+        };
+        for _ in 0..33 {
+            sender_2.send_ping().await.expect("fill cmd_tx 2");
+        }
+        peer_writer_2
+            .write_all(&ping_bytes)
+            .await
+            .expect("write ping 2");
+        peer_writer_2.flush().await.expect("flush ping 2");
+
+        let res_2 = tokio::time::timeout(Duration::from_secs(1), client_task_2)
+            .await
+            .expect("read_timeout must not hang when cmd_tx full")
+            .expect("client_task_2 join");
+        assert!(matches!(res_2, Err(ClientError::HeartbeatTimeout(_))));
     }
 }
