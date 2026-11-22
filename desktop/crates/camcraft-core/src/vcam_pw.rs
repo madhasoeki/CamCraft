@@ -55,8 +55,8 @@ pub const SPA_TYPE_OBJECT: u32 = 15;
 pub const SPA_TYPE_CHOICE: u32 = 19;
 
 /// SPA object type IDs (`<spa/utils/type.h>`).
-pub const SPA_TYPE_OBJECT_FORMAT: u32 = 0x40002;
-pub const SPA_TYPE_OBJECT_PARAM_BUFFERS: u32 = 0x40003;
+pub const SPA_TYPE_OBJECT_FORMAT: u32 = 0x40003;
+pub const SPA_TYPE_OBJECT_PARAM_BUFFERS: u32 = 0x40004;
 
 /// SPA parameter IDs (`<spa/param/param.h>`).
 pub const SPA_PARAM_ENUM_FORMAT: u32 = 3;
@@ -74,8 +74,23 @@ pub const SPA_FORMAT_VIDEO_FRAMERATE: u32 = 0x20004;
 
 /// Planar YUV 4:2:0 (`YU12` / `I420`) SPA video format (`SPA_VIDEO_FORMAT_I420`).
 pub const SPA_VIDEO_FORMAT_I420: u32 = 2;
+/// Packed YUV 4:2:2 (`YUYV` / `YUY2`) SPA video format (`SPA_VIDEO_FORMAT_YUY2`).
+pub const SPA_VIDEO_FORMAT_YUY2: u32 = 4;
+/// Packed 32-bit RGBA SPA video format (`SPA_VIDEO_FORMAT_RGBA`).
+pub const SPA_VIDEO_FORMAT_RGBA: u32 = 11;
+/// Ordered list of pixel formats advertised on `SPA_PARAM_EnumFormat`
+/// (`YUY2` for OBS camera-portal & WebRTC, `RGBA` for OBS sync/`obs-pwvideo`, `I420` for WebRTC/GStreamer).
+pub const SUPPORTED_VIDEO_FORMATS: [u32; 3] = [
+    SPA_VIDEO_FORMAT_YUY2,
+    SPA_VIDEO_FORMAT_RGBA,
+    SPA_VIDEO_FORMAT_I420,
+];
 /// SPA choice range (`SPA_CHOICE_Range`).
 pub const SPA_CHOICE_RANGE: u32 = 1;
+/// SPA choice enum (`SPA_CHOICE_Enum`).
+pub const SPA_CHOICE_ENUM: u32 = 3;
+/// SPA chunk empty flag (`SPA_CHUNK_FLAG_EMPTY`).
+pub const SPA_CHUNK_FLAG_EMPTY: i32 = 1 << 1;
 
 /// SPA buffer parameter property keys (`<spa/param/buffers.h>`).
 pub const SPA_PARAM_BUFFERS_BUFFERS: u32 = 1;
@@ -591,23 +606,24 @@ impl SpaPodBuilder {
         self.pad_to_8();
     }
 
-    fn add_prop_choice_fraction_range(
+    fn add_prop_choice_fraction_enum(
         &mut self,
         key: u32,
         default: (u32, u32),
-        min: (u32, u32),
-        max: (u32, u32),
+        options: &[(u32, u32)],
     ) {
         self.push_u32(key);
         self.push_u32(0);
         let choice_pos = self.byte_len();
         self.push_u32(0);
         self.push_u32(SPA_TYPE_CHOICE);
-        self.push_u32(SPA_CHOICE_RANGE);
+        self.push_u32(SPA_CHOICE_ENUM);
         self.push_u32(0);
         self.push_u32(8);
         self.push_u32(SPA_TYPE_FRACTION);
-        for (num, denom) in [default, min, max] {
+        self.push_u32(default.0);
+        self.push_u32(default.1);
+        for &(num, denom) in options {
             self.push_u32(num);
             self.push_u32(denom);
         }
@@ -636,9 +652,10 @@ impl SpaPodBuilder {
 }
 
 /// Populates `builder` with an `SPA_TYPE_OBJECT_Format` / `SPA_PARAM_EnumFormat` pod for
-/// `I420` raw video at `width x height` and framerate range `[0/1, 60/1]` defaulting to `fps/1`.
-pub fn build_video_enum_format_pod_into(
+/// `format` raw video at `width x height` and enumerated framerates (`60/1`, `30/1`) defaulting to `fps/1`.
+pub fn build_video_enum_format_pod_for_format_into(
     builder: &mut SpaPodBuilder,
+    format: u32,
     width: u32,
     height: u32,
     fps: u32,
@@ -647,31 +664,83 @@ pub fn build_video_enum_format_pod_into(
     let obj = builder.start_object(SPA_TYPE_OBJECT_FORMAT, SPA_PARAM_ENUM_FORMAT);
     builder.add_prop_id(SPA_FORMAT_MEDIA_TYPE, SPA_MEDIA_TYPE_VIDEO);
     builder.add_prop_id(SPA_FORMAT_MEDIA_SUBTYPE, SPA_MEDIA_SUBTYPE_RAW);
-    builder.add_prop_id(SPA_FORMAT_VIDEO_FORMAT, SPA_VIDEO_FORMAT_I420);
+    builder.add_prop_id(SPA_FORMAT_VIDEO_FORMAT, format);
     builder.add_prop_rectangle(SPA_FORMAT_VIDEO_SIZE, width, height);
-    builder.add_prop_choice_fraction_range(
+    builder.add_prop_choice_fraction_enum(
         SPA_FORMAT_VIDEO_FRAMERATE,
         (fps, 1),
-        (0, 1),
-        (MAX_FPS, 1),
+        &[(MAX_FPS, 1), (DEFAULT_FPS, 1)],
     );
     builder.finish_object(obj);
 }
 
-/// Builds a standalone `SPA_TYPE_OBJECT_Format` / `SPA_PARAM_EnumFormat` pod.
+/// Builds a standalone `SPA_TYPE_OBJECT_Format` / `SPA_PARAM_EnumFormat` pod for `format`.
 #[must_use]
-pub fn build_video_enum_format_pod(width: u32, height: u32, fps: u32) -> SpaPodBuilder {
+pub fn build_video_enum_format_pod_for_format(
+    format: u32,
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> SpaPodBuilder {
     let mut builder = SpaPodBuilder::with_capacity_words(24);
-    build_video_enum_format_pod_into(&mut builder, width, height, fps);
+    build_video_enum_format_pod_for_format_into(&mut builder, format, width, height, fps);
     builder
 }
 
+/// Populates `builder` with an `SPA_TYPE_OBJECT_Format` / `SPA_PARAM_EnumFormat` pod for
+/// default `YUY2` raw video at `width x height`.
+pub fn build_video_enum_format_pod_into(
+    builder: &mut SpaPodBuilder,
+    width: u32,
+    height: u32,
+    fps: u32,
+) {
+    build_video_enum_format_pod_for_format_into(builder, SPA_VIDEO_FORMAT_YUY2, width, height, fps);
+}
+
+/// Builds a standalone `SPA_TYPE_OBJECT_Format` / `SPA_PARAM_EnumFormat` pod for default `YUY2`.
+#[must_use]
+pub fn build_video_enum_format_pod(width: u32, height: u32, fps: u32) -> SpaPodBuilder {
+    build_video_enum_format_pod_for_format(SPA_VIDEO_FORMAT_YUY2, width, height, fps)
+}
+
+/// Returns `(stride_bytes, total_frame_bytes)` for a supported PipeWire video pixel format.
+#[must_use]
+pub fn video_format_stride_and_size(format: u32, width: u32, height: u32) -> Option<(u32, usize)> {
+    match format {
+        SPA_VIDEO_FORMAT_YUY2 => {
+            let stride = width.checked_mul(2)?;
+            let size = (stride as usize).checked_mul(height as usize)?;
+            Some((stride, size))
+        }
+        SPA_VIDEO_FORMAT_RGBA => {
+            let stride = width.checked_mul(4)?;
+            let size = (stride as usize).checked_mul(height as usize)?;
+            Some((stride, size))
+        }
+        SPA_VIDEO_FORMAT_I420 => {
+            let pixels = (width as usize).checked_mul(height as usize)?;
+            let size = pixels.checked_mul(3)? / 2;
+            Some((width, size))
+        }
+        _ => None,
+    }
+}
+
 /// Populates `builder` with an `SPA_TYPE_OBJECT_ParamBuffers` / `SPA_PARAM_Buffers` pod
-/// sized for contiguous `I420` (`width * height * 3 / 2`) frames.
-pub fn build_video_buffers_pod_into(builder: &mut SpaPodBuilder, width: u32, height: u32) {
+/// sized for the specified `format` (`YUY2`, `RGBA`, or `I420`).
+pub fn build_video_buffers_pod_for_format_into(
+    builder: &mut SpaPodBuilder,
+    format: u32,
+    width: u32,
+    height: u32,
+) {
     builder.clear();
-    let frame_size = i32::try_from((width as u64) * (height as u64) * 3 / 2).unwrap_or(i32::MAX);
-    let stride = i32::try_from(width).unwrap_or(i32::MAX);
+    let (stride_u32, size_usize) = video_format_stride_and_size(format, width, height)
+        .or_else(|| video_format_stride_and_size(SPA_VIDEO_FORMAT_YUY2, width, height))
+        .unwrap_or((0, 0));
+    let frame_size = i32::try_from(size_usize).unwrap_or(i32::MAX);
+    let stride = i32::try_from(stride_u32).unwrap_or(i32::MAX);
     let data_types = ((1_u32 << SPA_DATA_MEM_PTR) | (1_u32 << SPA_DATA_MEM_FD)) as i32;
 
     let obj = builder.start_object(SPA_TYPE_OBJECT_PARAM_BUFFERS, SPA_PARAM_BUFFERS);
@@ -683,12 +752,180 @@ pub fn build_video_buffers_pod_into(builder: &mut SpaPodBuilder, width: u32, hei
     builder.finish_object(obj);
 }
 
+/// Builds a standalone `SPA_TYPE_OBJECT_ParamBuffers` / `SPA_PARAM_Buffers` pod for `format`.
+#[must_use]
+pub fn build_video_buffers_pod_for_format(format: u32, width: u32, height: u32) -> SpaPodBuilder {
+    let mut builder = SpaPodBuilder::with_capacity_words(24);
+    build_video_buffers_pod_for_format_into(&mut builder, format, width, height);
+    builder
+}
+
+/// Populates `builder` with an `SPA_TYPE_OBJECT_ParamBuffers` / `SPA_PARAM_Buffers` pod
+/// sized for default `YUY2` frames.
+pub fn build_video_buffers_pod_into(builder: &mut SpaPodBuilder, width: u32, height: u32) {
+    build_video_buffers_pod_for_format_into(builder, SPA_VIDEO_FORMAT_YUY2, width, height);
+}
+
 /// Builds a standalone `SPA_TYPE_OBJECT_ParamBuffers` / `SPA_PARAM_Buffers` pod.
 #[must_use]
 pub fn build_video_buffers_pod(width: u32, height: u32) -> SpaPodBuilder {
-    let mut builder = SpaPodBuilder::with_capacity_words(24);
-    build_video_buffers_pod_into(&mut builder, width, height);
-    builder
+    build_video_buffers_pod_for_format(SPA_VIDEO_FORMAT_YUY2, width, height)
+}
+
+fn read_pod_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let slice = bytes.get(offset..offset.checked_add(4)?)?;
+    let arr: [u8; 4] = slice.try_into().ok()?;
+    Some(u32::from_ne_bytes(arr))
+}
+
+/// Parses `SPA_FORMAT_VIDEO_FORMAT` (`Id`) from a serialized `SPA_TYPE_OBJECT_FORMAT` pod.
+#[must_use]
+pub fn parse_video_format_from_pod(pod_bytes: &[u8]) -> Option<u32> {
+    if pod_bytes.len() < 16 {
+        return None;
+    }
+    let pod_size = read_pod_u32(pod_bytes, 0)? as usize;
+    let pod_type = read_pod_u32(pod_bytes, 4)?;
+    let obj_type = read_pod_u32(pod_bytes, 8)?;
+    if pod_type != SPA_TYPE_OBJECT || obj_type != SPA_TYPE_OBJECT_FORMAT || pod_size < 8 {
+        return None;
+    }
+
+    let total_end = 8usize.checked_add(pod_size)?.min(pod_bytes.len());
+    let mut offset = 16usize;
+    while offset.checked_add(16)? <= total_end {
+        let key = read_pod_u32(pod_bytes, offset)?;
+        let val_size = read_pod_u32(pod_bytes, offset + 8)? as usize;
+        let val_type = read_pod_u32(pod_bytes, offset + 12)?;
+        let prop_end = offset.checked_add(16)?.checked_add(val_size)?;
+        if prop_end > total_end {
+            return None;
+        }
+        if key == SPA_FORMAT_VIDEO_FORMAT && val_type == SPA_TYPE_ID && val_size >= 4 {
+            return read_pod_u32(pod_bytes, offset + 16);
+        }
+        let prop_total = 16usize.checked_add(val_size)?;
+        let padded_total = prop_total.checked_add(7)? & !7usize;
+        offset = offset.checked_add(padded_total)?;
+    }
+    None
+}
+
+/// Converts a contiguous planar `YUV420P` frame directly into packed `YUY2` (`YUYV`) bytes.
+///
+/// Returns `Some(written_bytes)` on success or `None` if dimensions are invalid or buffers mismatch.
+pub fn convert_yuv420p_to_yuy2(
+    src: &[u8],
+    dst: &mut [u8],
+    width: usize,
+    height: usize,
+) -> Option<usize> {
+    if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+        return None;
+    }
+    let y_len = width.checked_mul(height)?;
+    let uv_w = width / 2;
+    let uv_h = height / 2;
+    let uv_len = uv_w.checked_mul(uv_h)?;
+    let expected_src = y_len.checked_add(uv_len.checked_mul(2)?)?;
+    let expected_dst = y_len.checked_mul(2)?;
+    if src.len() != expected_src || dst.len() < expected_dst {
+        return None;
+    }
+
+    let (y_plane, uv_planes) = src.split_at(y_len);
+    let (u_plane, v_plane) = uv_planes.split_at(uv_len);
+    let dst_row_bytes = width * 2;
+
+    for (y, (y_row, dst_row)) in y_plane
+        .chunks_exact(width)
+        .zip(dst[..expected_dst].chunks_exact_mut(dst_row_bytes))
+        .enumerate()
+    {
+        let uv_start = (y / 2) * uv_w;
+        let u_row = u_plane.get(uv_start..uv_start + uv_w)?;
+        let v_row = v_plane.get(uv_start..uv_start + uv_w)?;
+        let (dst_chunks, _) = dst_row.as_chunks_mut::<4>();
+        let (y_pairs, _) = y_row.as_chunks::<2>();
+        for (out_px, ((y_pair, &u), &v)) in dst_chunks
+            .iter_mut()
+            .zip(y_pairs.iter().zip(u_row.iter()).zip(v_row.iter()))
+        {
+            *out_px = [y_pair[0], u, y_pair[1], v];
+        }
+    }
+
+    Some(expected_dst)
+}
+
+/// Converts a contiguous planar BT.601 `YUV420P` frame directly into 32-bit packed `RGBA` bytes.
+///
+/// Returns `Some(written_bytes)` on success or `None` if dimensions are invalid or buffers mismatch.
+pub fn convert_yuv420p_to_rgba(
+    src: &[u8],
+    dst: &mut [u8],
+    width: usize,
+    height: usize,
+) -> Option<usize> {
+    if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+        return None;
+    }
+    let y_len = width.checked_mul(height)?;
+    let uv_w = width / 2;
+    let uv_h = height / 2;
+    let uv_len = uv_w.checked_mul(uv_h)?;
+    let expected_src = y_len.checked_add(uv_len.checked_mul(2)?)?;
+    let expected_dst = y_len.checked_mul(4)?;
+    if src.len() != expected_src || dst.len() < expected_dst {
+        return None;
+    }
+
+    let (y_plane, uv_planes) = src.split_at(y_len);
+    let (u_plane, v_plane) = uv_planes.split_at(uv_len);
+    let dst_row_bytes = width * 4;
+
+    for (y, (y_row, dst_row)) in y_plane
+        .chunks_exact(width)
+        .zip(dst[..expected_dst].chunks_exact_mut(dst_row_bytes))
+        .enumerate()
+    {
+        let uv_start = (y / 2) * uv_w;
+        let u_row = u_plane.get(uv_start..uv_start + uv_w)?;
+        let v_row = v_plane.get(uv_start..uv_start + uv_w)?;
+        let (dst_chunks, _) = dst_row.as_chunks_mut::<8>();
+        let (y_pairs, _) = y_row.as_chunks::<2>();
+        for (out_pair, ((y_pair, &u), &v)) in dst_chunks
+            .iter_mut()
+            .zip(y_pairs.iter().zip(u_row.iter()).zip(v_row.iter()))
+        {
+            let d = (u as i32) - 128;
+            let e = (v as i32) - 128;
+            let r_delta = 409 * e + 128;
+            let g_delta = -100 * d - 208 * e + 128;
+            let b_delta = 516 * d + 128;
+
+            let c0 = 298 * ((y_pair[0] as i32) - 16);
+            let c1 = 298 * ((y_pair[1] as i32) - 16);
+            *out_pair = [
+                ((c0 + r_delta) >> 8).clamp(0, 255) as u8,
+                ((c0 + g_delta) >> 8).clamp(0, 255) as u8,
+                ((c0 + b_delta) >> 8).clamp(0, 255) as u8,
+                255,
+                ((c1 + r_delta) >> 8).clamp(0, 255) as u8,
+                ((c1 + g_delta) >> 8).clamp(0, 255) as u8,
+                ((c1 + b_delta) >> 8).clamp(0, 255) as u8,
+                255,
+            ];
+        }
+    }
+
+    Some(expected_dst)
+}
+
+struct LatestFrame {
+    width: u32,
+    height: u32,
+    data: Vec<u8>,
 }
 
 struct SharedState {
@@ -697,7 +934,8 @@ struct SharedState {
     state: AtomicI32,
     width: AtomicU32,
     height: AtomicU32,
-    latest_frame: Mutex<Vec<u8>>,
+    negotiated_format: AtomicU32,
+    latest_frame: Mutex<LatestFrame>,
 }
 
 struct ThreadLoopLockGuard<'a> {
@@ -724,7 +962,8 @@ impl Drop for ThreadLoopLockGuard<'_> {
     }
 }
 
-/// Copies `frame` into `pw_buf` if pointers and buffer capacity are valid, then queues `pw_buf`.
+/// Converts `frame` (YUV420P) into `format` inside `pw_buf` if pointers and buffer capacity
+/// are valid, marking empty/mismatched buffers with `SPA_CHUNK_FLAG_EMPTY`, then queues `pw_buf`.
 ///
 /// # Safety
 /// Must be called while holding the PipeWire thread loop lock (or inside a thread-loop
@@ -733,8 +972,10 @@ unsafe fn fill_and_queue_pw_buffer(
     api: &PipeWireApi,
     stream: *mut PwStream,
     pw_buf: *mut PwBuffer,
-    frame: &[u8],
-    width: u32,
+    frame: &LatestFrame,
+    format: u32,
+    stream_width: u32,
+    stream_height: u32,
 ) {
     // SAFETY: `pw_buf` is a non-null buffer returned by `pw_stream_dequeue_buffer`.
     let spa_buf = unsafe { (*pw_buf).buffer };
@@ -749,17 +990,51 @@ unsafe fn fill_and_queue_pw_buffer(
             let chunk_ptr = d0.chunk;
 
             if !dst_ptr.is_null() && !chunk_ptr.is_null() {
-                if !frame.is_empty() && maxsize >= frame.len() {
+                let mut written = None;
+                if !frame.data.is_empty()
+                    && frame.width == stream_width
+                    && frame.height == stream_height
+                    && let Some((stride, req_size)) =
+                        video_format_stride_and_size(format, stream_width, stream_height)
+                    && maxsize >= req_size
+                {
                     // SAFETY: `dst_ptr` points to a mapped PipeWire buffer of at least `maxsize`
-                    // bytes (`>= frame.len()`), and does not overlap with Rust-owned `frame`.
-                    unsafe {
-                        ptr::copy_nonoverlapping(frame.as_ptr(), dst_ptr, frame.len());
+                    // bytes (`>= req_size`) and does not overlap with Rust-owned `frame.data`.
+                    let dst_slice = unsafe { std::slice::from_raw_parts_mut(dst_ptr, maxsize) };
+                    let converted = match format {
+                        SPA_VIDEO_FORMAT_YUY2 => convert_yuv420p_to_yuy2(
+                            &frame.data,
+                            dst_slice,
+                            stream_width as usize,
+                            stream_height as usize,
+                        ),
+                        SPA_VIDEO_FORMAT_RGBA => convert_yuv420p_to_rgba(
+                            &frame.data,
+                            dst_slice,
+                            stream_width as usize,
+                            stream_height as usize,
+                        ),
+                        SPA_VIDEO_FORMAT_I420 => {
+                            if frame.data.len() == req_size && dst_slice.len() >= req_size {
+                                dst_slice[..req_size].copy_from_slice(&frame.data);
+                                Some(req_size)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(len) = converted {
+                        written = Some((len as u32, i32::try_from(stride).unwrap_or(i32::MAX)));
                     }
+                }
+
+                if let Some((size, stride)) = written {
                     // SAFETY: `chunk_ptr` is non-null and points to `pw_buf`'s `SpaChunk`.
                     unsafe {
                         (*chunk_ptr).offset = 0;
-                        (*chunk_ptr).size = frame.len() as u32;
-                        (*chunk_ptr).stride = i32::try_from(width).unwrap_or(i32::MAX);
+                        (*chunk_ptr).size = size;
+                        (*chunk_ptr).stride = stride;
                         (*chunk_ptr).flags = 0;
                     }
                 } else {
@@ -768,7 +1043,7 @@ unsafe fn fill_and_queue_pw_buffer(
                         (*chunk_ptr).offset = 0;
                         (*chunk_ptr).size = 0;
                         (*chunk_ptr).stride = 0;
-                        (*chunk_ptr).flags = 0;
+                        (*chunk_ptr).flags = SPA_CHUNK_FLAG_EMPTY;
                     }
                 }
             }
@@ -821,13 +1096,28 @@ unsafe extern "C" fn on_param_changed(data: *mut c_void, id: u32, param: *const 
         return;
     }
 
+    // SAFETY: `param` is non-null when `id == SPA_PARAM_FORMAT`, starting with an 8-byte `SpaPod`.
+    let pod_size = unsafe { (*param).size } as usize;
+    if (8..=64 * 1024).contains(&pod_size) {
+        let total_len = 8usize.saturating_add(pod_size);
+        // SAFETY: PipeWire guarantees `param` points to `8 + pod.size` readable bytes.
+        let pod_bytes = unsafe { std::slice::from_raw_parts(param.cast::<u8>(), total_len) };
+        if let Some(fmt) = parse_video_format_from_pod(pod_bytes)
+            && SUPPORTED_VIDEO_FORMATS.contains(&fmt)
+        {
+            shared.negotiated_format.store(fmt, Ordering::Release);
+            debug!(format = fmt, "Negotiated PipeWire virtual camera format");
+        }
+    }
+
     let width = shared.width.load(Ordering::Acquire);
     let height = shared.height.load(Ordering::Acquire);
     if width == 0 || height == 0 {
         return;
     }
 
-    let buffers_pod = build_video_buffers_pod(width, height);
+    let negotiated_format = shared.negotiated_format.load(Ordering::Acquire);
+    let buffers_pod = build_video_buffers_pod_for_format(negotiated_format, width, height);
     let mut param_ptr: *const SpaPod = buffers_pod.as_pod_ptr();
     // SAFETY: `stream` is valid, callback runs inside PipeWire's thread loop with its lock held,
     // and `param_ptr` points to an 8-byte aligned `ParamBuffers` SPA pod alive for this call.
@@ -835,7 +1125,7 @@ unsafe extern "C" fn on_param_changed(data: *mut c_void, id: u32, param: *const 
     if rc < 0 {
         warn!(
             rc,
-            width, height, "pw_stream_update_params(SPA_PARAM_Buffers) failed"
+            negotiated_format, width, height, "pw_stream_update_params(SPA_PARAM_Buffers) failed"
         );
     }
 }
@@ -857,7 +1147,9 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
         return;
     }
 
-    let width = shared.width.load(Ordering::Acquire);
+    let format = shared.negotiated_format.load(Ordering::Acquire);
+    let stream_width = shared.width.load(Ordering::Acquire);
+    let stream_height = shared.height.load(Ordering::Acquire);
     let latest = shared
         .latest_frame
         .lock()
@@ -865,7 +1157,15 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
 
     // SAFETY: `stream` and `pw_buf` are valid and we are inside PipeWire's process callback.
     unsafe {
-        fill_and_queue_pw_buffer(&shared.api, stream, pw_buf, &latest, width);
+        fill_and_queue_pw_buffer(
+            &shared.api,
+            stream,
+            pw_buf,
+            &latest,
+            format,
+            stream_width,
+            stream_height,
+        );
     }
 }
 
@@ -875,7 +1175,7 @@ pub struct PipeWireCameraSink {
     shared_ptr: *mut SharedState,
     configured_width: u32,
     configured_height: u32,
-    pod_builder: SpaPodBuilder,
+    enum_format_pods: [SpaPodBuilder; SUPPORTED_VIDEO_FORMATS.len()],
     standby_scratch: Vec<u8>,
 }
 
@@ -893,9 +1193,37 @@ impl PipeWireCameraSink {
             shared_ptr: ptr::null_mut(),
             configured_width: 0,
             configured_height: 0,
-            pod_builder: SpaPodBuilder::with_capacity_words(24),
+            enum_format_pods: [
+                SpaPodBuilder::with_capacity_words(24),
+                SpaPodBuilder::with_capacity_words(24),
+                SpaPodBuilder::with_capacity_words(24),
+            ],
             standby_scratch: Vec::new(),
         }
+    }
+
+    fn build_enum_format_ptrs(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> [*const SpaPod; SUPPORTED_VIDEO_FORMATS.len()] {
+        let mut ptrs: [*const SpaPod; SUPPORTED_VIDEO_FORMATS.len()] = [ptr::null(); 3];
+        for ((pod_builder, &fmt), slot) in self
+            .enum_format_pods
+            .iter_mut()
+            .zip(SUPPORTED_VIDEO_FORMATS.iter())
+            .zip(ptrs.iter_mut())
+        {
+            build_video_enum_format_pod_for_format_into(
+                pod_builder,
+                fmt,
+                width,
+                height,
+                DEFAULT_FPS,
+            );
+            *slot = pod_builder.as_pod_ptr();
+        }
+        ptrs
     }
 
     fn write_frame_validated(
@@ -956,8 +1284,10 @@ impl PipeWireCameraSink {
                 .latest_frame
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            latest.clear();
-            latest.extend_from_slice(data);
+            latest.width = width;
+            latest.height = height;
+            latest.data.clear();
+            latest.data.extend_from_slice(data);
         }
 
         let dims_changed = self.configured_width != width || self.configured_height != height;
@@ -984,11 +1314,16 @@ impl PipeWireCameraSink {
         if dims_changed {
             shared.width.store(width, Ordering::Release);
             shared.height.store(height, Ordering::Release);
-            build_video_enum_format_pod_into(&mut self.pod_builder, width, height, DEFAULT_FPS);
-            let mut param_ptr: *const SpaPod = self.pod_builder.as_pod_ptr();
-            // SAFETY: `stream` is valid, loop lock is held by `_lock`, and `param_ptr` points to
-            // an 8-byte aligned `EnumFormat` SPA pod alive for the duration of this call.
-            let rc = unsafe { (shared.api.pw_stream_update_params)(stream, &raw mut param_ptr, 1) };
+            let mut param_ptrs = self.build_enum_format_ptrs(width, height);
+            // SAFETY: `stream` is valid, loop lock is held by `_lock`, and `param_ptrs` point to
+            // 8-byte aligned `EnumFormat` SPA pods alive for the duration of this call.
+            let rc = unsafe {
+                (shared.api.pw_stream_update_params)(
+                    stream,
+                    param_ptrs.as_mut_ptr(),
+                    SUPPORTED_VIDEO_FORMATS.len() as u32,
+                )
+            };
             if rc < 0 {
                 return Err(VcamError::FormatError {
                     path: dev_path.to_path_buf(),
@@ -1002,15 +1337,8 @@ impl PipeWireCameraSink {
         }
 
         if shared.state.load(Ordering::Acquire) == PW_STREAM_STATE_STREAMING {
-            // SAFETY: `stream` is valid and the thread loop lock is held by `_lock`.
-            let pw_buf = unsafe { (shared.api.pw_stream_dequeue_buffer)(stream) };
-            if !pw_buf.is_null() {
-                // SAFETY: `stream` and `pw_buf` are valid and loop lock is held.
-                unsafe {
-                    fill_and_queue_pw_buffer(&shared.api, stream, pw_buf, data, width);
-                }
-            }
-            // SAFETY: `stream` is valid and loop lock is held; trigger graph processing.
+            // SAFETY: `stream` is valid and loop lock is held; trigger graph processing so
+            // `on_process` dequeues and queues the latest frame cleanly without double-dequeueing.
             let rc = unsafe { (shared.api.pw_stream_trigger_process)(stream) };
             if rc < 0 {
                 debug!(rc, "pw_stream_trigger_process returned non-zero");
@@ -1031,12 +1359,13 @@ impl PipeWireCameraSink {
             });
         }
 
-        let entries: [(&CStr, &CStr); 6] = [
+        let entries: [(&CStr, &CStr); 7] = [
             (c"media.type", c"Video"),
             (c"media.category", c"Source"),
             (c"media.role", c"Camera"),
             (c"media.class", c"Video/Source"),
             (c"node.name", c"camcraft_virtual_camera"),
+            (c"node.nick", c"CamCraft Virtual Camera"),
             (c"node.description", c"CamCraft Virtual Camera"),
         ];
 
@@ -1123,13 +1452,26 @@ impl VirtualCameraSink for PipeWireCameraSink {
             }
         };
 
+        let mut initial_standby = Vec::new();
+        fill_standby_frame(
+            &mut initial_standby,
+            DEFAULT_WIDTH,
+            DEFAULT_HEIGHT,
+            StandbyKind::Standby,
+        );
+
         let shared_ptr = Box::into_raw(Box::new(SharedState {
             api: Arc::clone(&api),
             stream: AtomicPtr::new(ptr::null_mut()),
             state: AtomicI32::new(PW_STREAM_STATE_UNCONNECTED),
             width: AtomicU32::new(DEFAULT_WIDTH),
             height: AtomicU32::new(DEFAULT_HEIGHT),
-            latest_frame: Mutex::new(Vec::new()),
+            negotiated_format: AtomicU32::new(SPA_VIDEO_FORMAT_YUY2),
+            latest_frame: Mutex::new(LatestFrame {
+                width: DEFAULT_WIDTH,
+                height: DEFAULT_HEIGHT,
+                data: initial_standby,
+            }),
         }));
 
         // SAFETY: `pw_loop` is valid, `props` ownership transfers to `pw_stream_new_simple`
@@ -1162,24 +1504,18 @@ impl VirtualCameraSink for PipeWireCameraSink {
             (*shared_ptr).stream.store(stream, Ordering::Release);
         }
 
-        build_video_enum_format_pod_into(
-            &mut self.pod_builder,
-            DEFAULT_WIDTH,
-            DEFAULT_HEIGHT,
-            DEFAULT_FPS,
-        );
-        let mut param_ptr: *const SpaPod = self.pod_builder.as_pod_ptr();
+        let mut param_ptrs = self.build_enum_format_ptrs(DEFAULT_WIDTH, DEFAULT_HEIGHT);
 
-        // SAFETY: `stream` is valid, thread loop is not yet running, and `param_ptr` points to
-        // an 8-byte aligned `EnumFormat` SPA pod alive for the duration of `pw_stream_connect`.
+        // SAFETY: `stream` is valid, thread loop is not yet running, and `param_ptrs` point to
+        // 8-byte aligned `EnumFormat` SPA pods alive for the duration of `pw_stream_connect`.
         let connect_rc = unsafe {
             (api.pw_stream_connect)(
                 stream,
                 PW_DIRECTION_OUTPUT,
                 PW_ID_ANY,
                 PW_STREAM_FLAG_DRIVER | PW_STREAM_FLAG_MAP_BUFFERS,
-                &raw mut param_ptr,
-                1,
+                param_ptrs.as_mut_ptr(),
+                SUPPORTED_VIDEO_FORMATS.len() as u32,
             )
         };
 
@@ -1459,6 +1795,7 @@ mod tests {
         assert_eq!(read_u32_ne(&bytes, 0), 160);
         assert_eq!(read_u32_ne(&bytes, 4), SPA_TYPE_OBJECT);
         assert_eq!(read_u32_ne(&bytes, 8), SPA_TYPE_OBJECT_FORMAT);
+        assert_eq!(SPA_TYPE_OBJECT_FORMAT, 0x40003);
         assert_eq!(read_u32_ne(&bytes, 12), SPA_PARAM_ENUM_FORMAT);
 
         // Property 1: mediaType = video
@@ -1473,11 +1810,11 @@ mod tests {
         assert_eq!(read_u32_ne(&bytes, 52), SPA_TYPE_ID);
         assert_eq!(read_u32_ne(&bytes, 56), SPA_MEDIA_SUBTYPE_RAW);
 
-        // Property 3: VIDEO_format = I420
+        // Property 3: VIDEO_format = YUY2 (OBS-compatible default)
         assert_eq!(read_u32_ne(&bytes, 64), SPA_FORMAT_VIDEO_FORMAT);
         assert_eq!(read_u32_ne(&bytes, 72), 4);
         assert_eq!(read_u32_ne(&bytes, 76), SPA_TYPE_ID);
-        assert_eq!(read_u32_ne(&bytes, 80), SPA_VIDEO_FORMAT_I420);
+        assert_eq!(read_u32_ne(&bytes, 80), SPA_VIDEO_FORMAT_YUY2);
 
         // Property 4: VIDEO_size = Rectangle(1920, 1080)
         assert_eq!(read_u32_ne(&bytes, 88), SPA_FORMAT_VIDEO_SIZE);
@@ -1486,19 +1823,19 @@ mod tests {
         assert_eq!(read_u32_ne(&bytes, 104), 1920);
         assert_eq!(read_u32_ne(&bytes, 108), 1080);
 
-        // Property 5: VIDEO_framerate = Choice(Range, Fraction: 30/1, 0/1, 60/1)
+        // Property 5: VIDEO_framerate = Choice(Enum, Fraction: 30/1 [default], 60/1, 30/1)
         assert_eq!(read_u32_ne(&bytes, 112), SPA_FORMAT_VIDEO_FRAMERATE);
         assert_eq!(read_u32_ne(&bytes, 120), 40);
         assert_eq!(read_u32_ne(&bytes, 124), SPA_TYPE_CHOICE);
-        assert_eq!(read_u32_ne(&bytes, 128), SPA_CHOICE_RANGE);
+        assert_eq!(read_u32_ne(&bytes, 128), SPA_CHOICE_ENUM);
         assert_eq!(read_u32_ne(&bytes, 132), 0);
         assert_eq!(read_u32_ne(&bytes, 136), 8);
         assert_eq!(read_u32_ne(&bytes, 140), SPA_TYPE_FRACTION);
         assert_eq!(read_u32_ne(&bytes, 144), 30);
         assert_eq!(read_u32_ne(&bytes, 148), 1);
-        assert_eq!(read_u32_ne(&bytes, 152), 0);
+        assert_eq!(read_u32_ne(&bytes, 152), 60);
         assert_eq!(read_u32_ne(&bytes, 156), 1);
-        assert_eq!(read_u32_ne(&bytes, 160), 60);
+        assert_eq!(read_u32_ne(&bytes, 160), 30);
         assert_eq!(read_u32_ne(&bytes, 164), 1);
     }
 
@@ -1514,6 +1851,7 @@ mod tests {
         assert_eq!(read_u32_ne(&bytes, 0), 152);
         assert_eq!(read_u32_ne(&bytes, 4), SPA_TYPE_OBJECT);
         assert_eq!(read_u32_ne(&bytes, 8), SPA_TYPE_OBJECT_PARAM_BUFFERS);
+        assert_eq!(SPA_TYPE_OBJECT_PARAM_BUFFERS, 0x40004);
         assert_eq!(read_u32_ne(&bytes, 12), SPA_PARAM_BUFFERS);
 
         // Property 1: buffers = Choice(Range, Int: 4, 2, 8)
@@ -1534,23 +1872,89 @@ mod tests {
         assert_eq!(read_u32_ne(&bytes, 76), SPA_TYPE_INT);
         assert_eq!(read_i32_ne(&bytes, 80), 1);
 
-        // Property 3: size = 1920 * 1080 * 3 / 2
+        // Property 3: size = 1920 * 1080 * 2 (YUY2)
         assert_eq!(read_u32_ne(&bytes, 88), SPA_PARAM_BUFFERS_SIZE);
         assert_eq!(read_u32_ne(&bytes, 96), 4);
         assert_eq!(read_u32_ne(&bytes, 100), SPA_TYPE_INT);
-        assert_eq!(read_i32_ne(&bytes, 104), 1920 * 1080 * 3 / 2);
+        assert_eq!(read_i32_ne(&bytes, 104), 1920 * 1080 * 2);
 
-        // Property 4: stride = 1920
+        // Property 4: stride = 1920 * 2 (YUY2)
         assert_eq!(read_u32_ne(&bytes, 112), SPA_PARAM_BUFFERS_STRIDE);
         assert_eq!(read_u32_ne(&bytes, 120), 4);
         assert_eq!(read_u32_ne(&bytes, 124), SPA_TYPE_INT);
-        assert_eq!(read_i32_ne(&bytes, 128), 1920);
+        assert_eq!(read_i32_ne(&bytes, 128), 1920 * 2);
 
         // Property 5: dataType = (1 << MemPtr) | (1 << MemFd)
         assert_eq!(read_u32_ne(&bytes, 136), SPA_PARAM_BUFFERS_DATA_TYPE);
         assert_eq!(read_u32_ne(&bytes, 144), 4);
         assert_eq!(read_u32_ne(&bytes, 148), SPA_TYPE_INT);
         assert_eq!(read_i32_ne(&bytes, 152), 6);
+
+        let rgba_bytes =
+            build_video_buffers_pod_for_format(SPA_VIDEO_FORMAT_RGBA, 1920, 1080).to_bytes();
+        assert_eq!(read_i32_ne(&rgba_bytes, 104), 1920 * 1080 * 4);
+        assert_eq!(read_i32_ne(&rgba_bytes, 128), 1920 * 4);
+
+        let i420_bytes =
+            build_video_buffers_pod_for_format(SPA_VIDEO_FORMAT_I420, 1920, 1080).to_bytes();
+        assert_eq!(read_i32_ne(&i420_bytes, 104), 1920 * 1080 * 3 / 2);
+        assert_eq!(read_i32_ne(&i420_bytes, 128), 1920);
+    }
+
+    #[test]
+    fn test_parse_video_format_from_pod_round_trip() {
+        for fmt in SUPPORTED_VIDEO_FORMATS {
+            let pod = build_video_enum_format_pod_for_format(fmt, 1280, 720, 30);
+            let bytes = pod.to_bytes();
+            assert_eq!(parse_video_format_from_pod(&bytes), Some(fmt));
+        }
+
+        let buf_pod = build_video_buffers_pod(1280, 720);
+        assert_eq!(parse_video_format_from_pod(&buf_pod.to_bytes()), None);
+        assert_eq!(parse_video_format_from_pod(&[]), None);
+        assert_eq!(parse_video_format_from_pod(&[0u8; 12]), None);
+    }
+
+    #[test]
+    fn test_yuv420p_to_yuy2_and_rgba_conversion() {
+        let w = 4;
+        let h = 4;
+        let mut yuv = Vec::with_capacity(w * h * 3 / 2);
+        // Y plane: first row bright white (235), second row mid-high (180), bottom half black (16)
+        yuv.extend_from_slice(&[235, 235, 235, 235]);
+        yuv.extend_from_slice(&[180, 180, 180, 180]);
+        yuv.extend_from_slice(&[16; 8]);
+        // U plane (2x2): distinct values per 2x2 block
+        yuv.extend_from_slice(&[128, 128, 80, 128]);
+        // V plane (2x2)
+        yuv.extend_from_slice(&[128, 128, 180, 128]);
+
+        let mut yuy2 = vec![0u8; w * h * 2];
+        assert_eq!(
+            convert_yuv420p_to_yuy2(&yuv, &mut yuy2, w, h),
+            Some(w * h * 2)
+        );
+        // Row 0: [235, 128, 235, 128, 235, 128, 235, 128]
+        assert_eq!(&yuy2[0..8], &[235, 128, 235, 128, 235, 128, 235, 128]);
+        // Row 2, first 2 pixels (Y=16, U=80, V=180)
+        assert_eq!(&yuy2[16..20], &[16, 80, 16, 180]);
+        // Row 2, next 2 pixels (Y=16, U=128, V=128)
+        assert_eq!(&yuy2[20..24], &[16, 128, 16, 128]);
+
+        let mut rgba = vec![0u8; w * h * 4];
+        assert_eq!(
+            convert_yuv420p_to_rgba(&yuv, &mut rgba, w, h),
+            Some(w * h * 4)
+        );
+        // Row 0 pixel 0: studio white -> [255, 255, 255, 255]
+        assert_eq!(&rgba[0..4], &[255, 255, 255, 255]);
+        // Row 3 pixel 2 (neutral black Y=16, U=128, V=128) -> [0, 0, 0, 255]
+        assert_eq!(&rgba[(3 * w + 2) * 4..(3 * w + 3) * 4], &[0, 0, 0, 255]);
+
+        // Reject invalid dimensions or undersized destination buffers
+        assert_eq!(convert_yuv420p_to_yuy2(&yuv, &mut yuy2, 3, 4), None);
+        assert_eq!(convert_yuv420p_to_yuy2(&yuv, &mut [0u8; 4], w, h), None);
+        assert_eq!(convert_yuv420p_to_rgba(&yuv[..8], &mut rgba, w, h), None);
     }
 
     #[test]
@@ -1594,19 +1998,24 @@ mod tests {
         assert_eq!(read_u32_ne(&bytes, 104), 1280);
         assert_eq!(read_u32_ne(&bytes, 108), 720);
         assert_eq!(read_u32_ne(&bytes, 144), 60);
-        assert_eq!(read_u32_ne(&bytes, 160), 60);
+        assert_eq!(read_u32_ne(&bytes, 152), 60);
+        assert_eq!(read_u32_ne(&bytes, 160), 30);
 
         build_video_buffers_pod_into(&mut builder, 1280, 720);
         let buf_bytes = builder.to_bytes();
         assert_eq!(buf_bytes.len(), 160);
-        assert_eq!(read_i32_ne(&buf_bytes, 104), 1280 * 720 * 3 / 2);
-        assert_eq!(read_i32_ne(&buf_bytes, 128), 1280);
+        assert_eq!(read_i32_ne(&buf_bytes, 104), 1280 * 720 * 2);
+        assert_eq!(read_i32_ne(&buf_bytes, 128), 1280 * 2);
         assert_eq!(builder.words.capacity(), initial_cap);
         assert_eq!(builder.as_pod_ptr(), initial_ptr);
     }
 
     #[test]
     fn test_pipewire_sink_open_and_close_lifecycle() {
+        let pw_socket_present = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(|dir| Path::new(&dir).join("pipewire-0").exists())
+            .unwrap_or(false);
+
         let mut sink = PipeWireCameraSink::new();
         match sink.open() {
             Ok(()) => {
@@ -1618,7 +2027,15 @@ mod tests {
                 assert!(sink.close().is_ok());
                 assert!(!sink.is_open());
             }
-            Err(VcamError::DeviceOpen { path, .. }) => {
+            Err(VcamError::DeviceOpen { path, details }) => {
+                assert!(
+                    !pw_socket_present,
+                    "PipeWire socket exists yet sink.open() failed: {details}"
+                );
+                assert!(
+                    !details.contains("code -71") && !details.contains("pw_stream_connect failed"),
+                    "unexpected PipeWire protocol error: {details}"
+                );
                 assert_eq!(path, Path::new(PIPEWIRE_DEVICE_PATH));
                 assert!(!sink.is_open());
             }

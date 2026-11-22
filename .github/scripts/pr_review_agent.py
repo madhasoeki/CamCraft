@@ -9,12 +9,14 @@ Configured purely via GitHub Repository Secrets:
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
-from typing import Any
+from typing import Any, Callable
 
 COMMENT_MARKER = "<!-- camcraft-pr-agent -->"
 MAX_DIFF_CHARS = 60_000
@@ -157,32 +159,374 @@ def extract_assistant_content(payload: dict[str, Any]) -> str:
     raise ValueError("AI response content could not be extracted")
 
 
+def _extract_chunk_text(msg: dict[str, Any]) -> str:
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        return "".join(parts)
+    return ""
+
+
+def parse_ai_response_body(raw: str) -> dict[str, Any]:
+    stripped = raw.strip()
+    if not stripped:
+        raise ValueError("Empty response body")
+
+    if stripped.startswith(("{", "[")):
+        try:
+            parsed = json.loads(stripped)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    # Strip leading SSE keep-alive comment lines (e.g. `: OPENROUTER PROCESSING`) before JSON.
+    non_comment = "\n".join(
+        line
+        for line in stripped.splitlines()
+        if line.strip() and not line.lstrip().startswith(":")
+    ).strip()
+    if non_comment.startswith("{"):
+        try:
+            parsed = json.loads(non_comment)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    # Assemble Server-Sent Events (`data: {...}`) streams when gateways return SSE.
+    sse_parts: list[str] = []
+    event_data_lines: list[str] = []
+    saw_data = False
+    last_error: str | None = None
+
+    def flush_event() -> None:
+        nonlocal saw_data, last_error
+        if not event_data_lines:
+            return
+        saw_data = True
+        payload_str = "\n".join(event_data_lines).strip()
+        event_data_lines.clear()
+        if not payload_str or payload_str == "[DONE]":
+            return
+        try:
+            chunk = json.loads(payload_str)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(chunk, dict):
+            return
+        if chunk.get("error"):
+            last_error = json.dumps(chunk["error"])
+        choices = chunk.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            first = choices[0]
+            for key in ("delta", "message"):
+                msg = first.get(key)
+                if isinstance(msg, dict):
+                    text = _extract_chunk_text(msg)
+                    if text:
+                        sse_parts.append(text)
+
+    for raw_line in stripped.splitlines():
+        line_clean = raw_line.rstrip("\r\n")
+        if not line_clean.strip():
+            flush_event()
+            continue
+        stripped_left = line_clean.lstrip()
+        if stripped_left.startswith(":"):
+            continue
+        if stripped_left.startswith("data:"):
+            val = stripped_left[5:]
+            if val.startswith(" "):
+                val = val[1:]
+            event_data_lines.append(val)
+
+    flush_event()
+
+    if last_error:
+        raise ValueError(f"AI stream returned error: {last_error[:200]}")
+    if sse_parts:
+        return {"choices": [{"message": {"content": "".join(sse_parts)}}]}
+    if saw_data:
+        raise ValueError("AI SSE stream returned no text content")
+
+    preview = " ".join(stripped.split())[:200]
+    raise ValueError(f"Unrecognized non-JSON response: {preview}")
+
+
+def _set_response_socket_timeout(resp: Any, sock_timeout: float) -> None:
+    cur: Any = resp
+    visited: set[int] = set()
+    for _ in range(4):
+        if cur is None or id(cur) in visited:
+            break
+        visited.add(id(cur))
+        raw_cur = getattr(cur, "raw", None)
+        for owner in (cur, raw_cur):
+            sock = getattr(owner, "_sock", None)
+            if sock is not None:
+                try:
+                    sock.settimeout(sock_timeout)
+                except (AttributeError, OSError):
+                    pass
+                return
+        cur = getattr(cur, "fp", None)
+
+
+def _get_header(headers: Any, name: str) -> str | None:
+    if headers is None:
+        return None
+    target = name.lower()
+    if hasattr(headers, "items"):
+        values = [str(v) for k, v in headers.items() if str(k).lower() == target]
+        if values:
+            return ", ".join(values)
+    getter = getattr(headers, "get", None)
+    if callable(getter):
+        val = getter(name)
+        return None if val is None else str(val)
+    return None
+
+
+def _parse_content_length(resp: Any) -> int | None:
+    status = getattr(resp, "status", None)
+    if isinstance(status, int) and (status in (204, 304) or 100 <= status < 200):
+        return None
+    if getattr(resp, "chunked", False):
+        return None
+    headers = getattr(resp, "headers", None)
+    transfer_encoding = _get_header(headers, "Transfer-Encoding")
+    if transfer_encoding and "chunked" in transfer_encoding.lower():
+        return None
+    raw_len = _get_header(headers, "Content-Length")
+    if raw_len is None:
+        return None
+    parts = {part.strip() for part in raw_len.split(",") if part.strip()}
+    if len(parts) != 1:
+        return None
+    try:
+        parsed = int(next(iter(parts)))
+    except ValueError:
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _read_response_bytes(
+    resp: Any,
+    *,
+    timeout: float,
+    deadline: float | None,
+    clean_url: str,
+    max_bytes: int | None = None,
+    allow_partial_on_deadline: bool = False,
+) -> bytes:
+    chunks: list[bytes] = []
+    total_read = 0
+    read_fn = getattr(resp, "read1", resp.read)
+    declared_len = None if allow_partial_on_deadline else _parse_content_length(resp)
+
+    while True:
+        if max_bytes is not None:
+            to_read = min(65536, max_bytes - total_read)
+            if to_read <= 0:
+                break
+        else:
+            to_read = 65536
+
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if allow_partial_on_deadline:
+                    break
+                raise RuntimeError(f"AI stage total timeout exceeded reading from {clean_url}")
+            _set_response_socket_timeout(resp, min(float(timeout), remaining))
+
+        try:
+            block = read_fn(to_read)
+        except http.client.IncompleteRead as inc_err:
+            if allow_partial_on_deadline:
+                if inc_err.partial:
+                    remaining_cap = None if max_bytes is None else max(0, max_bytes - total_read)
+                    chunks.append(
+                        inc_err.partial if remaining_cap is None else inc_err.partial[:remaining_cap]
+                    )
+                break
+            raise RuntimeError(
+                f"Incomplete response body from {clean_url}: "
+                f"read {total_read + len(inc_err.partial)} bytes before premature EOF"
+            ) from None
+        except (TimeoutError, OSError, http.client.HTTPException) as read_err:
+            if allow_partial_on_deadline:
+                break
+            if isinstance(read_err, OSError) and not isinstance(read_err, TimeoutError):
+                raise RuntimeError(f"Transport error reading from {clean_url}: {read_err}") from None
+            raise
+
+        if not block:
+            if not allow_partial_on_deadline:
+                if declared_len is not None and total_read < declared_len:
+                    raise RuntimeError(
+                        f"Incomplete response body from {clean_url}: "
+                        f"read {total_read} of {declared_len} bytes"
+                    )
+                if declared_len is None and not getattr(resp, "chunked", False):
+                    unread_len = getattr(resp, "length", None)
+                    if isinstance(unread_len, int) and unread_len > 0:
+                        raise RuntimeError(
+                            f"Incomplete response body from {clean_url}: "
+                            f"{unread_len} unread bytes remaining"
+                        )
+            break
+
+        chunks.append(block)
+        total_read += len(block)
+
+    return b"".join(chunks)
+
+
 def http_json(
     url: str,
     method: str = "GET",
     headers: dict[str, str] | None = None,
     body: dict[str, Any] | None = None,
-    timeout: int = 90,
+    timeout: float = 90.0,
+    deadline: float | None = None,
 ) -> tuple[int, Any]:
+    clean_url = url.split("?")[0]
+    eff_timeout = float(timeout)
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(f"AI stage total timeout exceeded before calling {clean_url}")
+        eff_timeout = min(eff_timeout, remaining)
+
     data = None if body is None else json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, method=method)
-    for k, v in (headers or {}).items():
+    req_headers = dict(headers or {})
+    if not any(k.lower() == "accept" for k in req_headers):
+        req_headers["Accept"] = "application/json"
+    for k, v in req_headers.items():
         req.add_header(k, v)
     if data is not None:
         req.add_header("Content-Type", "application/json")
 
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            parsed = json.loads(raw) if raw.strip() else {}
+        with urllib.request.urlopen(req, timeout=eff_timeout) as resp:
+            raw = _read_response_bytes(
+                resp,
+                timeout=timeout,
+                deadline=deadline,
+                clean_url=clean_url,
+            ).decode("utf-8", errors="replace")
+
+            content_type = resp.headers.get("Content-Type", "unknown") if resp.headers else "unknown"
+            if not raw.strip():
+                return resp.status, {}
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                try:
+                    parsed = parse_ai_response_body(raw)
+                except ValueError as parse_err:
+                    err_text = str(parse_err)
+                    detail = err_text if err_text.startswith("AI stream returned error:") else " ".join(raw.split())[:200]
+                    # Never surface request headers (e.g. API keys) in exceptions.
+                    raise RuntimeError(
+                        f"Non-JSON response (HTTP {resp.status}, Content-Type: {content_type}) "
+                        f"from {clean_url}: {detail}"
+                    ) from None
             return resp.status, parsed
     except urllib.error.HTTPError as err:
-        raw_err = err.read().decode("utf-8", errors="replace")
+        try:
+            raw_err = _read_response_bytes(
+                err,
+                timeout=timeout,
+                deadline=deadline,
+                clean_url=clean_url,
+                max_bytes=65536,
+                allow_partial_on_deadline=True,
+            ).decode("utf-8", errors="replace")
+        finally:
+            try:
+                err.close()
+            except OSError:
+                pass
         # Never surface request headers (e.g. API keys) in exceptions.
         snippet = raw_err.strip()[:400]
-        raise RuntimeError(f"HTTP {err.code} from {url.split('?')[0]}: {snippet}") from None
+        raise RuntimeError(f"HTTP {err.code} from {clean_url}: {snippet}") from None
     except urllib.error.URLError as err:
-        raise RuntimeError(f"Network error calling {url.split('?')[0]}: {err.reason}") from None
+        raise RuntimeError(f"Network error calling {clean_url}: {err.reason}") from None
+    except TimeoutError as err:
+        raise RuntimeError(f"Request timed out calling {clean_url}: {err}") from None
+    except http.client.HTTPException as err:
+        raise RuntimeError(f"HTTP protocol error calling {clean_url}: {err}") from None
+    except OSError as err:
+        raise RuntimeError(f"Transport error calling {clean_url}: {err}") from None
+
+
+def _is_permanent_http_error(err: Exception) -> bool:
+    msg = str(err)
+    return msg.startswith(("HTTP 400", "HTTP 401", "HTTP 403", "HTTP 404", "HTTP 422"))
+
+
+def call_ai_chat_completion(
+    chat_url: str,
+    api_key: str,
+    payload: dict[str, Any],
+    timeout: float = 90.0,
+    total_timeout: float = 180.0,
+    requester: Callable[..., tuple[int, Any]] = http_json,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + total_timeout
+
+    def _invoke(req_headers: dict[str, str], req_body: dict[str, Any]) -> dict[str, Any]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(f"AI stage total timeout ({total_timeout:.0f}s) exceeded")
+        step_timeout = min(float(timeout), remaining)
+        kwargs: dict[str, Any] = {
+            "method": "POST",
+            "headers": req_headers,
+            "body": req_body,
+            "timeout": step_timeout,
+        }
+        if requester is http_json:
+            kwargs["deadline"] = deadline
+        _, resp = requester(chat_url, **kwargs)
+        return resp
+
+    non_stream_headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+        "User-Agent": "CamCraft-PR-Agent/1.0",
+    }
+    non_stream_payload = {**payload, "stream": False}
+    try:
+        return _invoke(non_stream_headers, non_stream_payload)
+    except RuntimeError as first_err:
+        if _is_permanent_http_error(first_err):
+            raise
+        remaining_after_first = deadline - time.monotonic()
+        if remaining_after_first <= 1.0:
+            raise RuntimeError(
+                f"AI completion exceeded total timeout ({total_timeout:.0f}s) after failure: {first_err}"
+            ) from None
+        print(
+            f"Non-streaming completion attempt failed ({first_err}); retrying with SSE stream=true...",
+            flush=True,
+        )
+        stream_headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "text/event-stream, application/json",
+            "User-Agent": "CamCraft-PR-Agent/1.0",
+        }
+        stream_payload = {**payload, "stream": True}
+        return _invoke(stream_headers, stream_payload)
 
 
 def github_headers(token: str) -> dict[str, str]:
@@ -199,7 +543,7 @@ def fetch_pr_files(api_base: str, repo: str, pr_number: str, token: str) -> list
     page = 1
     while True:
         url = f"{api_base}/repos/{repo}/pulls/{pr_number}/files?per_page=100&page={page}"
-        _, batch = http_json(url, headers=github_headers(token), timeout=30)
+        _, batch = http_json(url, headers=github_headers(token), timeout=20)
         if not isinstance(batch, list) or not batch:
             break
         all_files.extend(batch)
@@ -220,7 +564,7 @@ def upsert_pr_comment(
     page = 1
     while True:
         url = f"{api_base}/repos/{repo}/issues/{pr_number}/comments?per_page=100&page={page}"
-        _, comments = http_json(url, headers=github_headers(token), timeout=30)
+        _, comments = http_json(url, headers=github_headers(token), timeout=20)
         if not isinstance(comments, list) or not comments:
             break
         for comment in comments:
@@ -238,7 +582,7 @@ def upsert_pr_comment(
             method="PATCH",
             headers=github_headers(token),
             body={"body": body_markdown},
-            timeout=30,
+            timeout=20,
         )
         return f"updated comment {existing_id}"
 
@@ -248,7 +592,7 @@ def upsert_pr_comment(
         method="POST",
         headers=github_headers(token),
         body={"body": body_markdown},
-        timeout=30,
+        timeout=20,
     )
     return f"created comment {created.get('id', '?')}"
 
@@ -295,7 +639,7 @@ def run_review(env: dict[str, str] | None = None) -> int:
         return 0
 
     pr_url = f"{gh_api}/repos/{repo}/pulls/{pr_number}"
-    _, pr_data = http_json(pr_url, headers=github_headers(gh_token), timeout=30)
+    _, pr_data = http_json(pr_url, headers=github_headers(gh_token), timeout=20)
     pr_title = str(pr_data.get("title", "")).strip()
     pr_body = str(pr_data.get("body") or "").strip()
     base_ref = str(pr_data.get("base", {}).get("ref", "main"))
@@ -321,10 +665,6 @@ def run_review(env: dict[str, str] | None = None) -> int:
     )
 
     chat_url = normalize_chat_endpoint(endpoint)
-    ai_headers = {
-        "Authorization": f"Bearer {api_key}",
-        "User-Agent": "CamCraft-PR-Agent/1.0",
-    }
     ai_payload = {
         "model": model,
         "temperature": 0.2,
@@ -334,8 +674,8 @@ def run_review(env: dict[str, str] | None = None) -> int:
         ],
     }
 
-    print(f"Sending PR #{pr_number} diff ({len(files)} files) to model `{model}`...")
-    _, ai_resp = http_json(chat_url, method="POST", headers=ai_headers, body=ai_payload, timeout=120)
+    print(f"Sending PR #{pr_number} diff ({len(files)} files) to model `{model}`...", flush=True)
+    ai_resp = call_ai_chat_completion(chat_url, api_key, ai_payload, timeout=90, total_timeout=180.0)
     review_text = extract_assistant_content(ai_resp)
 
     final_comment = (
@@ -348,7 +688,7 @@ def run_review(env: dict[str, str] | None = None) -> int:
     )
 
     action = upsert_pr_comment(gh_api, repo, pr_number, gh_token, final_comment)
-    print(f"PR #{pr_number} review posted ({action}).")
+    print(f"PR #{pr_number} review posted ({action}).", flush=True)
     return 0
 
 

@@ -110,11 +110,22 @@ pub trait VirtualCameraSink: Send {
     fn device_path(&self) -> &Path;
 }
 
-/// Scans `/dev/video*` to automatically discover a `v4l2loopback` node with card label `"CamCraft"`.
-///
-/// Falls back to `/dev/video10` if no matching device is found.
+fn video_device_priority(path: &Path) -> (u8, u32) {
+    match path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|s| s.strip_prefix("video"))
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        Some(10) => (0, 10),
+        Some(n) => (1, n),
+        None => (2, u32::MAX),
+    }
+}
+
+/// Scans `/dev/video*` for an existing `v4l2loopback` node with card label `"CamCraft"`.
 #[must_use]
-pub fn find_camcraft_v4l2_device() -> PathBuf {
+pub fn find_camcraft_v4l2_device_existing() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
 
     if let Ok(entries) = fs::read_dir("/dev") {
@@ -128,24 +139,8 @@ pub fn find_camcraft_v4l2_device() -> PathBuf {
         }
     }
 
-    // Sort to check /dev/video10 first if present, then lowest index to highest
-    candidates.sort_by(|a, b| {
-        let num_a = a
-            .file_name()
-            .and_then(|n| n.to_str())
-            .and_then(|s| s.trim_start_matches("video").parse::<u32>().ok())
-            .unwrap_or(u32::MAX);
-        let num_b = b
-            .file_name()
-            .and_then(|n| n.to_str())
-            .and_then(|s| s.trim_start_matches("video").parse::<u32>().ok())
-            .unwrap_or(u32::MAX);
-
-        // Prioritize index 10 (the default CamCraft video_nr)
-        let prio_a = if num_a == 10 { 0 } else { num_a + 1 };
-        let prio_b = if num_b == 10 { 0 } else { num_b + 1 };
-        prio_a.cmp(&prio_b)
-    });
+    // Prioritize /dev/video10 first, then ascending numeric index, then non-numeric names
+    candidates.sort_by_key(|path| video_device_priority(path));
 
     for path in &candidates {
         if let Ok(dev) = v4l::Device::with_path(path)
@@ -157,8 +152,20 @@ pub fn find_camcraft_v4l2_device() -> PathBuf {
                 card = %caps.card,
                 "Auto-detected CamCraft Virtual Camera device"
             );
-            return path.clone();
+            return Some(path.clone());
         }
+    }
+
+    None
+}
+
+/// Scans `/dev/video*` to automatically discover a `v4l2loopback` node with card label `"CamCraft"`.
+///
+/// Falls back to `/dev/video10` if no matching device is found.
+#[must_use]
+pub fn find_camcraft_v4l2_device() -> PathBuf {
+    if let Some(path) = find_camcraft_v4l2_device_existing() {
+        return path;
     }
 
     let default_path = PathBuf::from("/dev/video10");
@@ -877,27 +884,139 @@ pub fn open_virtual_camera(
     }
 }
 
-/// Loads the `v4l2loopback` kernel module via `pkexec` with CamCraft defaults.
-pub fn enable_v4l2loopback_via_pkexec() -> Result<(), VcamError> {
-    info!("Loading v4l2loopback kernel module via pkexec");
-    let output = Command::new("pkexec")
-        .args([
+fn find_in_path(binary: &str) -> Option<PathBuf> {
+    let standard_dirs = ["/usr/bin", "/usr/sbin", "/usr/local/bin", "/usr/local/sbin"];
+    for dir in standard_dirs {
+        let candidate = Path::new(dir).join(binary);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join(binary))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
+/// Parses the newly created `/dev/videoN` device path printed by `v4l2loopback-ctl add`.
+#[must_use]
+pub fn parse_v4l2loopback_ctl_add_output(stdout: &str) -> Option<PathBuf> {
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("/dev/video") {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+    None
+}
+
+/// Formats a shell-ready `sudo` recovery command from the selected binary and arguments.
+#[must_use]
+pub fn format_sudo_recovery_command(program: &str, args: &[&str]) -> String {
+    let mut parts = Vec::with_capacity(args.len() + 2);
+    parts.push("sudo".to_owned());
+    parts.push(program.to_owned());
+    for arg in args {
+        if arg.contains(char::is_whitespace) {
+            parts.push(format!("\"{arg}\""));
+        } else {
+            parts.push((*arg).to_owned());
+        }
+    }
+    parts.join(" ")
+}
+
+/// Selects the privileged command and arguments to provision a CamCraft V4L2 loopback device.
+#[must_use]
+pub fn build_v4l2_enable_command(
+    module_loaded: bool,
+    video10_occupied: bool,
+) -> (&'static str, Vec<&'static str>) {
+    if !module_loaded {
+        (
             "modprobe",
-            "v4l2loopback",
-            "devices=1",
-            "video_nr=10",
-            "card_label=CamCraft Virtual Camera",
-            "exclusive_caps=1",
-        ])
-        .output()?;
+            vec![
+                "v4l2loopback",
+                "devices=1",
+                "video_nr=10",
+                "card_label=CamCraft Virtual Camera",
+                "exclusive_caps=1",
+            ],
+        )
+    } else if !video10_occupied {
+        (
+            "v4l2loopback-ctl",
+            vec![
+                "add",
+                "-n",
+                "CamCraft Virtual Camera",
+                "-x",
+                "1",
+                "/dev/video10",
+            ],
+        )
+    } else {
+        (
+            "v4l2loopback-ctl",
+            vec!["add", "-n", "CamCraft Virtual Camera", "-x", "1"],
+        )
+    }
+}
+
+/// Provisions a `"CamCraft Virtual Camera"` `v4l2loopback` node via `pkexec` and returns its path.
+///
+/// Uses `modprobe v4l2loopback` when the kernel module is unloaded, or falls back to
+/// `v4l2loopback-ctl add` when another app (such as OBS Virtual Camera) already loaded it.
+pub fn enable_v4l2loopback_via_pkexec() -> Result<PathBuf, VcamError> {
+    if let Some(existing) = find_camcraft_v4l2_device_existing() {
+        info!(
+            path = %existing.display(),
+            "CamCraft V4L2 loopback device is already present; skipping pkexec"
+        );
+        return Ok(existing);
+    }
+
+    let module_loaded = Path::new("/sys/module/v4l2loopback").exists();
+    let video10_occupied = Path::new("/dev/video10").exists();
+    let (program, args) = build_v4l2_enable_command(module_loaded, video10_occupied);
+
+    let resolved_program = find_in_path(program);
+    if module_loaded && resolved_program.is_none() {
+        return Err(VcamError::DeviceOpen {
+            path: PathBuf::from("/dev/video10"),
+            details: "v4l2loopback kernel module is already loaded by another app (e.g. OBS Virtual Camera), and 'v4l2loopback-ctl' was not found. Install 'v4l2loopback' tools or use PipeWire mode.".to_owned(),
+        });
+    }
+    let exec_path = resolved_program.unwrap_or_else(|| PathBuf::from(program));
+
+    info!(
+        exec_path = %exec_path.display(),
+        ?args,
+        "Provisioning CamCraft V4L2 virtual camera via pkexec"
+    );
+    let output = Command::new("pkexec")
+        .arg(&exec_path)
+        .args(&args)
+        .output()
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                let recovery = format_sudo_recovery_command(program, &args);
+                VcamError::DeviceOpen {
+                    path: PathBuf::from("/dev/video10"),
+                    details: format!(
+                        "'pkexec' was not found on PATH; run '{recovery}' or use PipeWire mode."
+                    ),
+                }
+            } else {
+                VcamError::Io(err)
+            }
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         let details = if stderr.is_empty() {
-            format!(
-                "pkexec modprobe v4l2loopback exited with status {}",
-                output.status
-            )
+            format!("pkexec {program} exited with status {}", output.status)
         } else {
             stderr
         };
@@ -907,8 +1026,17 @@ pub fn enable_v4l2loopback_via_pkexec() -> Result<(), VcamError> {
         });
     }
 
-    info!("Loaded v4l2loopback kernel module via pkexec");
-    Ok(())
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let allocated_path = parse_v4l2loopback_ctl_add_output(&stdout)
+        .or_else(find_camcraft_v4l2_device_existing)
+        .unwrap_or_else(|| PathBuf::from("/dev/video10"));
+
+    info!(
+        program,
+        path = %allocated_path.display(),
+        "Provisioned CamCraft V4L2 virtual camera via pkexec"
+    );
+    Ok(allocated_path)
 }
 
 #[cfg(test)]
@@ -1126,5 +1254,118 @@ mod tests {
             }
             Err(other) => panic!("unexpected open_virtual_camera(Auto) error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_build_v4l2_enable_command_variants() {
+        assert_eq!(
+            build_v4l2_enable_command(false, false),
+            (
+                "modprobe",
+                vec![
+                    "v4l2loopback",
+                    "devices=1",
+                    "video_nr=10",
+                    "card_label=CamCraft Virtual Camera",
+                    "exclusive_caps=1",
+                ]
+            )
+        );
+        assert_eq!(
+            build_v4l2_enable_command(false, true),
+            (
+                "modprobe",
+                vec![
+                    "v4l2loopback",
+                    "devices=1",
+                    "video_nr=10",
+                    "card_label=CamCraft Virtual Camera",
+                    "exclusive_caps=1",
+                ]
+            )
+        );
+        assert_eq!(
+            build_v4l2_enable_command(true, false),
+            (
+                "v4l2loopback-ctl",
+                vec![
+                    "add",
+                    "-n",
+                    "CamCraft Virtual Camera",
+                    "-x",
+                    "1",
+                    "/dev/video10",
+                ]
+            )
+        );
+        assert_eq!(
+            build_v4l2_enable_command(true, true),
+            (
+                "v4l2loopback-ctl",
+                vec!["add", "-n", "CamCraft Virtual Camera", "-x", "1"]
+            )
+        );
+    }
+
+    #[test]
+    fn test_parse_v4l2loopback_ctl_add_output() {
+        assert_eq!(
+            parse_v4l2loopback_ctl_add_output("/dev/video10\n"),
+            Some(PathBuf::from("/dev/video10"))
+        );
+        assert_eq!(
+            parse_v4l2loopback_ctl_add_output("\n  /dev/video3  \n"),
+            Some(PathBuf::from("/dev/video3"))
+        );
+        assert_eq!(parse_v4l2loopback_ctl_add_output(""), None);
+        assert_eq!(
+            parse_v4l2loopback_ctl_add_output("created virtual device\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_format_sudo_recovery_command() {
+        let (mod_prog, mod_args) = build_v4l2_enable_command(false, false);
+        assert_eq!(
+            format_sudo_recovery_command(mod_prog, &mod_args),
+            "sudo modprobe v4l2loopback devices=1 video_nr=10 \"card_label=CamCraft Virtual Camera\" exclusive_caps=1"
+        );
+
+        let (ctl_prog, ctl_args) = build_v4l2_enable_command(true, false);
+        assert_eq!(
+            format_sudo_recovery_command(ctl_prog, &ctl_args),
+            "sudo v4l2loopback-ctl add -n \"CamCraft Virtual Camera\" -x 1 /dev/video10"
+        );
+
+        let (ctl_dyn_prog, ctl_dyn_args) = build_v4l2_enable_command(true, true);
+        assert_eq!(
+            format_sudo_recovery_command(ctl_dyn_prog, &ctl_dyn_args),
+            "sudo v4l2loopback-ctl add -n \"CamCraft Virtual Camera\" -x 1"
+        );
+    }
+
+    #[test]
+    fn test_video_device_priority_ordering_and_non_numeric_safety() {
+        let mut paths = vec![
+            PathBuf::from("/dev/video"),
+            PathBuf::from("/dev/video_custom"),
+            PathBuf::from("/dev/video4294967295"),
+            PathBuf::from("/dev/video2"),
+            PathBuf::from("/dev/video0"),
+            PathBuf::from("/dev/video10"),
+        ];
+        paths.sort_by_key(|path| video_device_priority(path));
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/dev/video10"),
+                PathBuf::from("/dev/video0"),
+                PathBuf::from("/dev/video2"),
+                PathBuf::from("/dev/video4294967295"),
+                PathBuf::from("/dev/video"),
+                PathBuf::from("/dev/video_custom"),
+            ]
+        );
     }
 }

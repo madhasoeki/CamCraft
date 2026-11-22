@@ -229,6 +229,7 @@ pub enum GuiUpdate {
     },
     V4l2EnableResult {
         ok: bool,
+        device_path: Option<String>,
         message: String,
     },
     UdevInstallResult {
@@ -657,19 +658,26 @@ async fn run_session_supervisor(
                         let ctx_c = ctx.clone();
                         tokio::spawn(async move {
                             let res = tokio::task::spawn_blocking(enable_v4l2loopback_via_pkexec).await;
-                            let (ok, message) = match res {
-                                Ok(Ok(())) => (
-                                    true,
-                                    "Legacy V4L2 kernel module enabled (/dev/video10 ready)."
-                                        .to_owned(),
-                                ),
-                                Ok(Err(e)) => (false, e.to_string()),
-                                Err(e) => (false, format!("Polkit V4L2 task failed: {e}")),
+                            let (ok, device_path, message) = match res {
+                                Ok(Ok(path)) => {
+                                    let path_str = path.display().to_string();
+                                    (
+                                        true,
+                                        Some(path_str.clone()),
+                                        format!("Legacy V4L2 virtual camera enabled ({path_str} ready)."),
+                                    )
+                                }
+                                Ok(Err(e)) => (false, None, e.to_string()),
+                                Err(e) => (false, None, format!("Polkit V4L2 task failed: {e}")),
                             };
                             emit(
                                 &update_tx_c,
                                 &ctx_c,
-                                GuiUpdate::V4l2EnableResult { ok, message },
+                                GuiUpdate::V4l2EnableResult {
+                                    ok,
+                                    device_path,
+                                    message,
+                                },
                             );
                         });
                     }
