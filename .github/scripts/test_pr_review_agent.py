@@ -338,6 +338,86 @@ class PrReviewAgentTests(unittest.TestCase):
         self.assertEqual(sock.timeouts, [10.0])
         self.assertFalse(_is_permanent_http_error(ctx_502.exception))
 
+    def test_call_ai_chat_completion_retries_on_connection_reset_during_read1(self) -> None:
+        class ResetResp:
+            status = 200
+            headers = {"Content-Type": "application/json"}
+
+            def read1(self, _n: int = -1) -> bytes:
+                raise ConnectionResetError("Connection reset by peer")
+
+            def read(self, n: int = -1) -> bytes:
+                return self.read1(n)
+
+            def __enter__(self) -> "ResetResp":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+        class StreamOkResp:
+            status = 200
+            headers = {"Transfer-Encoding": "chunked", "Content-Type": "text/event-stream"}
+
+            def __init__(self) -> None:
+                body = b'data: {"choices": [{"delta": {"content": "Recovered after reset"}}]}\n\ndata: [DONE]\n'
+                self._chunks = [body[:32], body[32:], b""]
+
+            def read1(self, _n: int = -1) -> bytes:
+                return self._chunks.pop(0) if self._chunks else b""
+
+            def read(self, n: int = -1) -> bytes:
+                return self.read1(n)
+
+            def __enter__(self) -> "StreamOkResp":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+        with mock.patch.object(pr_review_agent.urllib.request, "urlopen", return_value=ResetResp()):
+            with self.assertRaises(RuntimeError) as direct_ctx:
+                http_json(
+                    "https://example.invalid/v1/chat/completions",
+                    deadline=time.monotonic() + 30.0,
+                )
+        self.assertIn("Transport error", str(direct_ctx.exception))
+        self.assertFalse(_is_permanent_http_error(direct_ctx.exception))
+
+        with mock.patch.object(
+            pr_review_agent.urllib.request,
+            "urlopen",
+            side_effect=[ResetResp(), StreamOkResp()],
+        ) as mock_urlopen:
+            resp = call_ai_chat_completion(
+                "https://example.invalid/v1/chat/completions",
+                "secret-token",
+                {"model": "test-model", "messages": []},
+            )
+        self.assertEqual(mock_urlopen.call_count, 2)
+        self.assertEqual(extract_assistant_content(resp), "Recovered after reset")
+
+        http_401 = urllib.error.HTTPError(
+            "https://example.invalid/v1/chat/completions",
+            401,
+            "Unauthorized",
+            {},
+            io.BytesIO(b"Bad API key"),
+        )
+        with mock.patch.object(
+            pr_review_agent.urllib.request,
+            "urlopen",
+            side_effect=http_401,
+        ) as mock_urlopen_401:
+            with self.assertRaises(RuntimeError) as err_401:
+                call_ai_chat_completion(
+                    "https://example.invalid/v1/chat/completions",
+                    "bad-token",
+                    {"model": "test-model", "messages": []},
+                )
+        self.assertEqual(mock_urlopen_401.call_count, 1)
+        self.assertTrue(str(err_401.exception).startswith("HTTP 401 from "))
+
 
 if __name__ == "__main__":
     unittest.main()

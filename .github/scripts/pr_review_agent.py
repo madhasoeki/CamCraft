@@ -360,9 +360,11 @@ def _read_response_bytes(
                 f"Incomplete response body from {clean_url}: "
                 f"read {total_read + len(inc_err.partial)} bytes before premature EOF"
             ) from None
-        except (TimeoutError, OSError, http.client.HTTPException):
+        except (TimeoutError, OSError, http.client.HTTPException) as read_err:
             if allow_partial_on_deadline:
                 break
+            if isinstance(read_err, OSError) and not isinstance(read_err, TimeoutError):
+                raise RuntimeError(f"Transport error reading from {clean_url}: {read_err}") from None
             raise
 
         if not block:
@@ -463,6 +465,8 @@ def http_json(
         raise RuntimeError(f"Request timed out calling {clean_url}: {err}") from None
     except http.client.HTTPException as err:
         raise RuntimeError(f"HTTP protocol error calling {clean_url}: {err}") from None
+    except OSError as err:
+        raise RuntimeError(f"Transport error calling {clean_url}: {err}") from None
 
 
 def _is_permanent_http_error(err: Exception) -> bool:
