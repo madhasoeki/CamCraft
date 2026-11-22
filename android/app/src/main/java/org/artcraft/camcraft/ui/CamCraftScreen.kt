@@ -70,6 +70,7 @@ import java.util.Locale
 import kotlinx.coroutines.delay
 import org.artcraft.camcraft.BuildConfig
 import org.artcraft.camcraft.R
+import org.artcraft.camcraft.network.CamCraftStreamService
 import org.artcraft.camcraft.network.StreamConnectionStatus
 import org.artcraft.camcraft.network.StreamServiceState
 import org.artcraft.camcraft.protocol.CameraInfo
@@ -78,6 +79,7 @@ import org.artcraft.camcraft.ui.components.CamCraftIcons
 import org.artcraft.camcraft.ui.theme.ArtCraftColors
 import org.artcraft.camcraft.ui.theme.CamCraftTheme
 import org.artcraft.camcraft.ui.theme.TabularMonoStyle
+import org.artcraft.camcraft.update.ReleaseUpdateInfo
 import org.artcraft.camcraft.update.UpdateUiState
 
 /**
@@ -218,37 +220,27 @@ private fun TopStatusHeader(
         }
     }
 
+    val presentation = formatConnectionPresentation(
+        status = status,
+        clientAddress = clientAddress,
+        listenPort = listenPort,
+        errorMessage = errorMessage,
+    )
     val statusColor = when (status) {
         StreamConnectionStatus.CONNECTED -> ArtCraftColors.StatusEmerald
         StreamConnectionStatus.LISTENING -> ArtCraftColors.StatusAmber
         StreamConnectionStatus.ERROR -> ArtCraftColors.StatusRose
         StreamConnectionStatus.STOPPED -> ArtCraftColors.TextMuted
     }
-    val statusLabel = when (status) {
-        StreamConnectionStatus.CONNECTED -> "LIVE"
-        StreamConnectionStatus.LISTENING -> "READY"
-        StreamConnectionStatus.ERROR -> "ERROR"
-        StreamConnectionStatus.STOPPED -> "STANDBY"
-    }
-    val isUsbConnected = status == StreamConnectionStatus.CONNECTED && clientAddress == "127.0.0.1"
+    val statusLabel = presentation.statusLabel
     val statusIcon = when (status) {
-        StreamConnectionStatus.CONNECTED -> if (isUsbConnected) CamCraftIcons.Usb else CamCraftIcons.Wifi
+        StreamConnectionStatus.CONNECTED -> if (presentation.isUsb) CamCraftIcons.Usb else CamCraftIcons.Wifi
         StreamConnectionStatus.LISTENING -> CamCraftIcons.Wifi
         StreamConnectionStatus.ERROR,
         StreamConnectionStatus.STOPPED,
         -> CamCraftIcons.Power
     }
-    val subtitleText = when (status) {
-        StreamConnectionStatus.CONNECTED -> if (isUsbConnected) {
-            "USB ADB • 127.0.0.1"
-        } else {
-            "Wi-Fi • ${clientAddress ?: "Connected"}"
-        }
-        StreamConnectionStatus.ERROR -> errorMessage ?: "Unknown server error"
-        StreamConnectionStatus.LISTENING,
-        StreamConnectionStatus.STOPPED,
-        -> "Port $listenPort • USB / Wi-Fi"
-    }
+    val subtitleText = presentation.subtitle
 
     val batterySummary = remember(telemetry) { telemetry?.let(::formatBatterySummary) }
     val thermalColor = remember(telemetry?.temperatureC) {
@@ -589,7 +581,7 @@ private fun UpdateBanner(
                             val totMb = updateState.totalBytes / (1024f * 1024f)
                             String.format(Locale.US, "%.1f / %.1f MB", dlMb, totMb)
                         }
-                        is UpdateUiState.ReadyToInstall -> "SHA-256 verified. Tap Install to finish."
+                        is UpdateUiState.ReadyToInstall -> formatReadyToInstallDetail(updateState.release)
                         is UpdateUiState.NeedsInstallPermission -> "Grant permission in Settings to install APK."
                         is UpdateUiState.Error -> updateState.message
                     }
@@ -1453,3 +1445,50 @@ fun CamCraftScreenConnectedPreview() {
         )
     }
 }
+
+internal data class ConnectionPresentation(
+    val statusLabel: String,
+    val isUsb: Boolean,
+    val subtitle: String,
+)
+
+internal fun formatConnectionPresentation(
+    status: StreamConnectionStatus,
+    clientAddress: String?,
+    listenPort: Int,
+    errorMessage: String?,
+): ConnectionPresentation {
+    val statusLabel = when (status) {
+        StreamConnectionStatus.CONNECTED -> "LIVE"
+        StreamConnectionStatus.LISTENING -> "READY"
+        StreamConnectionStatus.ERROR -> "ERROR"
+        StreamConnectionStatus.STOPPED -> "STANDBY"
+    }
+    val isUsbAdb = status == StreamConnectionStatus.CONNECTED && clientAddress == "127.0.0.1"
+    val isUsbDirect = status == StreamConnectionStatus.CONNECTED &&
+        clientAddress == CamCraftStreamService.USB_CLIENT_LABEL
+    val isUsb = isUsbAdb || isUsbDirect
+    val subtitle = when (status) {
+        StreamConnectionStatus.CONNECTED -> when {
+            isUsbDirect -> CamCraftStreamService.USB_CLIENT_LABEL
+            isUsbAdb -> "USB ADB • 127.0.0.1"
+            else -> "Wi-Fi • ${clientAddress ?: "Connected"}"
+        }
+        StreamConnectionStatus.ERROR -> errorMessage ?: "Unknown server error"
+        StreamConnectionStatus.LISTENING,
+        StreamConnectionStatus.STOPPED,
+        -> "Port $listenPort • USB / Wi-Fi"
+    }
+    return ConnectionPresentation(
+        statusLabel = statusLabel,
+        isUsb = isUsb,
+        subtitle = subtitle,
+    )
+}
+
+internal fun formatReadyToInstallDetail(release: ReleaseUpdateInfo): String =
+    if (release.checksumsUrl != null) {
+        "SHA-256 verified. Tap Install to finish."
+    } else {
+        "APK downloaded. Tap Install to finish."
+    }

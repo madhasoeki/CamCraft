@@ -3,7 +3,9 @@ package org.artcraft.camcraft.update
 import android.content.Context
 import android.os.SystemClock
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -18,66 +20,50 @@ import kotlinx.coroutines.launch
 object AppUpdateManager {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val startupChecked = AtomicBoolean(false)
-    private var activeJob: Job? = null
+    private var downloadJob: Job? = null
 
     private val _state = MutableStateFlow<UpdateUiState>(UpdateUiState.Idle)
     val state: StateFlow<UpdateUiState> = _state.asStateFlow()
 
+    private val checkCoordinator = UpdateCheckCoordinator(
+        stateFlow = _state,
+        scope = scope,
+        performCheck = { AppUpdater.checkForUpdate() },
+    )
+
     fun checkOnStartup() {
         if (!startupChecked.compareAndSet(false, true)) return
-        checkInternal(silent = true)
+        checkCoordinator.check(silent = true)
     }
 
     fun checkManually() {
-        checkInternal(silent = false)
-    }
-
-    private fun checkInternal(silent: Boolean) {
-        if (activeJob?.isActive == true) return
-        if (!silent) {
-            _state.value = UpdateUiState.Checking
+        val cur = _state.value
+        if (cur is UpdateUiState.Downloading ||
+            cur is UpdateUiState.ReadyToInstall ||
+            cur is UpdateUiState.NeedsInstallPermission
+        ) {
+            return
         }
-        activeJob = scope.launch {
-            runCatching { AppUpdater.checkForUpdate() }
-                .onSuccess { result ->
-                    when (result) {
-                        is UpdateCheckResult.UpdateAvailable -> {
-                            _state.value = UpdateUiState.Available(result.release)
-                        }
-                        is UpdateCheckResult.UpToDate -> {
-                            if (!silent) {
-                                _state.value = UpdateUiState.UpToDate
-                            }
-                        }
-                    }
-                }
-                .onFailure { err ->
-                    if (!silent) {
-                        _state.value = UpdateUiState.Error(
-                            message = err.message ?: "Unable to check for updates",
-                        )
-                    }
-                }
-        }
+        checkCoordinator.check(silent = false)
     }
 
     fun downloadAndInstall(context: Context) {
+        val appCtx = context.applicationContext ?: context
         val release = when (val cur = _state.value) {
             is UpdateUiState.Available -> cur.release
             is UpdateUiState.Error -> cur.retryRelease ?: return
             is UpdateUiState.ReadyToInstall -> {
-                launchInstallerAndUpdateState(context, cur.release, cur.apkFile)
+                launchInstallerAndUpdateState(appCtx, cur.release, cur.apkFile)
                 return
             }
             is UpdateUiState.NeedsInstallPermission -> {
-                launchInstallerAndUpdateState(context, cur.release, cur.apkFile)
+                launchInstallerAndUpdateState(appCtx, cur.release, cur.apkFile)
                 return
             }
             else -> return
         }
 
-        if (activeJob?.isActive == true) return
-        val appCtx = context.applicationContext
+        if (downloadJob?.isActive == true) return
         _state.value = UpdateUiState.Downloading(
             version = release.version,
             progress = 0f,
@@ -85,7 +71,7 @@ object AppUpdateManager {
             totalBytes = release.assetSize,
         )
 
-        activeJob = scope.launch {
+        downloadJob = scope.launch {
             var lastEmitMs = 0L
             var lastPct = -1
             runCatching {
@@ -105,7 +91,7 @@ object AppUpdateManager {
                 }
             }.onSuccess { apkFile ->
                 _state.value = UpdateUiState.ReadyToInstall(release = release, apkFile = apkFile)
-                launchInstallerAndUpdateState(context, release, apkFile)
+                launchInstallerAndUpdateState(appCtx, release, apkFile)
             }.onFailure { err ->
                 _state.value = UpdateUiState.Error(
                     message = err.message ?: "Update download failed",
@@ -116,22 +102,24 @@ object AppUpdateManager {
     }
 
     fun installDownloadedApk(context: Context) {
+        val appCtx = context.applicationContext ?: context
         val (release, apkFile) = when (val cur = _state.value) {
             is UpdateUiState.ReadyToInstall -> cur.release to cur.apkFile
             is UpdateUiState.NeedsInstallPermission -> cur.release to cur.apkFile
             else -> return
         }
-        launchInstallerAndUpdateState(context, release, apkFile)
+        launchInstallerAndUpdateState(appCtx, release, apkFile)
     }
 
     fun onResumeCheckPendingInstall(context: Context) {
+        val appCtx = context.applicationContext ?: context
         val pending = _state.value as? UpdateUiState.NeedsInstallPermission ?: return
-        if (context.packageManager.canRequestPackageInstalls()) {
+        if (appCtx.packageManager.canRequestPackageInstalls()) {
             _state.value = UpdateUiState.ReadyToInstall(
                 release = pending.release,
                 apkFile = pending.apkFile,
             )
-            launchInstallerAndUpdateState(context, pending.release, pending.apkFile)
+            launchInstallerAndUpdateState(appCtx, pending.release, pending.apkFile)
         }
     }
 
@@ -140,11 +128,12 @@ object AppUpdateManager {
     }
 
     private fun launchInstallerAndUpdateState(
-        context: Context,
+        appContext: Context,
         release: ReleaseUpdateInfo,
         apkFile: java.io.File,
     ) {
-        runCatching { AppUpdater.launchApkInstaller(context, apkFile) }
+        val appCtx = appContext.applicationContext ?: appContext
+        runCatching { AppUpdater.launchApkInstaller(appCtx, apkFile) }
             .onSuccess { result ->
                 _state.value = when (result) {
                     InstallLaunchResult.InstallerLaunched -> UpdateUiState.ReadyToInstall(release, apkFile)
@@ -159,5 +148,100 @@ object AppUpdateManager {
                     retryRelease = release,
                 )
             }
+    }
+}
+
+/**
+ * Coordinates silent startup vs explicit manual update checks so a manual check that
+ * overlaps an active silent check escalates it to `Checking` and surfaces final UI feedback.
+ */
+internal class UpdateCheckCoordinator(
+    private val stateFlow: MutableStateFlow<UpdateUiState>,
+    private val scope: CoroutineScope,
+    private val performCheck: suspend () -> UpdateCheckResult,
+) {
+    private val lock = Any()
+    private var checkJob: Job? = null
+    private var escalatedToManual = false
+
+    internal val isCheckInFlight: Boolean
+        get() = synchronized(lock) { checkJob != null }
+
+    fun check(silent: Boolean) {
+        synchronized(lock) {
+            if (checkJob != null) {
+                if (!silent) {
+                    escalatedToManual = true
+                    val cur = stateFlow.value
+                    if (cur !is UpdateUiState.Downloading &&
+                        cur !is UpdateUiState.ReadyToInstall &&
+                        cur !is UpdateUiState.NeedsInstallPermission
+                    ) {
+                        stateFlow.value = UpdateUiState.Checking
+                    }
+                }
+                return
+            }
+
+            escalatedToManual = !silent
+            if (!silent) {
+                stateFlow.value = UpdateUiState.Checking
+            }
+
+            lateinit var launchedJob: Job
+            launchedJob = scope.launch(start = CoroutineStart.LAZY) {
+                val outcome = try {
+                    Result.success(performCheck())
+                } catch (ce: CancellationException) {
+                    synchronized(lock) {
+                        if (checkJob === launchedJob) {
+                            escalatedToManual = false
+                            checkJob = null
+                        }
+                    }
+                    throw ce
+                } catch (t: Throwable) {
+                    Result.failure(t)
+                }
+
+                synchronized(lock) {
+                    val treatAsManual = escalatedToManual
+                    escalatedToManual = false
+                    checkJob = null
+                    outcome
+                        .onSuccess { result ->
+                            when (result) {
+                                is UpdateCheckResult.UpdateAvailable -> {
+                                    stateFlow.value = UpdateUiState.Available(result.release)
+                                }
+                                is UpdateCheckResult.UpToDate -> {
+                                    if (treatAsManual) {
+                                        stateFlow.value = UpdateUiState.UpToDate
+                                    }
+                                }
+                            }
+                        }
+                        .onFailure { err ->
+                            if (treatAsManual) {
+                                stateFlow.value = UpdateUiState.Error(
+                                    message = err.message ?: "Unable to check for updates",
+                                )
+                            }
+                        }
+                }
+            }
+            checkJob = launchedJob
+            launchedJob.invokeOnCompletion { cause ->
+                if (cause != null) {
+                    synchronized(lock) {
+                        if (checkJob === launchedJob) {
+                            escalatedToManual = false
+                            checkJob = null
+                        }
+                    }
+                }
+            }
+            launchedJob.start()
+        }
     }
 }
