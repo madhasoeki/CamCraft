@@ -23,6 +23,7 @@ import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.MeteringPoint
 import androidx.camera.core.Preview
 import androidx.camera.core.SurfaceOrientedMeteringPointFactory
+import androidx.camera.core.SurfaceRequest
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -164,18 +165,34 @@ internal class ActiveEncoderSlot(
 
     @Volatile
     private var released = false
+    @Volatile
+    private var teardownFinished = false
+    @Volatile
+    private var releaseFailed = false
     private val releaseListeners = mutableListOf<() -> Unit>()
 
     val isReleased: Boolean
         get() = released
 
+    val isTeardownFinished: Boolean
+        get() = teardownFinished
+
+    val isReleaseFailed: Boolean
+        get() = releaseFailed
+
+    fun hasPendingResolutionAdjustmentUnreported(): Boolean =
+        pendingResolutionAdjustment && !resolutionAdjustmentOutcomeReported.get()
+
+    fun isResolutionAdjustmentReported(): Boolean = resolutionAdjustmentOutcomeReported.get()
+
     fun markResolutionAdjustmentReported(): Boolean =
         pendingResolutionAdjustment && resolutionAdjustmentOutcomeReported.compareAndSet(false, true)
 
     fun awaitReleased(timeoutMs: Long): Boolean {
-        if (released) return true
+        if (teardownFinished) return released
         return try {
             releasedLatch.await(timeoutMs, TimeUnit.MILLISECONDS)
+            released
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
             released
@@ -183,16 +200,19 @@ internal class ActiveEncoderSlot(
     }
 
     /**
-     * Registers a one-shot completion hook invoked when [markReleased] finishes.
-     * If already released, invokes [listener] immediately.
+     * Registers a one-shot completion hook invoked only when codec release succeeds.
+     * If already released successfully, invokes [listener] immediately; if teardown
+     * completed with a native release failure, does not invoke [listener].
      */
     fun onReleased(listener: () -> Unit) {
         val runImmediately = synchronized(releaseLock) {
-            if (released) {
-                true
-            } else {
-                releaseListeners.add(listener)
-                false
+            when {
+                released -> true
+                teardownFinished -> return
+                else -> {
+                    releaseListeners.add(listener)
+                    false
+                }
             }
         }
         if (runImmediately) {
@@ -201,13 +221,22 @@ internal class ActiveEncoderSlot(
     }
 
     fun markReleased() {
+        markReleaseFinished(codecReleased = true)
+    }
+
+    fun markReleaseFinished(codecReleased: Boolean) {
         val listeners = synchronized(releaseLock) {
-            if (released) {
+            if (teardownFinished) {
                 return
             }
-            released = true
+            teardownFinished = true
+            if (codecReleased) {
+                released = true
+            } else {
+                releaseFailed = true
+            }
             releasedLatch.countDown()
-            val copy = releaseListeners.toList()
+            val copy = if (codecReleased) releaseListeners.toList() else emptyList()
             releaseListeners.clear()
             copy
         }
@@ -314,6 +343,14 @@ class CameraStreamManager(
     private var activeSessionId: Long = 0L
     @Volatile
     private var lastAppliedConfigSeq: Long = -1L
+
+    // Requested camera geometry & adjustment lifecycle under surfaceLock
+    private var requestedCameraId: String = "0"
+    private var requestedWidth: Int = 1920
+    private var requestedHeight: Int = 1080
+    private var requestedFps: Int = 60
+    private var pipelineHealthyOrStarting: Boolean = false
+    private var resolutionAdjustmentInFlight: Boolean = false
 
     private var encoderPreview: Preview? = null
     private var uiPreview: Preview? = null
@@ -436,12 +473,21 @@ class CameraStreamManager(
         height: Int,
         fps: Int,
         bitrateKbps: Int,
+        zoomRatio: Float? = null,
+        exposureEv: Float? = null,
+        torchOn: Boolean? = null,
     ) {
         val generation = synchronized(surfaceLock) {
             if (isReleased.get()) return
             activeSessionId = sessionId
             lastAppliedConfigSeq = configSeq
             isStreaming = true
+            requestedCameraId = cameraId
+            requestedWidth = width
+            requestedHeight = height
+            requestedFps = fps
+            pipelineHealthyOrStarting = true
+            resolutionAdjustmentInFlight = false
             activeSlot?.isRetiring = true
             pipelineGeneration.incrementAndGet()
         }
@@ -452,6 +498,9 @@ class CameraStreamManager(
             if (!shouldStart) {
                 return@executeOnEncoderExecutor
             }
+            zoomRatio?.let { targetZoomRatio = it }
+            exposureEv?.let { targetExposureEv = it }
+            torchOn?.let { targetTorch = it }
             currentCameraId = cameraId
             currentWidth = width
             currentHeight = height
@@ -488,6 +537,31 @@ class CameraStreamManager(
         bitrateKbps = bitrateKbps,
     )
 
+    internal fun willRestartPipelineForRebind(
+        sessionId: Long,
+        cameraId: String,
+        width: Int,
+        height: Int,
+        fps: Int,
+    ): Boolean = synchronized(surfaceLock) {
+        shouldAdvanceCameraConfigForRebind(
+            isReleased = isReleased.get(),
+            isStreaming = isStreaming,
+            activeSessionId = activeSessionId,
+            requestSessionId = sessionId,
+            pipelineHealthyOrStarting = pipelineHealthyOrStarting,
+            resolutionAdjustmentInFlight = resolutionAdjustmentInFlight,
+            requestedCameraId = requestedCameraId,
+            requestedWidth = requestedWidth,
+            requestedHeight = requestedHeight,
+            requestedFps = requestedFps,
+            newCameraId = cameraId,
+            newWidth = width,
+            newHeight = height,
+            newFps = fps,
+        )
+    }
+
     private fun isCurrentSessionGenerationLocked(sessionId: Long, generation: Long): Boolean =
         shouldActivateLifecycleOnBind(
             isReleased = isReleased.get(),
@@ -509,6 +583,8 @@ class CameraStreamManager(
             isStreaming = false
             activeSessionId = 0L
             lastAppliedConfigSeq = -1L
+            pipelineHealthyOrStarting = false
+            resolutionAdjustmentInFlight = false
             activeSlot?.isRetiring = true
             pipelineGeneration.incrementAndGet()
         }
@@ -552,7 +628,7 @@ class CameraStreamManager(
             uiPreview = null
             activeCamera = null
             currentFpsPlan = null
-            val waitTarget = detached ?: lastDetachedSlot?.takeIf { !it.isReleased }
+            val waitTarget = detached ?: lastDetachedSlot?.takeIf { !it.isTeardownFinished }
             Triple(detached, owned, waitTarget)
         }
 
@@ -613,10 +689,10 @@ class CameraStreamManager(
         }
         val releaseTask = Runnable {
             try {
-                encoder.release(onReleased = slot::markReleased)
+                encoder.releaseWithResult(onTeardownCompleted = slot::markReleaseFinished)
             } catch (e: Throwable) {
                 Log.w(TAG, "Unexpected error requesting encoder release: ${e.message}")
-                slot.markReleased()
+                slot.markReleaseFinished(codecReleased = false)
             }
         }
         try {
@@ -802,6 +878,9 @@ class CameraStreamManager(
      * Dynamically reconfigures resolution, framerate, bitrate, or switches lens.
      * Bitrate-only updates adjust [MediaCodec] dynamically without restarting CameraX;
      * camera/geometry/FPS changes restart the encoder so fresh `VIDEO_CONFIG` + IDR are sent.
+     *
+     * Optional [zoomRatio], [exposureEv], and [torchOn] are applied atomically on [encoderExecutor]
+     * in the same ordered camera task as this rebind.
      */
     fun rebindCamera(
         sessionId: Long,
@@ -812,8 +891,48 @@ class CameraStreamManager(
         height: Int,
         fps: Int,
         bitrateKbps: Int,
+        zoomRatio: Float? = null,
+        exposureEv: Float? = null,
+        torchOn: Boolean? = null,
     ) {
         if (isReleased.get()) return
+        synchronized(surfaceLock) {
+            if (!shouldApplyRebind(
+                    isReleased = isReleased.get(),
+                    isStreaming = isStreaming,
+                    activeSessionId = activeSessionId,
+                    requestSessionId = sessionId,
+                    configSeq = configSeq,
+                    lastAppliedConfigSeq = lastAppliedConfigSeq,
+                )
+            ) {
+                return
+            }
+            if (shouldAdvanceCameraConfigForRebind(
+                    isReleased = false,
+                    isStreaming = true,
+                    activeSessionId = activeSessionId,
+                    requestSessionId = sessionId,
+                    pipelineHealthyOrStarting = pipelineHealthyOrStarting,
+                    resolutionAdjustmentInFlight = resolutionAdjustmentInFlight,
+                    requestedCameraId = requestedCameraId,
+                    requestedWidth = requestedWidth,
+                    requestedHeight = requestedHeight,
+                    requestedFps = requestedFps,
+                    newCameraId = cameraId,
+                    newWidth = width,
+                    newHeight = height,
+                    newFps = fps,
+                )
+            ) {
+                requestedCameraId = cameraId
+                requestedWidth = width
+                requestedHeight = height
+                requestedFps = fps
+                pipelineHealthyOrStarting = true
+                resolutionAdjustmentInFlight = false
+            }
+        }
 
         executeOnEncoderExecutor {
             val currentSlot = synchronized(surfaceLock) {
@@ -832,7 +951,14 @@ class CameraStreamManager(
                 activeSlot
             }
 
-            val cameraChanged = cameraId != currentCameraId
+            zoomRatio?.let { targetZoomRatio = it }
+            exposureEv?.let { targetExposureEv = it }
+            torchOn?.let { targetTorch = it }
+
+            val configChanged = cameraConfigId != 0L &&
+                currentSlot != null &&
+                currentSlot.cameraConfigId != cameraConfigId
+            val cameraChanged = cameraId != currentCameraId || configChanged
             val geometryOrFpsChanged = width != currentWidth ||
                 height != currentHeight ||
                 fps != currentFps
@@ -868,8 +994,13 @@ class CameraStreamManager(
                     fps = fps,
                     bitrateKbps = bitrateKbps,
                 )
-            } else if (decision.needsBitrateUpdate) {
-                currentSlot?.encoder?.updateBitrate(bitrateKbps)
+            } else {
+                zoomRatio?.let(::setZoomRatio)
+                exposureEv?.let(::setExposureEv)
+                torchOn?.let(::setTorch)
+                if (decision.needsBitrateUpdate) {
+                    currentSlot?.encoder?.updateBitrate(bitrateKbps)
+                }
             }
         }
     }
@@ -889,6 +1020,7 @@ class CameraStreamManager(
             if (!isCurrentSessionGenerationLocked(expectedSessionId, expectedGeneration)) {
                 return
             }
+            resolutionAdjustmentInFlight = true
             pipelineGeneration.incrementAndGet()
         }
         currentWidth = selectedWidth
@@ -958,6 +1090,9 @@ class CameraStreamManager(
                         return@H264SurfaceEncoder
                     }
                     onVideoPacketSlice(sessionId, packetType, flags, ptsUs, payload, offset, length)
+                    if (packetType == PacketType.VIDEO_FRAME) {
+                        maybePublishResolutionAdjustedOnFirstFrame(capturedSlot)
+                    }
                 },
             )
             val newSlot = ActiveEncoderSlot(
@@ -1017,10 +1152,15 @@ class CameraStreamManager(
                     expectedGeneration = generation,
                     hasRetriedAfterRelease = hasRetriedAfterRelease,
                     priorSlotAlreadyReleased = priorSlotAlreadyReleased,
+                    priorSlotReleaseFailed = retiringSlot.isReleaseFailed,
                 )
                 val failNow = !retry &&
                     markResolutionAdjusted &&
                     isCurrentSessionGenerationLocked(sessionId, generation)
+                if (failNow) {
+                    pipelineHealthyOrStarting = false
+                    resolutionAdjustmentInFlight = false
+                }
                 retry to failNow
             }
             if (shouldScheduleRetry && retiringSlot != null) {
@@ -1072,6 +1212,38 @@ class CameraStreamManager(
         }
     }
 
+    private fun maybePublishResolutionAdjustedOnFirstFrame(slot: ActiveEncoderSlot) {
+        if (!slot.hasPendingResolutionAdjustmentUnreported()) return
+        val shouldPublish = synchronized(surfaceLock) {
+            val eligible = shouldPublishResolutionOnVideoPacket(
+                packetType = PacketType.VIDEO_FRAME,
+                isReleased = isReleased.get(),
+                isStreaming = isStreaming,
+                activeSessionId = activeSessionId,
+                snapshotSessionId = slot.sessionId,
+                activeSlotMatchesSnapshot = activeSlot === slot,
+                snapshotRetiring = slot.isRetiring,
+                pendingResolutionAdjustment = slot.pendingResolutionAdjustment,
+            ) && slot.markResolutionAdjustmentReported()
+            if (eligible) {
+                requestedWidth = slot.width
+                requestedHeight = slot.height
+                resolutionAdjustmentInFlight = false
+                pipelineHealthyOrStarting = true
+            }
+            eligible
+        }
+        if (shouldPublish) {
+            onResolutionAdjusted?.invoke(
+                slot.sessionId,
+                slot.cameraConfigId,
+                slot.cameraId,
+                slot.width,
+                slot.height,
+            )
+        }
+    }
+
     private fun handleResolutionAdjustmentFailureIfPending(
         snapshot: BindSnapshot,
         reason: String,
@@ -1084,7 +1256,7 @@ class CameraStreamManager(
         reason: String,
     ) {
         val shouldNotifyFailed = synchronized(surfaceLock) {
-            shouldPublishResolutionAdjustment(
+            val publishFailure = shouldPublishResolutionAdjustment(
                 isReleased = isReleased.get(),
                 isStreaming = isStreaming,
                 activeSessionId = activeSessionId,
@@ -1093,6 +1265,11 @@ class CameraStreamManager(
                 snapshotRetiring = slot.isRetiring,
                 pendingResolutionAdjustment = slot.pendingResolutionAdjustment,
             ) && slot.markResolutionAdjustmentReported()
+            if (publishFailure) {
+                pipelineHealthyOrStarting = false
+                resolutionAdjustmentInFlight = false
+            }
+            publishFailure
         }
         if (!shouldNotifyFailed) return
 
@@ -1292,15 +1469,19 @@ class CameraStreamManager(
                 }
                 when (decision) {
                     SurfaceResolutionDecision.PROVIDE_SURFACE -> {
-                        var surfaceProvided = false
                         try {
                             request.provideSurface(snapshot.surface, cameraExecutor) { result ->
                                 Log.d(TAG, "Encoder surface provider result: ${result.resultCode}")
                                 if (snapshot.slot.surfaceTracker.onSurfaceReturned()) {
                                     finalizeSlotRetirement(snapshot.slot)
                                 }
+                                if (isSurfaceResultRejection(result.resultCode)) {
+                                    handleResolutionAdjustmentFailureIfPending(
+                                        snapshot = snapshot,
+                                        reason = "Encoder surface rejected by CameraX (resultCode=${result.resultCode}) for ${snapshot.width}x${snapshot.height}",
+                                    )
+                                }
                             }
-                            surfaceProvided = true
                         } catch (e: Throwable) {
                             Log.w(TAG, "provideSurface failed unexpectedly: ${e.message}")
                             if (snapshot.slot.surfaceTracker.onSurfaceReturned()) {
@@ -1310,28 +1491,6 @@ class CameraStreamManager(
                                 snapshot = snapshot,
                                 reason = "Encoder surface acceptance failed for ${snapshot.width}x${snapshot.height}: ${e.message}",
                             )
-                        }
-                        if (surfaceProvided) {
-                            val shouldPublish = synchronized(surfaceLock) {
-                                shouldPublishResolutionAdjustment(
-                                    isReleased = isReleased.get(),
-                                    isStreaming = isStreaming,
-                                    activeSessionId = activeSessionId,
-                                    snapshotSessionId = snapshot.sessionId,
-                                    activeSlotMatchesSnapshot = activeSlot === snapshot.slot,
-                                    snapshotRetiring = snapshot.slot.isRetiring,
-                                    pendingResolutionAdjustment = snapshot.slot.pendingResolutionAdjustment,
-                                ) && snapshot.slot.markResolutionAdjustmentReported()
-                            }
-                            if (shouldPublish) {
-                                onResolutionAdjusted?.invoke(
-                                    snapshot.sessionId,
-                                    snapshot.cameraConfigId,
-                                    snapshot.cameraId,
-                                    snapshot.width,
-                                    snapshot.height,
-                                )
-                            }
                         }
                     }
                     SurfaceResolutionDecision.RECONFIGURE_ENCODER -> {
@@ -1764,6 +1923,8 @@ class CameraStreamManager(
             isStreaming = false
             activeSessionId = 0L
             lastAppliedConfigSeq = -1L
+            pipelineHealthyOrStarting = false
+            resolutionAdjustmentInFlight = false
             activeSlot?.isRetiring = true
             lastDetachedSlot = null
             pipelineGeneration.incrementAndGet()
@@ -2056,8 +2217,10 @@ class CameraStreamManager(
             expectedGeneration: Long,
             hasRetriedAfterRelease: Boolean,
             priorSlotAlreadyReleased: Boolean,
+            priorSlotReleaseFailed: Boolean = false,
         ): Boolean = !hasRetriedAfterRelease &&
             !priorSlotAlreadyReleased &&
+            !priorSlotReleaseFailed &&
             shouldActivateLifecycleOnBind(
                 isReleased = isReleased,
                 isStreaming = isStreaming,
@@ -2192,6 +2355,57 @@ class CameraStreamManager(
             snapshotRetiring = snapshotRetiring,
             pendingResolutionAdjustment = pendingResolutionAdjustment,
         ) && surfaceValid && (requestWidth != snapshotWidth || requestHeight != snapshotHeight)
+
+        internal fun shouldPublishResolutionOnVideoPacket(
+            packetType: PacketType,
+            isReleased: Boolean,
+            isStreaming: Boolean,
+            activeSessionId: Long,
+            snapshotSessionId: Long,
+            activeSlotMatchesSnapshot: Boolean,
+            snapshotRetiring: Boolean,
+            pendingResolutionAdjustment: Boolean,
+        ): Boolean = packetType == PacketType.VIDEO_FRAME &&
+            shouldPublishResolutionAdjustment(
+                isReleased = isReleased,
+                isStreaming = isStreaming,
+                activeSessionId = activeSessionId,
+                snapshotSessionId = snapshotSessionId,
+                activeSlotMatchesSnapshot = activeSlotMatchesSnapshot,
+                snapshotRetiring = snapshotRetiring,
+                pendingResolutionAdjustment = pendingResolutionAdjustment,
+            )
+
+        internal fun isSurfaceResultRejection(resultCode: Int): Boolean =
+            resultCode != SurfaceRequest.Result.RESULT_SURFACE_USED_SUCCESSFULLY
+
+        internal fun shouldAdvanceCameraConfigForRebind(
+            isReleased: Boolean,
+            isStreaming: Boolean,
+            activeSessionId: Long,
+            requestSessionId: Long,
+            pipelineHealthyOrStarting: Boolean,
+            resolutionAdjustmentInFlight: Boolean,
+            requestedCameraId: String,
+            requestedWidth: Int,
+            requestedHeight: Int,
+            requestedFps: Int,
+            newCameraId: String,
+            newWidth: Int,
+            newHeight: Int,
+            newFps: Int,
+        ): Boolean {
+            if (isReleased || !isStreaming || requestSessionId == 0L || activeSessionId != requestSessionId) {
+                return true
+            }
+            if (!pipelineHealthyOrStarting || resolutionAdjustmentInFlight) {
+                return true
+            }
+            return requestedCameraId != newCameraId ||
+                requestedWidth != newWidth ||
+                requestedHeight != newHeight ||
+                requestedFps != newFps
+        }
 
         internal fun shouldFallbackFullRebindAfterUiFailure(encoderStillBound: Boolean): Boolean =
             !encoderStillBound

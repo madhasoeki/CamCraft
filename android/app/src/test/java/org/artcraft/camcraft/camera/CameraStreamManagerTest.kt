@@ -1,5 +1,6 @@
 package org.artcraft.camcraft.camera
 
+import androidx.camera.core.SurfaceRequest
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
@@ -7,6 +8,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
+import org.artcraft.camcraft.protocol.PacketType
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -1140,6 +1142,170 @@ class CameraStreamManagerTest {
                 snapshotHeight = 720,
                 requestWidth = 640,
                 requestHeight = 480,
+            ),
+        )
+    }
+
+    @Test
+    fun resolutionAdjustmentSuccessPublishesOnlyOnFirstVideoFrameAndRejectsInvalidSurfaceResult() {
+        // VIDEO_CONFIG must NOT prematurely publish adjusted resolution before first VIDEO_FRAME arrives.
+        assertFalse(
+            CameraStreamManager.shouldPublishResolutionOnVideoPacket(
+                packetType = PacketType.VIDEO_CONFIG,
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 8L,
+                snapshotSessionId = 8L,
+                activeSlotMatchesSnapshot = true,
+                snapshotRetiring = false,
+                pendingResolutionAdjustment = true,
+            ),
+        )
+        // First VIDEO_FRAME for still-current replacement slot IS eligible to publish.
+        assertTrue(
+            CameraStreamManager.shouldPublishResolutionOnVideoPacket(
+                packetType = PacketType.VIDEO_FRAME,
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 8L,
+                snapshotSessionId = 8L,
+                activeSlotMatchesSnapshot = true,
+                snapshotRetiring = false,
+                pendingResolutionAdjustment = true,
+            ),
+        )
+        // Retiring or stale slot must NOT publish even on VIDEO_FRAME.
+        assertFalse(
+            CameraStreamManager.shouldPublishResolutionOnVideoPacket(
+                packetType = PacketType.VIDEO_FRAME,
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 9L,
+                snapshotSessionId = 8L,
+                activeSlotMatchesSnapshot = true,
+                snapshotRetiring = false,
+                pendingResolutionAdjustment = true,
+            ),
+        )
+
+        // Surface provider result listener distinguishes normal teardown vs CameraX rejection codes.
+        assertFalse(
+            CameraStreamManager.isSurfaceResultRejection(
+                SurfaceRequest.Result.RESULT_SURFACE_USED_SUCCESSFULLY,
+            ),
+        )
+        assertTrue(
+            CameraStreamManager.isSurfaceResultRejection(
+                SurfaceRequest.Result.RESULT_INVALID_SURFACE,
+            ),
+        )
+        assertTrue(
+            CameraStreamManager.isSurfaceResultRejection(
+                SurfaceRequest.Result.RESULT_REQUEST_CANCELLED,
+            ),
+        )
+    }
+
+    @Test
+    fun failedNativeCodecReleaseDoesNotMarkSlotReleasedOrTriggerRetry() {
+        val retiringSlot = ActiveEncoderSlot(
+            sessionId = 4L,
+            generation = 1L,
+            encoder = null,
+            width = 1920,
+            height = 1080,
+            fps = 60,
+            cameraId = "0",
+            surfaceTracker = EncoderSurfaceRetirementTracker(),
+            isRetiring = true,
+        )
+        val retryCalls = AtomicInteger(0)
+        retiringSlot.onReleased { retryCalls.incrementAndGet() }
+
+        retiringSlot.markReleaseFinished(codecReleased = false)
+
+        // awaitReleased returns immediately with false when native release failed.
+        assertFalse(retiringSlot.awaitReleased(2_000L))
+        assertTrue(retiringSlot.isTeardownFinished)
+        assertTrue(retiringSlot.isReleaseFailed)
+        assertFalse(retiringSlot.isReleased)
+        assertEquals(0, retryCalls.get())
+
+        // Late onReleased attachment after release failure must also stay silent.
+        retiringSlot.onReleased { retryCalls.incrementAndGet() }
+        assertEquals(0, retryCalls.get())
+
+        assertFalse(
+            CameraStreamManager.shouldRetryEncoderSetupAfterFailure(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 4L,
+                requestSessionId = 4L,
+                currentGeneration = 2L,
+                expectedGeneration = 2L,
+                hasRetriedAfterRelease = false,
+                priorSlotAlreadyReleased = false,
+                priorSlotReleaseFailed = retiringSlot.isReleaseFailed,
+            ),
+        )
+    }
+
+    @Test
+    fun shouldAdvanceCameraConfigForRebindDistinguishesSupersedingRetriesFromBitrateOnly() {
+        // Same camera/geometry while pipeline is healthy and no adjustment in flight -> preserve token.
+        assertFalse(
+            CameraStreamManager.shouldAdvanceCameraConfigForRebind(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 5L,
+                requestSessionId = 5L,
+                pipelineHealthyOrStarting = true,
+                resolutionAdjustmentInFlight = false,
+                requestedCameraId = "0",
+                requestedWidth = 1920,
+                requestedHeight = 1080,
+                requestedFps = 60,
+                newCameraId = "0",
+                newWidth = 1920,
+                newHeight = 1080,
+                newFps = 60,
+            ),
+        )
+        // Superseding retry during in-flight negotiation OR after pipeline failure -> advance token.
+        assertTrue(
+            CameraStreamManager.shouldAdvanceCameraConfigForRebind(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 5L,
+                requestSessionId = 5L,
+                pipelineHealthyOrStarting = true,
+                resolutionAdjustmentInFlight = true,
+                requestedCameraId = "0",
+                requestedWidth = 1920,
+                requestedHeight = 1080,
+                requestedFps = 60,
+                newCameraId = "0",
+                newWidth = 1920,
+                newHeight = 1080,
+                newFps = 60,
+            ),
+        )
+        assertTrue(
+            CameraStreamManager.shouldAdvanceCameraConfigForRebind(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 5L,
+                requestSessionId = 5L,
+                pipelineHealthyOrStarting = false,
+                resolutionAdjustmentInFlight = false,
+                requestedCameraId = "0",
+                requestedWidth = 1920,
+                requestedHeight = 1080,
+                requestedFps = 60,
+                newCameraId = "0",
+                newWidth = 1920,
+                newHeight = 1080,
+                newFps = 60,
             ),
         )
     }

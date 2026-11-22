@@ -47,6 +47,7 @@ import kotlinx.coroutines.asExecutor
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -520,16 +521,18 @@ class CamCraftStreamService : Service() {
         val session = resolveActiveSessionForPacket(activeSession, sessionId) ?: return false
         return try {
             synchronized(session.outputLock) {
-                CcftPacket.writePacket(
-                    output = session.output,
-                    type = packetType,
-                    flags = flags,
-                    ptsUs = ptsUs,
-                    payload = payload,
-                    offset = offset,
-                    length = length,
-                    flush = true,
-                )
+                session.withTrackedWrite {
+                    CcftPacket.writePacket(
+                        output = session.output,
+                        type = packetType,
+                        flags = flags,
+                        ptsUs = ptsUs,
+                        payload = payload,
+                        offset = offset,
+                        length = length,
+                        flush = true,
+                    )
+                }
             }
             true
         } catch (e: IOException) {
@@ -538,6 +541,7 @@ class CamCraftStreamService : Service() {
                 if (activeSession === session) {
                     activeSession = null
                 }
+                controlCoordinator.clearActiveSessionIfCurrent(session)
             }
             session.close()
             false
@@ -598,7 +602,7 @@ class CamCraftStreamService : Service() {
     ) {
         if (isStopping.get()) return
         Log.w(TAG, "Resolution adjustment failed (session=$sessionId, config=$cameraConfigId, cam=$cameraId): $reason")
-        controlCoordinator.enqueueAckIfSessionOwned(
+        val ownedAndNotified = controlCoordinator.enqueueAckIfSessionOwned(
             expectedSessionId = sessionId,
             expectedCameraConfigId = cameraConfigId,
             expectedCameraId = cameraId,
@@ -613,10 +617,20 @@ class CamCraftStreamService : Service() {
                 null
             }
         }
+        if (ownedAndNotified) {
+            applyVideoPipelineFailureIfActive(
+                lock = lifecycleLock,
+                isStopping = { isStopping.get() },
+                isSessionActive = { activeSession?.sessionId == sessionId },
+                reason = reason,
+                serviceState = _serviceState,
+                onUpdateNotification = ::updateNotification,
+            )
+        }
     }
 
     private fun publishConnectedNotificationFromCurrentState(expectedSessionId: Long) {
-        publishConnectedNotificationFromSnapshot(
+        restoreConnectedStatusIfRecovering(
             lock = lifecycleLock,
             isStopping = { isStopping.get() },
             isSessionActive = { activeSession?.sessionId == expectedSessionId },
@@ -638,7 +652,11 @@ class CamCraftStreamService : Service() {
 
     private fun onFrameSent(packetType: PacketType) {
         if (packetType != PacketType.VIDEO_FRAME) return
-        if (isStopping.get() || activeSession == null) return
+        val session = activeSession
+        if (isStopping.get() || session == null) return
+        if (_serviceState.value.status == StreamConnectionStatus.ERROR) {
+            publishConnectedNotificationFromCurrentState(expectedSessionId = session.sessionId)
+        }
         totalFramesSent++
         windowFrames++
 
@@ -888,6 +906,7 @@ class CamCraftStreamService : Service() {
                     handleAudioPacketFromEngine(capturedSessionId, packetType, ptsUs, payload, length)
                 }
                 var ackWriterJob: Job? = null
+                var writeWatchdogJob: Job? = null
 
                 try {
                     // 1. Send and flush CONTROL_HELLO (0x10) BEFORE starting ackWriterJob so any ACKs
@@ -895,9 +914,37 @@ class CamCraftStreamService : Service() {
                     val hello = createDeviceHello(_serviceState.value.activeState, this)
                     val helloPacket = CcftPacket.controlHello(System.nanoTime() / 1_000L, hello)
                     synchronized(sessionHandle.outputLock) {
-                        helloPacket.encodeTo(sessionHandle.output, flush = true)
+                        sessionHandle.withTrackedWrite {
+                            helloPacket.encodeTo(sessionHandle.output, flush = true)
+                        }
                     }
                     Log.i(TAG, "Sent CONTROL_HELLO to $clientLabel (session=$sessionId)")
+
+                    writeWatchdogJob = serviceScope.launch {
+                        while (isActive && !isStopping.get() && !sessionHandle.isClosed) {
+                            delay(WRITE_WATCHDOG_POLL_MS)
+                            val stalled = checkAndCloseStalledSessionWrite(
+                                session = sessionHandle,
+                                nowNs = System.nanoTime(),
+                                timeoutNs = WRITE_STALL_TIMEOUT_MS * 1_000_000L,
+                                beforeClose = {
+                                    synchronized(lifecycleLock) {
+                                        if (activeSession === sessionHandle) {
+                                            activeSession = null
+                                        }
+                                        controlCoordinator.clearActiveSessionIfCurrent(sessionHandle)
+                                    }
+                                },
+                            )
+                            if (stalled) {
+                                Log.w(
+                                    TAG,
+                                    "Closed stalled client session=$sessionId after write blocked > ${WRITE_STALL_TIMEOUT_MS}ms",
+                                )
+                                break
+                            }
+                        }
+                    }
 
                     ackWriterJob = serviceScope.launch {
                         for (ack in sessionHandle.ackChannel) {
@@ -910,7 +957,9 @@ class CamCraftStreamService : Service() {
                                     ack = ack,
                                 )
                                 synchronized(sessionHandle.outputLock) {
-                                    packet.encodeTo(sessionHandle.output, flush = true)
+                                    sessionHandle.withTrackedWrite {
+                                        packet.encodeTo(sessionHandle.output, flush = true)
+                                    }
                                 }
                             } catch (e: IOException) {
                                 Log.w(TAG, "Failed writing CONTROL_ACK to client (session=$sessionId): ${e.message}")
@@ -939,6 +988,9 @@ class CamCraftStreamService : Service() {
                                 height = activeState.height,
                                 fps = activeState.fps,
                                 bitrateKbps = activeState.bitrateKbps,
+                                zoomRatio = activeState.zoomRatio,
+                                exposureEv = activeState.exposureEv,
+                                torchOn = activeState.torchOn,
                             )
                         }
                     }
@@ -947,16 +999,18 @@ class CamCraftStreamService : Service() {
                     var sentCachedConfig = false
                     synchronized(sessionHandle.outputLock) {
                         cameraStreamManager?.cachedConfigForSession(sessionHandle.sessionId)?.let { spsPps ->
-                            CcftPacket.writePacket(
-                                output = sessionHandle.output,
-                                type = PacketType.VIDEO_CONFIG,
-                                flags = CcftFlags.NONE,
-                                ptsUs = System.nanoTime() / 1_000L,
-                                payload = spsPps,
-                                offset = 0,
-                                length = spsPps.size,
-                                flush = true,
-                            )
+                            sessionHandle.withTrackedWrite {
+                                CcftPacket.writePacket(
+                                    output = sessionHandle.output,
+                                    type = PacketType.VIDEO_CONFIG,
+                                    flags = CcftFlags.NONE,
+                                    ptsUs = System.nanoTime() / 1_000L,
+                                    payload = spsPps,
+                                    offset = 0,
+                                    length = spsPps.size,
+                                    flush = true,
+                                )
+                            }
                             sentCachedConfig = true
                         }
                     }
@@ -1013,7 +1067,11 @@ class CamCraftStreamService : Service() {
                     sessionHandle.close()
                     closeTransportBeforeStreams(closeTransport, inputStream, outputStream)
                     withContext(NonCancellable) {
+                        writeWatchdogJob?.cancel()
                         ackWriterJob?.cancel()
+                        withTimeoutOrNull(1_000L) {
+                            writeWatchdogJob?.join()
+                        }
                         withTimeoutOrNull(1_000L) {
                             ackWriterJob?.join()
                         }
@@ -1098,7 +1156,9 @@ class CamCraftStreamService : Service() {
                     // Respond immediately with PONG mirroring ptsUs
                     val pong = CcftPacket.heartbeatPong(packet.header.ptsUs)
                     synchronized(sessionHandle.outputLock) {
-                        pong.encodeTo(sessionHandle.output, flush = true)
+                        sessionHandle.withTrackedWrite {
+                            pong.encodeTo(sessionHandle.output, flush = true)
+                        }
                     }
                 }
                 PacketType.CONTROL_CMD -> {
@@ -1146,10 +1206,17 @@ class CamCraftStreamService : Service() {
                     controlCoordinator.updateIfSessionOwned(
                         expectedSessionId = sessionHandle.sessionId,
                         camerasOverride = cameras,
+                        shouldAdvanceCameraConfig = { previous, next ->
+                            isCameraGeometryChanged(previous, next) ||
+                                cameraStreamManager?.willRestartPipelineForRebind(
+                                    sessionId = sessionHandle.sessionId,
+                                    cameraId = next.cameraId,
+                                    width = next.width,
+                                    height = next.height,
+                                    fps = next.fps,
+                                ) == true
+                        },
                         onCommittedLocked = { next, seq, configId ->
-                            cameraStreamManager?.setZoomRatio(next.zoomRatio)
-                            cameraStreamManager?.setExposureEv(next.exposureEv)
-                            cameraStreamManager?.setTorch(next.torchOn)
                             cameraStreamManager?.rebindCamera(
                                 sessionId = sessionHandle.sessionId,
                                 configSeq = seq,
@@ -1159,6 +1226,9 @@ class CamCraftStreamService : Service() {
                                 height = next.height,
                                 fps = next.fps,
                                 bitrateKbps = next.bitrateKbps,
+                                zoomRatio = next.zoomRatio,
+                                exposureEv = next.exposureEv,
+                                torchOn = next.torchOn,
                             )
                         },
                     ) { cur ->
@@ -1244,16 +1314,18 @@ class CamCraftStreamService : Service() {
                 is ControlCmd.RequestKeyframe -> {
                     synchronized(sessionHandle.outputLock) {
                         cameraStreamManager?.cachedConfigForSession(sessionHandle.sessionId)?.let { spsPps ->
-                            CcftPacket.writePacket(
-                                output = sessionHandle.output,
-                                type = PacketType.VIDEO_CONFIG,
-                                flags = CcftFlags.NONE,
-                                ptsUs = System.nanoTime() / 1_000L,
-                                payload = spsPps,
-                                offset = 0,
-                                length = spsPps.size,
-                                flush = true,
-                            )
+                            sessionHandle.withTrackedWrite {
+                                CcftPacket.writePacket(
+                                    output = sessionHandle.output,
+                                    type = PacketType.VIDEO_CONFIG,
+                                    flags = CcftFlags.NONE,
+                                    ptsUs = System.nanoTime() / 1_000L,
+                                    payload = spsPps,
+                                    offset = 0,
+                                    length = spsPps.size,
+                                    flush = true,
+                                )
+                            }
                         }
                     }
                     cameraStreamManager?.requestKeyFrame(sessionHandle.sessionId)
@@ -1276,15 +1348,14 @@ class CamCraftStreamService : Service() {
         val cameras = _serviceState.value.cameras.ifEmpty { CameraEnumerator.enumerateCameras(this) }
         if (cameras.isEmpty()) return
 
+        var targetSessionId = 0L
         controlCoordinator.updateWithCustomAckAndConfig(
             camerasOverride = cameras,
             ackBuilder = { next -> ControlAck.success(next) },
             onCommittedLocked = { next, seq, configId ->
-                cameraStreamManager?.setZoomRatio(next.zoomRatio)
-                cameraStreamManager?.setExposureEv(next.exposureEv)
-                cameraStreamManager?.setTorch(next.torchOn)
+                targetSessionId = controlCoordinator.currentActiveSessionId()
                 cameraStreamManager?.rebindCamera(
-                    sessionId = controlCoordinator.currentActiveSessionId(),
+                    sessionId = targetSessionId,
                     configSeq = seq,
                     cameraConfigId = configId,
                     cameraId = next.cameraId,
@@ -1292,12 +1363,18 @@ class CamCraftStreamService : Service() {
                     height = next.height,
                     fps = next.fps,
                     bitrateKbps = next.bitrateKbps,
+                    zoomRatio = next.zoomRatio,
+                    exposureEv = next.exposureEv,
+                    torchOn = next.torchOn,
                 )
             },
         ) { cur ->
             val currentIdx = cameras.indexOfFirst { it.id == cur.cameraId }
             val nextCam = cameras[(currentIdx + 1) % cameras.size]
             clampActiveStateForCamera(cur.copy(cameraId = nextCam.id), nextCam)
+        }
+        if (targetSessionId != 0L) {
+            publishConnectedNotificationFromCurrentState(expectedSessionId = targetSessionId)
         }
     }
 
@@ -1414,6 +1491,8 @@ class CamCraftStreamService : Service() {
         const val NOTIFICATION_ID = 9876
         private const val CLIENT_READ_TIMEOUT_MS = 10_000
         internal const val CONTROL_ACK_QUEUE_CAPACITY = 64
+        internal const val WRITE_STALL_TIMEOUT_MS = 2_500L
+        private const val WRITE_WATCHDOG_POLL_MS = 500L
 
         const val ACTION_START = "org.artcraft.camcraft.action.START"
         const val ACTION_START_USB_ACCESSORY = "org.artcraft.camcraft.action.START_USB_ACCESSORY"
@@ -1873,6 +1952,78 @@ class CamCraftStreamService : Service() {
             onUpdateNotification(buildConnectedNotificationText(clientAddress, snapshot.activeState))
             true
         }
+
+        internal fun applyVideoPipelineFailureIfActive(
+            lock: Any,
+            isStopping: () -> Boolean,
+            isSessionActive: () -> Boolean,
+            reason: String,
+            serviceState: MutableStateFlow<StreamServiceState>,
+            onUpdateNotification: (String) -> Unit,
+        ): Boolean = synchronized(lock) {
+            if (isStopping() || !isSessionActive()) {
+                return@synchronized false
+            }
+            val updated = serviceState.updateAndGet { state ->
+                if (state.status == StreamConnectionStatus.STOPPED || state.clientAddress.isNullOrBlank()) {
+                    state
+                } else {
+                    state.copy(
+                        status = StreamConnectionStatus.ERROR,
+                        currentFps = 0f,
+                        errorMessage = reason,
+                    )
+                }
+            }
+            val clientAddress = updated.clientAddress
+            if (updated.status != StreamConnectionStatus.ERROR || clientAddress.isNullOrBlank()) {
+                return@synchronized false
+            }
+            onUpdateNotification("Video unavailable ($clientAddress) • $reason")
+            true
+        }
+
+        internal fun restoreConnectedStatusIfRecovering(
+            lock: Any,
+            isStopping: () -> Boolean,
+            isSessionActive: () -> Boolean,
+            serviceState: MutableStateFlow<StreamServiceState>,
+            onUpdateNotification: (String) -> Unit,
+        ): Boolean = synchronized(lock) {
+            if (isStopping() || !isSessionActive()) {
+                return@synchronized false
+            }
+            val snapshot = serviceState.updateAndGet { state ->
+                if (state.status == StreamConnectionStatus.ERROR && !state.clientAddress.isNullOrBlank()) {
+                    state.copy(
+                        status = StreamConnectionStatus.CONNECTED,
+                        errorMessage = null,
+                    )
+                } else {
+                    state
+                }
+            }
+            val clientAddress = snapshot.clientAddress
+            if (snapshot.status != StreamConnectionStatus.CONNECTED || clientAddress.isNullOrBlank()) {
+                return@synchronized false
+            }
+            onUpdateNotification(buildConnectedNotificationText(clientAddress, snapshot.activeState))
+            true
+        }
+
+        internal inline fun checkAndCloseStalledSessionWrite(
+            session: ClientSessionHandle,
+            nowNs: Long,
+            timeoutNs: Long,
+            beforeClose: () -> Unit = {},
+        ): Boolean {
+            if (!session.isWriteStalled(nowNs, timeoutNs)) {
+                return false
+            }
+            beforeClose()
+            session.close()
+            return true
+        }
     }
 }
 
@@ -1997,12 +2148,37 @@ internal class ClientSessionHandle(
     val ackChannel = Channel<ControlAck>(ackQueueCapacity)
     private val closed = AtomicBoolean(false)
     private val transportClosed = AtomicBoolean(false)
+    private val activeWriteStartedNs = AtomicLong(0L)
 
     @Volatile
     var audioEngine: AudioStreamEngine? = null
 
     val isClosed: Boolean
         get() = closed.get()
+
+    fun markWriteStarted(nowNs: Long = System.nanoTime()) {
+        activeWriteStartedNs.set(if (nowNs == 0L) 1L else nowNs)
+    }
+
+    fun markWriteFinished() {
+        activeWriteStartedNs.set(0L)
+    }
+
+    inline fun <T> withTrackedWrite(block: () -> T): T {
+        markWriteStarted()
+        return try {
+            block()
+        } finally {
+            markWriteFinished()
+        }
+    }
+
+    fun isWriteStalled(nowNs: Long, timeoutNs: Long): Boolean {
+        if (closed.get()) return false
+        val startedNs = activeWriteStartedNs.get()
+        if (startedNs == 0L) return false
+        return (nowNs - startedNs) >= timeoutNs
+    }
 
     private fun closeTransportOnce() {
         if (transportClosed.compareAndSet(false, true)) {
@@ -2162,6 +2338,7 @@ internal class ControlStateAckCoordinator(
         expectedCameraConfigId: Long? = null,
         expectedCameraId: String? = null,
         advanceCameraConfigOnGeometryChange: Boolean = true,
+        shouldAdvanceCameraConfig: ((previous: ActiveCameraState, next: ActiveCameraState) -> Boolean)? = null,
         camerasOverride: List<CameraInfo>? = null,
         ackBuilder: (ActiveCameraState) -> ControlAck? = { next -> ControlAck.success(next) },
         onCommittedLocked: (ActiveCameraState, Long, Long) -> Unit = { _, _, _ -> },
@@ -2191,9 +2368,9 @@ internal class ControlStateAckCoordinator(
             )
         }.activeState
         val seq = ++commitSeq
-        if (advanceCameraConfigOnGeometryChange &&
-            CamCraftStreamService.isCameraGeometryChanged(previous, next)
-        ) {
+        val advanceConfig = shouldAdvanceCameraConfig?.invoke(previous, next)
+            ?: (advanceCameraConfigOnGeometryChange && CamCraftStreamService.isCameraGeometryChanged(previous, next))
+        if (advanceConfig) {
             cameraConfigId++
         }
         onCommittedLocked(next, seq, cameraConfigId)

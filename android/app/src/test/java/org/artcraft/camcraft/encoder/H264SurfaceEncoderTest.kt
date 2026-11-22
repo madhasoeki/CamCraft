@@ -200,4 +200,32 @@ class H264SurfaceEncoderTest {
         syncCoord.markTeardownCompleted()
         assertEquals(1, syncCalls.get())
     }
+
+    @Test
+    fun drainReleaseCoordinatorSeparatesCodecReleaseFailureFromConfirmedSuccess() {
+        val failedCoord = DrainReleaseCoordinator()
+        val successOnlyCalls = AtomicInteger(0)
+        val resultEvents = mutableListOf<Boolean>()
+
+        failedCoord.markDrainStarted()
+        failedCoord.onTeardownCompleted { successOnlyCalls.incrementAndGet() }
+        failedCoord.onTeardownResult { codecReleased -> resultEvents.add(codecReleased) }
+
+        assertFalse(failedCoord.requestRelease())
+        assertTrue(failedCoord.markDrainExited())
+        failedCoord.markTeardownCompleted(codecReleased = false)
+
+        // Teardown attempt completed, but codec release failed -> success-only listeners MUST NOT run.
+        assertTrue(failedCoord.isTeardownCompleted())
+        assertFalse(failedCoord.isTeardownSucceeded())
+        assertEquals(0, successOnlyCalls.get())
+        assertEquals(listOf(false), resultEvents)
+
+        // Late listeners observe the recorded failure status accurately without firing success hooks.
+        val lateResultEvents = mutableListOf<Boolean>()
+        failedCoord.onTeardownCompleted { successOnlyCalls.incrementAndGet() }
+        failedCoord.onTeardownResult { codecReleased -> lateResultEvents.add(codecReleased) }
+        assertEquals(0, successOnlyCalls.get())
+        assertEquals(listOf(false), lateResultEvents)
+    }
 }

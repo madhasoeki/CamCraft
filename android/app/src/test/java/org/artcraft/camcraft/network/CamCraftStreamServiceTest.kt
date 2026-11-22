@@ -953,8 +953,8 @@ class CamCraftStreamServiceTest {
             syncPendingClose.get()!!.invoke()
             assertEquals(1, syncTransportCloses.get())
 
-            // Extend the USB close race: pause A's dispatched closer, install USB attempt B while A's
-            // close is still in progress, then resume A's closer and assert B passes admission.
+            // Extend the USB close race: pause A's dispatched closer deterministically until B's
+            // admission is verified, with latch release and executor shutdown guaranteed in finally.
             val usbACloses = AtomicInteger(0)
             val usbBCloses = AtomicInteger(0)
             val attemptACloseEntered = CountDownLatch(1)
@@ -962,57 +962,65 @@ class CamCraftStreamServiceTest {
             val closeRaceExecutor = Executors.newSingleThreadExecutor { r ->
                 Thread(r, "test-usb-close-race").apply { isDaemon = true }
             }
-            val tracker = UsbSessionAttemptTracker<String> { descriptor ->
-                when (descriptor) {
-                    "usb-desc-A" -> {
-                        attemptACloseEntered.countDown()
-                        allowAttemptACloseFinish.await(2, TimeUnit.SECONDS)
-                        usbACloses.incrementAndGet()
+            try {
+                val tracker = UsbSessionAttemptTracker<String> { descriptor ->
+                    when (descriptor) {
+                        "usb-desc-A" -> {
+                            attemptACloseEntered.countDown()
+                            try {
+                                allowAttemptACloseFinish.await()
+                            } catch (_: InterruptedException) {
+                                Thread.currentThread().interrupt()
+                            }
+                            usbACloses.incrementAndGet()
+                        }
+                        "usb-desc-B" -> usbBCloses.incrementAndGet()
                     }
-                    "usb-desc-B" -> usbBCloses.incrementAndGet()
                 }
+                val attemptA = tracker.beginAttempt(accessoryTag = "acc-A")
+                assertTrue(tracker.attachDescriptor(attemptA, "usb-desc-A"))
+
+                val pendingClose = AtomicReference<(() -> Unit)?>(null)
+                val racingHandle = ClientSessionHandle(
+                    sessionId = 22L,
+                    output = ByteArrayOutputStream(),
+                    outputLock = Any(),
+                    closeTransport = {
+                        tracker.closeAttempt(attemptA)
+                    },
+                    ackQueueCapacity = 1,
+                    dispatchClose = { task -> pendingClose.set(task) },
+                )
+                assertTrue(racingHandle.enqueueAck(ControlAck.success(defaultActiveCameraState())))
+                assertFalse(racingHandle.enqueueAck(ControlAck.success(defaultActiveCameraState())))
+                assertNotNull(pendingClose.get())
+                assertEquals(0, usbACloses.get())
+
+                // Pause A's dispatched closer mid-close inside closeDescriptor, then install USB attempt B
+                // while A's close is still pending.
+                val closeFutureA = closeRaceExecutor.submit { pendingClose.get()!!.invoke() }
+                assertTrue(attemptACloseEntered.await(2, TimeUnit.SECONDS))
+                assertFalse(tracker.hasActiveNonClosingAttempt())
+
+                val attemptB = tracker.beginAttempt(accessoryTag = "acc-B")
+                assertTrue(tracker.attachDescriptor(attemptB, "usb-desc-B"))
+                assertTrue(tracker.isAttemptCurrent(attemptB, "usb-desc-B"))
+                assertTrue(tracker.hasActiveNonClosingAttempt())
+
+                // Resume A's closer after verifying B's admission; B must stay admitted and unclosed.
+                allowAttemptACloseFinish.countDown()
+                closeFutureA.get(2, TimeUnit.SECONDS)
+                racingHandle.close()
+
+                assertEquals(1, usbACloses.get())
+                assertEquals(0, usbBCloses.get())
+                assertFalse(tracker.isAttemptCurrent(attemptA, "usb-desc-A"))
+                assertTrue(tracker.isAttemptCurrent(attemptB, "usb-desc-B"))
+                assertTrue(tracker.hasActiveNonClosingAttempt())
+            } finally {
+                allowAttemptACloseFinish.countDown()
+                closeRaceExecutor.shutdownNow()
             }
-            val attemptA = tracker.beginAttempt(accessoryTag = "acc-A")
-            assertTrue(tracker.attachDescriptor(attemptA, "usb-desc-A"))
-
-            val pendingClose = AtomicReference<(() -> Unit)?>(null)
-            val racingHandle = ClientSessionHandle(
-                sessionId = 22L,
-                output = ByteArrayOutputStream(),
-                outputLock = Any(),
-                closeTransport = {
-                    tracker.closeAttempt(attemptA)
-                },
-                ackQueueCapacity = 1,
-                dispatchClose = { task -> pendingClose.set(task) },
-            )
-            assertTrue(racingHandle.enqueueAck(ControlAck.success(defaultActiveCameraState())))
-            assertFalse(racingHandle.enqueueAck(ControlAck.success(defaultActiveCameraState())))
-            assertNotNull(pendingClose.get())
-            assertEquals(0, usbACloses.get())
-
-            // Pause A's dispatched closer mid-close inside closeDescriptor, then install USB attempt B
-            // while A's close is still in progress.
-            val closeFutureA = closeRaceExecutor.submit { pendingClose.get()!!.invoke() }
-            assertTrue(attemptACloseEntered.await(2, TimeUnit.SECONDS))
-            assertFalse(tracker.hasActiveNonClosingAttempt())
-
-            val attemptB = tracker.beginAttempt(accessoryTag = "acc-B")
-            assertTrue(tracker.attachDescriptor(attemptB, "usb-desc-B"))
-            assertTrue(tracker.isAttemptCurrent(attemptB, "usb-desc-B"))
-            assertTrue(tracker.hasActiveNonClosingAttempt())
-
-            // Resume A's closer; B must continue passing admission and remain open.
-            allowAttemptACloseFinish.countDown()
-            closeFutureA.get(2, TimeUnit.SECONDS)
-            racingHandle.close()
-
-            assertEquals(1, usbACloses.get())
-            assertEquals(0, usbBCloses.get())
-            assertFalse(tracker.isAttemptCurrent(attemptA, "usb-desc-A"))
-            assertTrue(tracker.isAttemptCurrent(attemptB, "usb-desc-B"))
-            assertTrue(tracker.hasActiveNonClosingAttempt())
-            closeRaceExecutor.shutdownNow()
         } finally {
             ioExecutor.shutdownNow()
         }
@@ -1241,5 +1249,169 @@ class CamCraftStreamServiceTest {
             ),
         )
         assertEquals(1, publishedNotifications.size)
+    }
+
+    @Test
+    fun applyVideoPipelineFailureMarksErrorAndRestoreConnectedClearsOnRetry() {
+        val lock = Any()
+        val stopping = AtomicBoolean(false)
+        val sessionActive = AtomicBoolean(true)
+        val stateFlow = MutableStateFlow(
+            StreamServiceState(
+                status = StreamConnectionStatus.CONNECTED,
+                clientAddress = "USB Direct",
+                activeState = defaultActiveCameraState(),
+                currentFps = 59.8f,
+            ),
+        )
+        val notifications = mutableListOf<String>()
+
+        assertTrue(
+            CamCraftStreamService.applyVideoPipelineFailureIfActive(
+                lock = lock,
+                isStopping = { stopping.get() },
+                isSessionActive = { sessionActive.get() },
+                reason = "Replacement pipeline failed",
+                serviceState = stateFlow,
+                onUpdateNotification = { notifications.add(it) },
+            ),
+        )
+        assertEquals(StreamConnectionStatus.ERROR, stateFlow.value.status)
+        assertEquals(0f, stateFlow.value.currentFps, 0.001f)
+        assertEquals("Replacement pipeline failed", stateFlow.value.errorMessage)
+        assertEquals("Video unavailable (USB Direct) • Replacement pipeline failed", notifications.single())
+
+        // Retry or frame recovery restores CONNECTED and clears stale errorMessage.
+        assertTrue(
+            CamCraftStreamService.restoreConnectedStatusIfRecovering(
+                lock = lock,
+                isStopping = { stopping.get() },
+                isSessionActive = { sessionActive.get() },
+                serviceState = stateFlow,
+                onUpdateNotification = { notifications.add(it) },
+            ),
+        )
+        assertEquals(StreamConnectionStatus.CONNECTED, stateFlow.value.status)
+        assertNull(stateFlow.value.errorMessage)
+        assertEquals("Connected (USB Direct) • 1920x1080 @ 60 FPS", notifications.last())
+    }
+
+    @Test
+    fun checkAndCloseStalledSessionWriteUnblocksBlockedWriterThreadOnce() {
+        val writerEntered = CountDownLatch(1)
+        val releaseWriter = CountDownLatch(1)
+        val transportCloses = AtomicInteger(0)
+        val blockedWriterExecutor = Executors.newSingleThreadExecutor { r ->
+            Thread(r, "test-stalled-writer").apply { isDaemon = true }
+        }
+        val blockingOutput = object : OutputStream() {
+            override fun write(b: Int) {
+                writerEntered.countDown()
+                try {
+                    releaseWriter.await()
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+                throw IOException("transport closed by watchdog")
+            }
+        }
+        val handle = ClientSessionHandle(
+            sessionId = 44L,
+            output = blockingOutput,
+            outputLock = Any(),
+            closeTransport = {
+                transportCloses.incrementAndGet()
+                releaseWriter.countDown()
+            },
+        )
+        try {
+            // Not writing -> not stalled even if time elapsed.
+            assertFalse(handle.isWriteStalled(nowNs = 10_000_000_000L, timeoutNs = 2_500_000_000L))
+
+            val beforeCloseRuns = AtomicInteger(0)
+            val writerFuture = blockedWriterExecutor.submit<Boolean> {
+                try {
+                    synchronized(handle.outputLock) {
+                        handle.withTrackedWrite {
+                            handle.output.write(0x43)
+                        }
+                    }
+                    false
+                } catch (_: IOException) {
+                    true
+                }
+            }
+            assertTrue(writerEntered.await(2, TimeUnit.SECONDS))
+
+            // Simulate elapsed write duration reaching WRITE_STALL_TIMEOUT_MS -> closes transport without
+            // acquiring handle.outputLock, unblocking the stalled writer thread with IOException.
+            handle.markWriteStarted(nowNs = 1_000L)
+            assertFalse(
+                CamCraftStreamService.checkAndCloseStalledSessionWrite(
+                    session = handle,
+                    nowNs = 2_000_000_000L,
+                    timeoutNs = 2_500_000_000L,
+                    beforeClose = { beforeCloseRuns.incrementAndGet() },
+                ),
+            )
+            assertTrue(
+                CamCraftStreamService.checkAndCloseStalledSessionWrite(
+                    session = handle,
+                    nowNs = 2_500_002_000L,
+                    timeoutNs = 2_500_000_000L,
+                    beforeClose = { beforeCloseRuns.incrementAndGet() },
+                ),
+            )
+            assertTrue(writerFuture.get(2, TimeUnit.SECONDS))
+            assertTrue(handle.isClosed)
+            assertEquals(1, beforeCloseRuns.get())
+            assertEquals(1, transportCloses.get())
+        } finally {
+            releaseWriter.countDown()
+            blockedWriterExecutor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun updateIfSessionOwnedAdvancesCameraConfigIdOnSupersedingRetryWhilePreservingBitrateOnly() {
+        val stateFlow = MutableStateFlow(StreamServiceState())
+        val coordinator = ControlStateAckCoordinator(stateFlow) { }
+        val session = ClientSessionHandle(
+            sessionId = 55L,
+            output = ByteArrayOutputStream(),
+            outputLock = Any(),
+            closeTransport = {},
+        )
+        coordinator.setActiveSession(session)
+
+        val initialConfigId = coordinator.runIfSessionActive(session, advanceCameraConfig = true) { _, _, configId ->
+            configId
+        }!!
+
+        // Superseding retry predicate (e.g., negotiation in flight) advances configId even with same dims.
+        coordinator.updateIfSessionOwned(
+            expectedSessionId = 55L,
+            shouldAdvanceCameraConfig = { _, _ -> true },
+        ) { cur -> cur.copy(bitrateKbps = 8_000) }
+        val retryConfigId = coordinator.currentCameraConfigId()
+        assertTrue(retryConfigId > initialConfigId)
+
+        // Prior configId callback is now rejected atomically.
+        assertNull(
+            coordinator.updateIfSessionOwned(
+                expectedSessionId = 55L,
+                expectedCameraConfigId = initialConfigId,
+                expectedCameraId = "0",
+                advanceCameraConfigOnGeometryChange = false,
+            ) { cur -> cur.copy(width = 640, height = 480) },
+        )
+
+        // Bitrate-only update when predicate is false preserves retryConfigId.
+        coordinator.updateIfSessionOwned(
+            expectedSessionId = 55L,
+            shouldAdvanceCameraConfig = { _, _ -> false },
+        ) { cur -> cur.copy(bitrateKbps = 10_000) }
+        assertEquals(retryConfigId, coordinator.currentCameraConfigId())
+        assertEquals(10_000, stateFlow.value.bitrateKbps)
     }
 }

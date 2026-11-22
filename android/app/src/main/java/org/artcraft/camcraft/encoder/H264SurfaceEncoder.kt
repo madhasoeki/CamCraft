@@ -354,12 +354,30 @@ class H264SurfaceEncoder(
      * Safely stops the background worker thread, signals EOS, and releases MediaCodec and Surface.
      *
      * Optional [onReleased] runs strictly after the underlying codec and input [Surface] have been
-     * torn down, either synchronously before returning or on drain-thread exit when deferred.
+     * torn down, only when `MediaCodec.release()` succeeded.
      */
     @JvmOverloads
     fun release(onReleased: (() -> Unit)? = null) {
-        if (onReleased != null) {
-            releaseCoordinator.onTeardownCompleted(onReleased)
+        releaseWithResult(
+            onTeardownCompleted = if (onReleased != null) {
+                { codecReleased ->
+                    if (codecReleased) {
+                        onReleased()
+                    }
+                }
+            } else {
+                null
+            },
+        )
+    }
+
+    /**
+     * Releases the encoder and reports to [onTeardownCompleted] whether codec release succeeded (`true`)
+     * or threw an error (`false`) once teardown finishes (synchronously or upon deferred drain exit).
+     */
+    internal fun releaseWithResult(onTeardownCompleted: ((codecReleased: Boolean) -> Unit)? = null) {
+        if (onTeardownCompleted != null) {
+            releaseCoordinator.onTeardownResult(onTeardownCompleted)
         }
         isRunning.set(false)
 
@@ -386,6 +404,7 @@ class H264SurfaceEncoder(
     }
 
     private fun releaseCodecAndSurfaceLocked() {
+        var codecReleased = false
         try {
             synchronized(lifecycleLock) {
                 val activeCodec = codec
@@ -404,9 +423,12 @@ class H264SurfaceEncoder(
                 if (activeCodec != null) {
                     try {
                         activeCodec.release()
-                    } catch (e: Exception) {
+                        codecReleased = true
+                    } catch (e: Throwable) {
                         Log.w(TAG, "Codec release exception: ${e.message}")
                     }
+                } else {
+                    codecReleased = true
                 }
 
                 try {
@@ -418,9 +440,13 @@ class H264SurfaceEncoder(
                 cachedConfig = null
             }
 
-            Log.i(TAG, "H264SurfaceEncoder released")
+            if (codecReleased) {
+                Log.i(TAG, "H264SurfaceEncoder released")
+            } else {
+                Log.e(TAG, "H264SurfaceEncoder teardown finished with MediaCodec.release() failure")
+            }
         } finally {
-            releaseCoordinator.markTeardownCompleted()
+            releaseCoordinator.markTeardownCompleted(codecReleased = codecReleased)
         }
     }
 
@@ -574,7 +600,8 @@ internal class DrainReleaseCoordinator {
     private var releaseRequested = false
     private var finalized = false
     private var teardownCompleted = false
-    private val completionListeners = mutableListOf<() -> Unit>()
+    private var teardownSucceeded = false
+    private val completionListeners = mutableListOf<(Boolean) -> Unit>()
 
     fun markDrainStarted() {
         synchronized(lock) {
@@ -605,36 +632,45 @@ internal class DrainReleaseCoordinator {
         }
     }
 
-    fun onTeardownCompleted(listener: () -> Unit) {
-        val runImmediately = synchronized(lock) {
+    fun onTeardownResult(listener: (codecReleased: Boolean) -> Unit) {
+        val (runImmediately, succeededSnapshot) = synchronized(lock) {
             if (teardownCompleted) {
-                true
+                true to teardownSucceeded
             } else {
                 completionListeners.add(listener)
-                false
+                false to false
             }
         }
         if (runImmediately) {
             try {
-                listener()
+                listener(succeededSnapshot)
             } catch (_: Throwable) {
             }
         }
     }
 
-    fun markTeardownCompleted() {
+    fun onTeardownCompleted(listener: () -> Unit) {
+        onTeardownResult { codecReleased ->
+            if (codecReleased) {
+                listener()
+            }
+        }
+    }
+
+    fun markTeardownCompleted(codecReleased: Boolean = true) {
         val listeners = synchronized(lock) {
             if (teardownCompleted) {
                 return
             }
             teardownCompleted = true
+            teardownSucceeded = codecReleased
             val snapshot = completionListeners.toList()
             completionListeners.clear()
             snapshot
         }
         for (listener in listeners) {
             try {
-                listener()
+                listener(codecReleased)
             } catch (_: Throwable) {
             }
         }
@@ -643,4 +679,5 @@ internal class DrainReleaseCoordinator {
     fun isReleaseRequested(): Boolean = synchronized(lock) { releaseRequested }
     fun isFinalized(): Boolean = synchronized(lock) { finalized }
     fun isTeardownCompleted(): Boolean = synchronized(lock) { teardownCompleted }
+    fun isTeardownSucceeded(): Boolean = synchronized(lock) { teardownSucceeded }
 }
