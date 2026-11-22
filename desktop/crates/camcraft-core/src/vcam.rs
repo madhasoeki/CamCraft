@@ -110,6 +110,19 @@ pub trait VirtualCameraSink: Send {
     fn device_path(&self) -> &Path;
 }
 
+fn video_device_priority(path: &Path) -> (u8, u32) {
+    match path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|s| s.strip_prefix("video"))
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        Some(10) => (0, 10),
+        Some(n) => (1, n),
+        None => (2, u32::MAX),
+    }
+}
+
 /// Scans `/dev/video*` for an existing `v4l2loopback` node with card label `"CamCraft"`.
 #[must_use]
 pub fn find_camcraft_v4l2_device_existing() -> Option<PathBuf> {
@@ -126,24 +139,8 @@ pub fn find_camcraft_v4l2_device_existing() -> Option<PathBuf> {
         }
     }
 
-    // Sort to check /dev/video10 first if present, then lowest index to highest
-    candidates.sort_by(|a, b| {
-        let num_a = a
-            .file_name()
-            .and_then(|n| n.to_str())
-            .and_then(|s| s.trim_start_matches("video").parse::<u32>().ok())
-            .unwrap_or(u32::MAX);
-        let num_b = b
-            .file_name()
-            .and_then(|n| n.to_str())
-            .and_then(|s| s.trim_start_matches("video").parse::<u32>().ok())
-            .unwrap_or(u32::MAX);
-
-        // Prioritize index 10 (the default CamCraft video_nr)
-        let prio_a = if num_a == 10 { 0 } else { num_a + 1 };
-        let prio_b = if num_b == 10 { 0 } else { num_b + 1 };
-        prio_a.cmp(&prio_b)
-    });
+    // Prioritize /dev/video10 first, then ascending numeric index, then non-numeric names
+    candidates.sort_by_key(|path| video_device_priority(path));
 
     for path in &candidates {
         if let Ok(dev) = v4l::Device::with_path(path)
@@ -1345,6 +1342,30 @@ mod tests {
         assert_eq!(
             format_sudo_recovery_command(ctl_dyn_prog, &ctl_dyn_args),
             "sudo v4l2loopback-ctl add -n \"CamCraft Virtual Camera\" -x 1"
+        );
+    }
+
+    #[test]
+    fn test_video_device_priority_ordering_and_non_numeric_safety() {
+        let mut paths = vec![
+            PathBuf::from("/dev/video"),
+            PathBuf::from("/dev/video_custom"),
+            PathBuf::from("/dev/video4294967295"),
+            PathBuf::from("/dev/video2"),
+            PathBuf::from("/dev/video0"),
+            PathBuf::from("/dev/video10"),
+        ];
+        paths.sort_by_key(|path| video_device_priority(path));
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/dev/video10"),
+                PathBuf::from("/dev/video0"),
+                PathBuf::from("/dev/video2"),
+                PathBuf::from("/dev/video4294967295"),
+                PathBuf::from("/dev/video"),
+                PathBuf::from("/dev/video_custom"),
+            ]
         );
     }
 }

@@ -100,11 +100,37 @@ class PrReviewAgentTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_ai_response_body("<html><body>504 Gateway Time-out</body></html>")
 
+    def test_parse_ai_response_body_propagates_error_after_partial_content_and_handles_multiline_sse(
+        self,
+    ) -> None:
+        multiline_sse = (
+            ": keepalive before\n"
+            "data: {\"choices\": [\n"
+            "data: {\"delta\": {\"content\": \"Multi-line \"}}\n"
+            "data: ]}\n\n"
+            ": keepalive middle\r\n"
+            'data: {"choices": [{"delta": {"content": "OK"}}]}\r\n\r\n'
+            "data: [DONE]\n"
+        )
+        self.assertEqual(
+            extract_assistant_content(parse_ai_response_body(multiline_sse)),
+            "Multi-line OK",
+        )
+
+        partial_then_error_sse = (
+            'data: {"choices": [{"delta": {"content": "Partial look..."}}]}\n\n'
+            'data: {"error": {"message": "upstream overloaded", "code": 503}}\n\n'
+            "data: [DONE]\n"
+        )
+        with self.assertRaises(ValueError) as ctx:
+            parse_ai_response_body(partial_then_error_sse)
+        self.assertIn("upstream overloaded", str(ctx.exception))
+
     def test_call_ai_chat_completion_falls_back_to_stream_on_transient_error(self) -> None:
         calls: list[dict[str, object]] = []
 
         def fake_requester(url, method="GET", headers=None, body=None, timeout=120):
-            calls.append({"url": url, "headers": headers, "body": body})
+            calls.append({"url": url, "headers": headers, "body": body, "timeout": timeout})
             if len(calls) == 1:
                 raise RuntimeError("Non-JSON response (HTTP 504, Content-Type: text/html) from ...")
             return 200, {"choices": [{"message": {"content": "Streamed OK"}}]}
@@ -120,6 +146,26 @@ class PrReviewAgentTests(unittest.TestCase):
         self.assertEqual(calls[0]["body"]["stream"], False)
         self.assertEqual(calls[1]["body"]["stream"], True)
         self.assertIn("text/event-stream", calls[1]["headers"]["Accept"])
+
+    def test_call_ai_chat_completion_enforces_total_timeout_budget(self) -> None:
+        calls = 0
+
+        def slow_requester(url, method="GET", headers=None, body=None, timeout=120):
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("Request timed out calling https://example.invalid")
+
+        with self.assertRaises(RuntimeError) as ctx:
+            call_ai_chat_completion(
+                "https://example.invalid/v1/chat/completions",
+                "secret-token",
+                {"model": "test-model", "messages": []},
+                timeout=0.5,
+                total_timeout=0.5,
+                requester=slow_requester,
+            )
+        self.assertEqual(calls, 1)
+        self.assertIn("total timeout", str(ctx.exception))
 
     def test_call_ai_chat_completion_does_not_retry_permanent_http_errors(self) -> None:
         calls = 0
