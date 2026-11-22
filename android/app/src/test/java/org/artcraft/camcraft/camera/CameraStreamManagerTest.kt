@@ -2,6 +2,7 @@ package org.artcraft.camcraft.camera
 
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -183,11 +184,12 @@ class CameraStreamManagerTest {
             val executedThread = AtomicReference<String?>()
             val removedRunnables = mutableListOf<Runnable>()
             val warnings = mutableListOf<String>()
+            val mainFuture = AtomicReference<Future<*>?>(null)
 
             CameraStreamManager.runOnMainBlocking(
                 isMainThread = { false },
                 post = { runnable ->
-                    fakeMainExecutor.execute(runnable)
+                    mainFuture.set(fakeMainExecutor.submit(runnable))
                     true
                 },
                 removeCallbacks = { runnable -> removedRunnables.add(runnable) },
@@ -198,6 +200,7 @@ class CameraStreamManagerTest {
                 executedThread.set(Thread.currentThread().name)
             }
 
+            mainFuture.get()?.get(2, TimeUnit.SECONDS)
             assertEquals(1, executions.get())
             assertEquals("fake-main-thread", executedThread.get())
             assertTrue(removedRunnables.isEmpty())
@@ -399,11 +402,12 @@ class CameraStreamManagerTest {
             val allowBlockFinish = CountDownLatch(1)
             val deferredLatch = CountDownLatch(1)
             val blockFinished = AtomicBoolean(false)
+            val mainFuture = AtomicReference<Future<*>?>(null)
 
             val result = CameraStreamManager.runOnMainBlocking(
                 isMainThread = { false },
                 post = { runnable ->
-                    fakeMain.execute(runnable)
+                    mainFuture.set(fakeMain.submit(runnable))
                     assertTrue(enteredBlock.await(1, TimeUnit.SECONDS))
                     true
                 },
@@ -424,6 +428,7 @@ class CameraStreamManagerTest {
             assertEquals(CameraStreamManager.MainWaitResult.TIMED_OUT, result)
             assertEquals(0, deferredCalls.get())
             allowBlockFinish.countDown()
+            mainFuture.get()?.get(2, TimeUnit.SECONDS)
             assertTrue(deferredLatch.await(2, TimeUnit.SECONDS))
             assertEquals(1, deferredCalls.get())
         } finally {
@@ -438,13 +443,14 @@ class CameraStreamManagerTest {
             val enteredBlock = CountDownLatch(1)
             val allowBlockFinish = CountDownLatch(1)
             val deferredLatch = CountDownLatch(1)
+            val mainFuture = AtomicReference<Future<*>?>(null)
             val callerThread = Thread.currentThread()
 
             val result = try {
                 CameraStreamManager.runOnMainBlocking(
                     isMainThread = { false },
                     post = { runnable ->
-                        fakeMainInterrupt.execute(runnable)
+                        mainFuture.set(fakeMainInterrupt.submit(runnable))
                         assertTrue(enteredBlock.await(1, TimeUnit.SECONDS))
                         callerThread.interrupt()
                         true
@@ -467,6 +473,7 @@ class CameraStreamManagerTest {
             assertEquals(CameraStreamManager.MainWaitResult.INTERRUPTED, result)
             assertEquals(1, deferredCalls.get())
             allowBlockFinish.countDown()
+            mainFuture.get()?.get(2, TimeUnit.SECONDS)
             assertTrue(deferredLatch.await(2, TimeUnit.SECONDS))
             assertEquals(2, deferredCalls.get())
         } finally {
@@ -741,5 +748,291 @@ class CameraStreamManagerTest {
         val owned = CameraStreamManager.distinctOwnedUseCases("enc", null, "ui", "enc")
         assertEquals(listOf("enc", "ui"), owned)
         assertTrue(CameraStreamManager.distinctOwnedUseCases<String>(null, null).isEmpty())
+    }
+
+    @Test
+    fun lifecycleActivationRequiresCurrentSessionAndGeneration() {
+        // Replacement rebind generation activates lifecycle even if initial startStream was superseded.
+        assertTrue(
+            CameraStreamManager.shouldActivateLifecycleOnBind(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 4L,
+                snapshotSessionId = 4L,
+                currentGeneration = 2L,
+                snapshotGeneration = 2L,
+            ),
+        )
+        // Superseded initial generation cannot activate lifecycle.
+        assertFalse(
+            CameraStreamManager.shouldActivateLifecycleOnBind(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 4L,
+                snapshotSessionId = 4L,
+                currentGeneration = 2L,
+                snapshotGeneration = 1L,
+            ),
+        )
+        // Stopped or released stream cannot activate lifecycle.
+        assertFalse(
+            CameraStreamManager.shouldActivateLifecycleOnBind(
+                isReleased = false,
+                isStreaming = false,
+                activeSessionId = 4L,
+                snapshotSessionId = 4L,
+                currentGeneration = 2L,
+                snapshotGeneration = 2L,
+            ),
+        )
+        assertFalse(
+            CameraStreamManager.shouldActivateLifecycleOnBind(
+                isReleased = true,
+                isStreaming = true,
+                activeSessionId = 4L,
+                snapshotSessionId = 4L,
+                currentGeneration = 2L,
+                snapshotGeneration = 2L,
+            ),
+        )
+        // Stale session cannot activate lifecycle.
+        assertFalse(
+            CameraStreamManager.shouldActivateLifecycleOnBind(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 5L,
+                snapshotSessionId = 4L,
+                currentGeneration = 2L,
+                snapshotGeneration = 2L,
+            ),
+        )
+    }
+
+    @Test
+    fun activeEncoderSlotReleaseLatchAndRetryHookCoordinateConcurrentRelease() {
+        val retiringSlot = ActiveEncoderSlot(
+            sessionId = 3L,
+            generation = 1L,
+            encoder = null,
+            width = 1920,
+            height = 1080,
+            fps = 60,
+            cameraId = "0",
+            surfaceTracker = EncoderSurfaceRetirementTracker(),
+            isRetiring = true,
+        )
+
+        assertFalse(retiringSlot.isReleased)
+        assertFalse(retiringSlot.awaitReleased(15L))
+
+        val releaseExecutor = Executors.newSingleThreadExecutor { r ->
+            Thread(r, "test-encoder-release").apply { isDaemon = true }
+        }
+        val encoderExecutor = Executors.newSingleThreadExecutor { r ->
+            Thread(r, "test-encoder-setup").apply { isDaemon = true }
+        }
+        try {
+            val hookTriggered = CountDownLatch(1)
+            val hookCalls = AtomicInteger(0)
+            val setupThreadName = AtomicReference<String?>()
+
+            // Simulate failed encoder creation while retiringSlot is still releasing, then attach retry hook.
+            assertTrue(
+                CameraStreamManager.shouldRetryEncoderSetupAfterFailure(
+                    isReleased = false,
+                    isStreaming = true,
+                    activeSessionId = 3L,
+                    requestSessionId = 3L,
+                    currentGeneration = 2L,
+                    expectedGeneration = 2L,
+                    hasRetriedAfterRelease = false,
+                    priorSlotAlreadyReleased = false,
+                ),
+            )
+            retiringSlot.onReleased {
+                encoderExecutor.execute {
+                    setupThreadName.set(Thread.currentThread().name)
+                    hookCalls.incrementAndGet()
+                    hookTriggered.countDown()
+                }
+            }
+            assertEquals(0, hookCalls.get())
+
+            // Simulate dedicated encoderReleaseExecutor completing release & calling markReleased().
+            releaseExecutor.execute {
+                retiringSlot.markReleased()
+            }
+
+            assertTrue(retiringSlot.awaitReleased(2_000L))
+            assertTrue(hookTriggered.await(2_000L, TimeUnit.MILLISECONDS))
+            assertEquals(1, hookCalls.get())
+            assertEquals("test-encoder-setup", setupThreadName.get())
+            assertTrue(retiringSlot.isReleased)
+
+            // Idempotent markReleased() must not re-fire already invoked hook.
+            retiringSlot.markReleased()
+            assertEquals(1, hookCalls.get())
+
+            // Attaching a late listener after markReleased() already ran invokes immediately once.
+            val lateCalls = AtomicInteger(0)
+            retiringSlot.onReleased { lateCalls.incrementAndGet() }
+            assertEquals(1, lateCalls.get())
+
+            // No retry when prior slot had already finished releasing, already retried, or generation changed.
+            assertFalse(
+                CameraStreamManager.shouldRetryEncoderSetupAfterFailure(
+                    isReleased = false,
+                    isStreaming = true,
+                    activeSessionId = 3L,
+                    requestSessionId = 3L,
+                    currentGeneration = 2L,
+                    expectedGeneration = 2L,
+                    hasRetriedAfterRelease = false,
+                    priorSlotAlreadyReleased = true,
+                ),
+            )
+            assertFalse(
+                CameraStreamManager.shouldRetryEncoderSetupAfterFailure(
+                    isReleased = false,
+                    isStreaming = true,
+                    activeSessionId = 3L,
+                    requestSessionId = 3L,
+                    currentGeneration = 2L,
+                    expectedGeneration = 2L,
+                    hasRetriedAfterRelease = true,
+                    priorSlotAlreadyReleased = false,
+                ),
+            )
+            assertFalse(
+                CameraStreamManager.shouldRetryEncoderSetupAfterFailure(
+                    isReleased = false,
+                    isStreaming = true,
+                    activeSessionId = 3L,
+                    requestSessionId = 3L,
+                    currentGeneration = 3L,
+                    expectedGeneration = 2L,
+                    hasRetriedAfterRelease = false,
+                    priorSlotAlreadyReleased = false,
+                ),
+            )
+        } finally {
+            releaseExecutor.shutdownNow()
+            encoderExecutor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun evaluateSurfaceRequestResolutionHandlesExactMatchReconfigureOnceAndStaleReject() {
+        // 1. Exact size match -> PROVIDE_SURFACE
+        assertEquals(
+            CameraStreamManager.SurfaceResolutionDecision.PROVIDE_SURFACE,
+            CameraStreamManager.evaluateSurfaceRequestResolution(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 5L,
+                snapshotSessionId = 5L,
+                activeSlotMatchesSnapshot = true,
+                snapshotRetiring = false,
+                surfaceValid = true,
+                snapshotWidth = 1920,
+                snapshotHeight = 1080,
+                requestWidth = 1920,
+                requestHeight = 1080,
+                resolutionAlreadyAdjusted = false,
+            ),
+        )
+
+        // 2. CameraX fell back to valid even size -> RECONFIGURE_ENCODER once
+        assertEquals(
+            CameraStreamManager.SurfaceResolutionDecision.RECONFIGURE_ENCODER,
+            CameraStreamManager.evaluateSurfaceRequestResolution(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 5L,
+                snapshotSessionId = 5L,
+                activeSlotMatchesSnapshot = true,
+                snapshotRetiring = false,
+                surfaceValid = true,
+                snapshotWidth = 1920,
+                snapshotHeight = 1080,
+                requestWidth = 1280,
+                requestHeight = 720,
+                resolutionAlreadyAdjusted = false,
+            ),
+        )
+
+        // 3. Subsequent mismatch on already-adjusted generation -> REJECT_STALE (no infinite rebind loop)
+        assertEquals(
+            CameraStreamManager.SurfaceResolutionDecision.REJECT_STALE,
+            CameraStreamManager.evaluateSurfaceRequestResolution(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 5L,
+                snapshotSessionId = 5L,
+                activeSlotMatchesSnapshot = true,
+                snapshotRetiring = false,
+                surfaceValid = true,
+                snapshotWidth = 1280,
+                snapshotHeight = 720,
+                requestWidth = 640,
+                requestHeight = 480,
+                resolutionAlreadyAdjusted = true,
+            ),
+        )
+
+        // 4. Odd or non-positive resolution -> REJECT_STALE
+        assertEquals(
+            CameraStreamManager.SurfaceResolutionDecision.REJECT_STALE,
+            CameraStreamManager.evaluateSurfaceRequestResolution(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 5L,
+                snapshotSessionId = 5L,
+                activeSlotMatchesSnapshot = true,
+                snapshotRetiring = false,
+                surfaceValid = true,
+                snapshotWidth = 1920,
+                snapshotHeight = 1080,
+                requestWidth = 1279,
+                requestHeight = 720,
+                resolutionAlreadyAdjusted = false,
+            ),
+        )
+        assertEquals(
+            CameraStreamManager.SurfaceResolutionDecision.REJECT_STALE,
+            CameraStreamManager.evaluateSurfaceRequestResolution(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 5L,
+                snapshotSessionId = 5L,
+                activeSlotMatchesSnapshot = true,
+                snapshotRetiring = false,
+                surfaceValid = true,
+                snapshotWidth = 1920,
+                snapshotHeight = 1080,
+                requestWidth = 0,
+                requestHeight = 720,
+                resolutionAlreadyAdjusted = false,
+            ),
+        )
+
+        // 5. Stale / retiring / invalid surface -> REJECT_STALE even if size differs
+        assertEquals(
+            CameraStreamManager.SurfaceResolutionDecision.REJECT_STALE,
+            CameraStreamManager.evaluateSurfaceRequestResolution(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 6L,
+                snapshotSessionId = 5L,
+                activeSlotMatchesSnapshot = true,
+                snapshotRetiring = false,
+                surfaceValid = true,
+                snapshotWidth = 1920,
+                snapshotHeight = 1080,
+                requestWidth = 1280,
+                requestHeight = 720,
+                resolutionAlreadyAdjusted = false,
+            ),
+        )
     }
 }

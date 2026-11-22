@@ -230,37 +230,39 @@ class H264SurfaceEncoder(
                                 var isConfig = false
                                 var isKeyframe = false
 
-                                if (isRunning.get() && !releaseCoordinator.isReleaseRequested()) {
-                                    val outputBuffer = activeCodec.getOutputBuffer(outputIndex)
-                                    val size = bufferInfo.size
-                                    if (outputBuffer != null && size > 0) {
-                                        val requiredCapacity = size + ANNEX_B_PREFIX_HEADROOM
-                                        if (requiredCapacity > scratchBuffer.size) {
-                                            scratchBuffer = ByteArray(maxOf(scratchBuffer.size * 2, requiredCapacity))
-                                        }
+                                try {
+                                    if (isRunning.get() && !releaseCoordinator.isReleaseRequested()) {
+                                        val outputBuffer = activeCodec.getOutputBuffer(outputIndex)
+                                        val size = bufferInfo.size
+                                        if (outputBuffer != null && size > 0) {
+                                            val requiredCapacity = size + ANNEX_B_PREFIX_HEADROOM
+                                            if (requiredCapacity > scratchBuffer.size) {
+                                                scratchBuffer = ByteArray(maxOf(scratchBuffer.size * 2, requiredCapacity))
+                                            }
 
-                                        outputBuffer.position(bufferInfo.offset)
-                                        outputBuffer.limit(bufferInfo.offset + size)
-                                        outputBuffer.get(scratchBuffer, ANNEX_B_PREFIX_HEADROOM, size)
+                                            outputBuffer.position(bufferInfo.offset)
+                                            outputBuffer.limit(bufferInfo.offset + size)
+                                            outputBuffer.get(scratchBuffer, ANNEX_B_PREFIX_HEADROOM, size)
 
-                                        val slice = formatAnnexBInPlace(scratchBuffer, size)
-                                        sliceOffset = slice.offset
-                                        sliceLength = slice.length
-                                        ptsUs = if (bufferInfo.presentationTimeUs > 0) {
-                                            bufferInfo.presentationTimeUs
-                                        } else {
-                                            System.nanoTime() / 1_000L
+                                            val slice = formatAnnexBInPlace(scratchBuffer, size)
+                                            sliceOffset = slice.offset
+                                            sliceLength = slice.length
+                                            ptsUs = if (bufferInfo.presentationTimeUs > 0) {
+                                                bufferInfo.presentationTimeUs
+                                            } else {
+                                                System.nanoTime() / 1_000L
+                                            }
+                                            isConfig = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+                                            isKeyframe = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+                                            shouldDispatch = true
                                         }
-                                        isConfig = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
-                                        isKeyframe = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
-                                        shouldDispatch = true
                                     }
-                                }
-
-                                // Return buffer to MediaCodec before dispatching over I/O so we never
-                                // touch activeCodec after a potentially stalled callback returns.
-                                if (isRunning.get() && !releaseCoordinator.isReleaseRequested()) {
-                                    activeCodec.releaseOutputBuffer(outputIndex, false)
+                                } finally {
+                                    // Return buffer to MediaCodec before dispatching over I/O so we never
+                                    // touch activeCodec after a potentially stalled callback returns or if copy throws.
+                                    if (isRunning.get() && !releaseCoordinator.isReleaseRequested()) {
+                                        activeCodec.releaseOutputBuffer(outputIndex, false)
+                                    }
                                 }
 
                                 if (shouldDispatch && isRunning.get() && !releaseCoordinator.isReleaseRequested()) {

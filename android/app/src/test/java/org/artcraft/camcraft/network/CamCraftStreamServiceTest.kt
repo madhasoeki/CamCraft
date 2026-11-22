@@ -7,14 +7,17 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import org.artcraft.camcraft.camera.CameraStreamManager
 import org.artcraft.camcraft.protocol.CameraInfo
 import org.artcraft.camcraft.protocol.CcftFlags
 import org.artcraft.camcraft.protocol.CcftProtocolConstants
@@ -579,9 +582,14 @@ class CamCraftStreamServiceTest {
     fun controlStateCoordinatorOrdersAudioMuteAndRebindSideEffectsWithAcks() {
         val flow = MutableStateFlow(StreamServiceState())
         val acks = Collections.synchronizedList(mutableListOf<ControlAck>())
+        val eventTrace = Collections.synchronizedList(mutableListOf<String>())
         val committedRebinds = Collections.synchronizedList(mutableListOf<Pair<String, Long>>())
         val engineMuted = AtomicBoolean(false)
-        val coordinator = ControlStateAckCoordinator(flow) { ack -> acks.add(ack) }
+        val coordinator = ControlStateAckCoordinator(flow) { ack ->
+            acks.add(ack)
+            val state = ack.activeState!!
+            eventTrace.add("ack:${state.cameraId}:${state.audioMuted}")
+        }
 
         val gate = CountDownLatch(1)
         val remoteAudioThread = Thread {
@@ -590,6 +598,7 @@ class CamCraftStreamServiceTest {
                 coordinator.updateAndEnqueue(
                     onCommittedLocked = { next, _ ->
                         engineMuted.set(next.audioMuted)
+                        eventTrace.add("effect:${next.cameraId}:${next.audioMuted}")
                     },
                 ) { cur ->
                     CamCraftStreamService.applyAudioStatePatch(cur, enabled = true, muted = (i % 2 == 1))
@@ -602,6 +611,7 @@ class CamCraftStreamServiceTest {
                 coordinator.updateAndEnqueue(
                     onCommittedLocked = { next, _ ->
                         engineMuted.set(next.audioMuted)
+                        eventTrace.add("effect:${next.cameraId}:${next.audioMuted}")
                     },
                 ) { cur ->
                     cur.copy(audioMuted = !cur.audioMuted)
@@ -615,6 +625,7 @@ class CamCraftStreamServiceTest {
                 coordinator.updateAndEnqueue(
                     onCommittedLocked = { next, seq ->
                         committedRebinds.add(next.cameraId to seq)
+                        eventTrace.add("effect:${next.cameraId}:${next.audioMuted}")
                     },
                 ) { cur ->
                     cur.copy(cameraId = targetCamId)
@@ -634,6 +645,19 @@ class CamCraftStreamServiceTest {
         assertFalse(uiMuteThread.isAlive)
         assertFalse(rebindThread.isAlive)
         assertEquals(100, acks.size)
+        assertEquals(200, eventTrace.size)
+
+        // Verify each committed effect strictly precedes its corresponding ACK in the shared trace.
+        for (idx in 0 until 100) {
+            val effectEntry = eventTrace[idx * 2]
+            val ackEntry = eventTrace[idx * 2 + 1]
+            assertTrue("Expected effect entry at ${idx * 2}, got $effectEntry", effectEntry.startsWith("effect:"))
+            assertTrue("Expected ack entry at ${idx * 2 + 1}, got $ackEntry", ackEntry.startsWith("ack:"))
+            assertEquals(
+                effectEntry.removePrefix("effect:"),
+                ackEntry.removePrefix("ack:"),
+            )
+        }
 
         // Final audioMuted applied inside onCommittedLocked matches committed state and final ACK.
         assertEquals(flow.value.activeState.audioMuted, engineMuted.get())
@@ -651,5 +675,285 @@ class CamCraftStreamServiceTest {
             assertEquals(camId, ackCameraIds[seq.toInt() - 1])
         }
         assertEquals(20, collapsedCommittedCams.size)
+    }
+
+    @Test
+    fun perSessionAudioCallbackIsolationDropsStaleSessionPacketsAfterReconnect() {
+        val session1Handle = ClientSessionHandle(
+            sessionId = 1L,
+            output = ByteArrayOutputStream(),
+            outputLock = Any(),
+            closeTransport = {},
+        )
+        val session2Handle = ClientSessionHandle(
+            sessionId = 2L,
+            output = ByteArrayOutputStream(),
+            outputLock = Any(),
+            closeTransport = {},
+        )
+        var activeSession: ClientSessionHandle? = session1Handle
+        val routedSessions = mutableListOf<Long>()
+        val emitAudioForSession: (Long) -> Unit = { capturedSessionId ->
+            CamCraftStreamService.resolveActiveSessionForPacket(activeSession, capturedSessionId)?.let {
+                routedSessions.add(it.sessionId)
+            }
+        }
+
+        val session1Callback = { emitAudioForSession(session1Handle.sessionId) }
+        val session2Callback = { emitAudioForSession(session2Handle.sessionId) }
+
+        session1Callback()
+        // Reconnect: session 1 closes and session 2 becomes active.
+        session1Handle.close()
+        activeSession = session2Handle
+
+        // Delayed packet from session 1's captured callback is dropped; session 2's packet routes cleanly.
+        session1Callback()
+        session2Callback()
+        assertEquals(listOf(1L, 2L), routedSessions)
+    }
+
+    @Test
+    fun controlCoordinatorRunLockedSerializesStartupCameraAndMuteWithConcurrentUiUpdates() {
+        repeat(25) {
+            val flow = MutableStateFlow(StreamServiceState())
+            val acks = Collections.synchronizedList(mutableListOf<ControlAck>())
+            val coordinator = ControlStateAckCoordinator(flow) { acks.add(it) }
+
+            val startCameraId = AtomicReference<String?>(null)
+            val startSeq = AtomicLong(0L)
+            val uiRebindSeq = AtomicLong(0L)
+            val uiCameraId = AtomicReference<String?>(null)
+            val engineMuted = AtomicBoolean(true)
+            val engineStarted = AtomicBoolean(false)
+
+            val gate = CountDownLatch(1)
+            val startupThread = Thread {
+                gate.await(1, TimeUnit.SECONDS)
+                // [26] Startup reads state and initializes startStream configSeq under orderLock.
+                coordinator.runLocked { state, seq ->
+                    startCameraId.set(state.cameraId)
+                    startSeq.set(seq)
+                }
+                // [27] Audio capture starts initiallyMuted=true off orderLock, then applies committed mute under orderLock.
+                engineStarted.set(true)
+                coordinator.runLocked { state, _ ->
+                    engineMuted.set(state.audioMuted)
+                }
+            }
+            val uiThread = Thread {
+                gate.await(1, TimeUnit.SECONDS)
+                coordinator.updateAndEnqueue(
+                    onCommittedLocked = { next, seq ->
+                        uiCameraId.set(next.cameraId)
+                        uiRebindSeq.set(seq)
+                    },
+                ) { cur ->
+                    cur.copy(cameraId = "1")
+                }
+                coordinator.updateAndEnqueue(
+                    onCommittedLocked = { next, _ ->
+                        if (engineStarted.get()) {
+                            engineMuted.set(next.audioMuted)
+                        }
+                    },
+                ) { cur ->
+                    cur.copy(audioMuted = true)
+                }
+            }
+
+            startupThread.start()
+            uiThread.start()
+            gate.countDown()
+            startupThread.join(2_000)
+            uiThread.join(2_000)
+            assertFalse(startupThread.isAlive)
+            assertFalse(uiThread.isAlive)
+
+            // Either UI lens switch happened BEFORE startStream (so startup got "1" and uiRebindSeq < startSeq is rejected),
+            // or AFTER startStream (so uiRebindSeq > startSeq is accepted by CameraStreamManager.shouldApplyRebind).
+            val uiWonBeforeStart = uiRebindSeq.get() < startSeq.get()
+            if (uiWonBeforeStart) {
+                assertEquals("1", startCameraId.get())
+                assertFalse(
+                    CameraStreamManager.shouldApplyRebind(
+                        isReleased = false,
+                        isStreaming = true,
+                        activeSessionId = 1L,
+                        requestSessionId = 1L,
+                        configSeq = uiRebindSeq.get(),
+                        lastAppliedConfigSeq = startSeq.get(),
+                    ),
+                )
+            } else {
+                assertEquals("0", startCameraId.get())
+                assertTrue(
+                    CameraStreamManager.shouldApplyRebind(
+                        isReleased = false,
+                        isStreaming = true,
+                        activeSessionId = 1L,
+                        requestSessionId = 1L,
+                        configSeq = uiRebindSeq.get(),
+                        lastAppliedConfigSeq = startSeq.get(),
+                    ),
+                )
+            }
+
+            // Committed audioMuted=true is NEVER overwritten by stale false during audio startup.
+            assertTrue(flow.value.activeState.audioMuted)
+            assertTrue(engineMuted.get())
+        }
+    }
+
+    @Test
+    fun serviceStateOwnershipGuardPreventsStaleSessionAndDestroyedInstanceOverwrites() {
+        val ownershipLock = Any()
+        val oldInstance = Any()
+        val newInstance = Any()
+        val activeInstanceRef = AtomicReference<Any?>(oldInstance)
+        val ownerSessionIdRef = AtomicLong(10L)
+
+        val liveState = StreamServiceState(
+            status = StreamConnectionStatus.CONNECTED,
+            clientAddress = "192.168.1.99",
+            localIpAddress = "192.168.1.10",
+            listenPort = 9876,
+        )
+        val stateFlow = MutableStateFlow(liveState)
+
+        // Simulate oldInstance.onDestroy() followed by replacement newInstance publishing CONNECTED for session 11.
+        activeInstanceRef.set(newInstance)
+        ownerSessionIdRef.set(11L)
+
+        // Stale session 10 from oldInstance must NOT overwrite state across any PostSessionStatus branch.
+        for (outcome in CamCraftStreamService.Companion.PostSessionStatus.entries) {
+            val mutated = CamCraftStreamService.applyPostSessionStateWithOwnership(
+                ownershipLock = ownershipLock,
+                isOwned = {
+                    CamCraftStreamService.canMutateServiceStateForSession(
+                        activeInstance = activeInstanceRef.get(),
+                        callerInstance = oldInstance,
+                        activeOwnerSessionId = ownerSessionIdRef.get(),
+                        sessionId = 10L,
+                    )
+                },
+                clearSessionOwnership = { ownerSessionIdRef.set(0L) },
+                outcome = outcome,
+                listenPort = 9876,
+                refreshedIp = "192.168.1.10",
+                serverBindError = "bind err",
+                serviceState = stateFlow,
+            )
+            assertFalse("Stale session must not mutate state for $outcome", mutated)
+            assertEquals(liveState, stateFlow.value)
+            assertEquals(11L, ownerSessionIdRef.get())
+        }
+
+        // Stale session ID on the current instance is also rejected.
+        assertFalse(
+            CamCraftStreamService.canMutateServiceStateForSession(
+                activeInstance = activeInstanceRef.get(),
+                callerInstance = newInstance,
+                activeOwnerSessionId = ownerSessionIdRef.get(),
+                sessionId = 10L,
+            ),
+        )
+
+        // Active owner session 11 on newInstance CAN transition to LISTENING and clears ownerSessionId.
+        val currentMutated = CamCraftStreamService.applyPostSessionStateWithOwnership(
+            ownershipLock = ownershipLock,
+            isOwned = {
+                CamCraftStreamService.canMutateServiceStateForSession(
+                    activeInstance = activeInstanceRef.get(),
+                    callerInstance = newInstance,
+                    activeOwnerSessionId = ownerSessionIdRef.get(),
+                    sessionId = 11L,
+                )
+            },
+            clearSessionOwnership = { ownerSessionIdRef.set(0L) },
+            outcome = CamCraftStreamService.Companion.PostSessionStatus.LISTENING,
+            listenPort = 9876,
+            refreshedIp = "192.168.1.10",
+            serverBindError = null,
+            serviceState = stateFlow,
+        )
+        assertTrue(currentMutated)
+        assertEquals(StreamConnectionStatus.LISTENING, stateFlow.value.status)
+        assertNull(stateFlow.value.clientAddress)
+        assertEquals(0L, ownerSessionIdRef.get())
+    }
+
+    @Test
+    fun clientSessionHandleOverflowRejectsSubsequentEnqueuesAndDispatchesCloseOffCallerThread() {
+        val callerThread = Thread.currentThread()
+        val transportCloses = AtomicInteger(0)
+        val closeThread = AtomicReference<Thread?>(null)
+        val dispatchedTasks = Collections.synchronizedList(mutableListOf<() -> Unit>())
+        val ioExecutor = Executors.newSingleThreadExecutor { r ->
+            Thread(r, "test-io-close").apply { isDaemon = true }
+        }
+        try {
+            val closedLatch = CountDownLatch(1)
+            val handle = ClientSessionHandle(
+                sessionId = 20L,
+                output = ByteArrayOutputStream(),
+                outputLock = Any(),
+                closeTransport = {
+                    closeThread.set(Thread.currentThread())
+                    transportCloses.incrementAndGet()
+                    closedLatch.countDown()
+                },
+                ackQueueCapacity = 2,
+                dispatchClose = { task ->
+                    dispatchedTasks.add(task)
+                },
+            )
+
+            assertTrue(handle.enqueueAck(ControlAck.success(defaultActiveCameraState())))
+            assertTrue(handle.enqueueAck(ControlAck.success(defaultActiveCameraState())))
+
+            // Overflow on caller thread: immediately marks closed and rejects future enqueues,
+            // but does NOT run closeTransport synchronously on caller thread.
+            assertFalse(handle.enqueueAck(ControlAck.success(defaultActiveCameraState())))
+            assertTrue(handle.isClosed)
+            assertEquals(0, transportCloses.get())
+            assertEquals(1, dispatchedTasks.size)
+
+            // Subsequent enqueue fails immediately without dispatching another close.
+            assertFalse(handle.enqueueAck(ControlAck.success(defaultActiveCameraState())))
+            assertEquals(1, dispatchedTasks.size)
+
+            // Executing the dispatched task on IO thread closes transport once off caller thread.
+            ioExecutor.execute { dispatchedTasks.first().invoke() }
+            assertTrue(closedLatch.await(2, TimeUnit.SECONDS))
+            assertEquals(1, transportCloses.get())
+            assertTrue(closeThread.get() !== callerThread)
+
+            // Also verify synchronous close() before pending dispatchClose runs transport once total.
+            val syncTransportCloses = AtomicInteger(0)
+            val pendingClose = AtomicReference<(() -> Unit)?>(null)
+            val racingHandle = ClientSessionHandle(
+                sessionId = 21L,
+                output = ByteArrayOutputStream(),
+                outputLock = Any(),
+                closeTransport = { syncTransportCloses.incrementAndGet() },
+                ackQueueCapacity = 1,
+                dispatchClose = { task -> pendingClose.set(task) },
+            )
+            assertTrue(racingHandle.enqueueAck(ControlAck.success(defaultActiveCameraState())))
+            assertFalse(racingHandle.enqueueAck(ControlAck.success(defaultActiveCameraState())))
+            assertNotNull(pendingClose.get())
+            assertEquals(0, syncTransportCloses.get())
+
+            // I/O teardown calls close() synchronously -> closes transport once.
+            racingHandle.close()
+            assertEquals(1, syncTransportCloses.get())
+
+            // Late dispatched task runs -> must NOT close transport a second time.
+            pendingClose.get()!!.invoke()
+            assertEquals(1, syncTransportCloses.get())
+        } finally {
+            ioExecutor.shutdownNow()
+        }
     }
 }

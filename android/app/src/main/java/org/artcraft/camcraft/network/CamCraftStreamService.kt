@@ -43,6 +43,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asExecutor
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.currentCoroutineContext
@@ -142,13 +143,9 @@ class CamCraftStreamService : Service() {
     private var usbJob: Job? = null
 
     private val sessionMutex = Mutex()
-    private val nextSessionId = AtomicLong(1L)
 
     @Volatile
     private var activeSession: ClientSessionHandle? = null
-
-    @Volatile
-    private var audioSessionId: Long = 0L
 
     private val activeTcpSockets = mutableSetOf<Socket>()
 
@@ -190,7 +187,6 @@ class CamCraftStreamService : Service() {
     private var serverBindError: String? = null
 
     private var cameraStreamManager: CameraStreamManager? = null
-    private var audioStreamEngine: AudioStreamEngine? = null
     private var mdnsAdvertiser: MdnsAdvertiser? = null
     private var wifiNetworkMonitor: WifiNetworkMonitor? = null
 
@@ -214,6 +210,11 @@ class CamCraftStreamService : Service() {
         super.onCreate()
         createNotificationChannel()
         startInForeground()
+
+        synchronized(stateOwnershipLock) {
+            activeInstance = this
+            activeStateOwnerSessionId = 0L
+        }
 
         ContextCompat.registerReceiver(
             this,
@@ -259,14 +260,16 @@ class CamCraftStreamService : Service() {
             val appContext = applicationContext ?: this
             val cameras = CameraEnumerator.enumerateCameras(appContext)
             _serviceState.update { it.copy(cameras = cameras) }
-            val manager = CameraStreamManager(appContext) { sessionId, packetType, flags, ptsUs, payload, offset, length ->
-                handleVideoPacketFromEncoder(sessionId, packetType, flags, ptsUs, payload, offset, length)
-            }
+            val manager = CameraStreamManager(
+                context = appContext,
+                onVideoPacketSlice = { sessionId, packetType, flags, ptsUs, payload, offset, length ->
+                    handleVideoPacketFromEncoder(sessionId, packetType, flags, ptsUs, payload, offset, length)
+                },
+                onResolutionAdjusted = { sessionId, width, height ->
+                    handleEncoderResolutionAdjusted(sessionId, width, height)
+                },
+            )
             cameraStreamManager = manager
-            audioStreamEngine = AudioStreamEngine(appContext) { packetType, ptsUs, payload, length ->
-                handleAudioPacketFromEngine(packetType, ptsUs, payload, length)
-            }
-            activeInstance = this
             pendingPreviewView?.get()?.let { previewView ->
                 manager.attachPreviewView(previewView)
             }
@@ -312,6 +315,8 @@ class CamCraftStreamService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         Log.i(TAG, "Destroying CamCraft service")
+        val preservedIp = LocalIpResolver.resolveLocalIpv4Address(this)
+            ?: _serviceState.value.localIpAddress
         val audioToRelease: AudioStreamEngine?
         val cameraToRelease: CameraStreamManager?
         synchronized(lifecycleLock) {
@@ -323,8 +328,7 @@ class CamCraftStreamService : Service() {
                 }
                 isUsbReceiverRegistered = false
             }
-            val preservedIp = LocalIpResolver.resolveLocalIpv4Address(this)
-                ?: _serviceState.value.localIpAddress
+            audioToRelease = activeSession?.audioEngine
             shutdownWifiAndMdnsUnderLock(
                 lock = lifecycleLock,
                 setStopping = { isStopping.set(true) },
@@ -338,24 +342,25 @@ class CamCraftStreamService : Service() {
                     activeTransformFlags = CcftFlags.NONE
                 },
                 resetServiceState = {
-                    _serviceState.value = StreamServiceState(
-                        status = StreamConnectionStatus.STOPPED,
-                        localIpAddress = preservedIp,
-                    )
+                    synchronized(stateOwnershipLock) {
+                        if (activeInstance === this) {
+                            _serviceState.value = StreamServiceState(
+                                status = StreamConnectionStatus.STOPPED,
+                                localIpAddress = preservedIp,
+                            )
+                            activeStateOwnerSessionId = 0L
+                            activeInstance = null
+                        }
+                    }
                 },
                 unregisterMdns = {
                     mdnsAdvertiser?.unregister()
                     mdnsAdvertiser = null
                 },
             )
-            audioToRelease = audioStreamEngine
-            audioStreamEngine = null
             cameraToRelease = cameraStreamManager
             cameraStreamManager = null
             pendingPreviewView = null
-            if (activeInstance == this) {
-                activeInstance = null
-            }
         }
         audioToRelease?.release()
         cameraToRelease?.release()
@@ -407,31 +412,41 @@ class CamCraftStreamService : Service() {
                         }
                         serverBindError = null
                         val sessionActive = activeSession != null
-                        _serviceState.update {
-                            if (sessionActive) {
-                                it.copy(
-                                    localIpAddress = currentIp,
-                                    listenPort = port,
-                                    errorMessage = null,
-                                )
+                        val updatedListening = synchronized(stateOwnershipLock) {
+                            if (activeInstance !== this@CamCraftStreamService) {
+                                false
                             } else {
-                                becameListening = true
-                                it.copy(
-                                    status = StreamConnectionStatus.LISTENING,
-                                    clientAddress = null,
-                                    localIpAddress = currentIp,
-                                    listenPort = port,
-                                    errorMessage = null,
-                                )
+                                _serviceState.update {
+                                    if (sessionActive) {
+                                        it.copy(
+                                            localIpAddress = currentIp,
+                                            listenPort = port,
+                                            errorMessage = null,
+                                        )
+                                    } else {
+                                        becameListening = true
+                                        activeStateOwnerSessionId = 0L
+                                        it.copy(
+                                            status = StreamConnectionStatus.LISTENING,
+                                            clientAddress = null,
+                                            localIpAddress = currentIp,
+                                            listenPort = port,
+                                            errorMessage = null,
+                                        )
+                                    }
+                                }
+                                true
                             }
                         }
-                        mdnsAdvertiser?.register(
-                            deviceName = resolveDeviceName(),
-                            port = port,
-                            localIpAddress = currentIp,
-                        )
-                        if (becameListening) {
-                            updateNotification(buildListeningNotificationText(currentIp, port))
+                        if (updatedListening) {
+                            mdnsAdvertiser?.register(
+                                deviceName = resolveDeviceName(),
+                                port = port,
+                                localIpAddress = currentIp,
+                            )
+                            if (becameListening) {
+                                updateNotification(buildListeningNotificationText(currentIp, port))
+                            }
                         }
                     }
                     Log.i(TAG, "CamCraft TCP Server listening on port $port (Wi-Fi IP: $currentIp)")
@@ -459,13 +474,23 @@ class CamCraftStreamService : Service() {
                         mdnsAdvertiser?.unregister()
                         serverBindError = errMsg
                         if (activeSession == null) {
-                            _serviceState.update {
-                                it.copy(
-                                    status = StreamConnectionStatus.ERROR,
-                                    errorMessage = errMsg,
-                                )
+                            val updatedError = synchronized(stateOwnershipLock) {
+                                if (activeInstance !== this@CamCraftStreamService) {
+                                    false
+                                } else {
+                                    activeStateOwnerSessionId = 0L
+                                    _serviceState.update {
+                                        it.copy(
+                                            status = StreamConnectionStatus.ERROR,
+                                            errorMessage = errMsg,
+                                        )
+                                    }
+                                    true
+                                }
                             }
-                            updateNotification("Error: $errMsg")
+                            if (updatedError) {
+                                updateNotification("Error: $errMsg")
+                            }
                         }
                     }
                 } finally {
@@ -538,13 +563,42 @@ class CamCraftStreamService : Service() {
         }
     }
 
+    private fun handleEncoderResolutionAdjusted(sessionId: Long, width: Int, height: Int) {
+        if (isStopping.get()) return
+        val targetSession = activeSession?.takeIf { it.sessionId == sessionId } ?: return
+        val updated = controlCoordinator.updateWithCustomAck(
+            ackBuilder = { next ->
+                val current = activeSession
+                if (!isStopping.get() && current === targetSession && current.sessionId == sessionId) {
+                    current.enqueueAck(ControlAck.success(next))
+                }
+                null
+            },
+            mutate = { cur ->
+                if (cur.width == width && cur.height == height) {
+                    cur
+                } else {
+                    cur.copy(width = width, height = height)
+                }
+            },
+        )
+        synchronized(lifecycleLock) {
+            if (!isStopping.get() && activeSession === targetSession && targetSession.sessionId == sessionId) {
+                val clientLabel = _serviceState.value.clientAddress
+                if (!clientLabel.isNullOrBlank()) {
+                    updateNotification(buildConnectedNotificationText(clientLabel, updated))
+                }
+            }
+        }
+    }
+
     private fun handleAudioPacketFromEngine(
+        sessionId: Long,
         packetType: PacketType,
         ptsUs: Long,
         payload: ByteArray,
         length: Int,
     ) {
-        val sessionId = audioSessionId
         if (sessionId == 0L) return
         sendStreamPacket(sessionId, packetType, CcftFlags.NONE, ptsUs, payload, 0, length, "audio")
     }
@@ -611,6 +665,10 @@ class CamCraftStreamService : Service() {
                 inputStream = inputStream,
                 outputStream = outputStream,
                 closeTransport = closeTransport,
+                isTransportStillCurrent = {
+                    val usbActive = usbJob?.isActive == true && !usbSessionClosing.get()
+                    !usbActive && activeTcpSockets.contains(clientSocket) && !clientSocket.isClosed
+                },
             )
         } catch (e: Exception) {
             Log.w(TAG, "Client TCP connection setup/session error: ${e.message}")
@@ -718,6 +776,11 @@ class CamCraftStreamService : Service() {
                         inputStream = inputStream,
                         outputStream = outputStream,
                         closeTransport = closeTransport,
+                        isTransportStillCurrent = {
+                            synchronized(usbTransportLock) {
+                                !usbSessionClosing.get() && activeUsbPfd === pfd
+                            }
+                        },
                     )
                 } catch (e: Exception) {
                     Log.w(TAG, "USB AOA session setup/teardown error: ${e.message}")
@@ -754,6 +817,7 @@ class CamCraftStreamService : Service() {
         inputStream: DataInputStream,
         outputStream: OutputStream,
         closeTransport: () -> Unit,
+        isTransportStillCurrent: () -> Boolean,
     ) {
         var enteredMutex = false
         try {
@@ -772,6 +836,9 @@ class CamCraftStreamService : Service() {
                     outputLock = sessionOutputLock,
                     closeTransport = closeTransport,
                     ackQueueCapacity = CONTROL_ACK_QUEUE_CAPACITY,
+                    dispatchClose = { closeTask ->
+                        Dispatchers.IO.asExecutor().execute(closeTask)
+                    },
                 )
 
                 val initialActiveState = _serviceState.value.activeState
@@ -780,41 +847,48 @@ class CamCraftStreamService : Service() {
                     rotationDeg = initialActiveState.rotationDeg,
                 )
 
-                synchronized(lifecycleLock) {
-                    activeSession = sessionHandle
-                    audioSessionId = sessionId
-                    _serviceState.update {
-                        it.copy(
-                            status = StreamConnectionStatus.CONNECTED,
-                            clientAddress = clientLabel,
-                        )
-                    }
-                }
-                updateNotification(buildConnectedNotificationText(clientLabel, initialActiveState))
-
-                val ackWriterJob = serviceScope.launch {
-                    for (ack in sessionHandle.ackChannel) {
-                        if (isStopping.get() || activeSession !== sessionHandle) {
-                            break
-                        }
-                        try {
-                            val packet = CcftPacket.controlAck(
-                                ptsUs = System.nanoTime() / 1_000L,
-                                ack = ack,
-                            )
-                            synchronized(sessionHandle.outputLock) {
-                                packet.encodeTo(sessionHandle.output, flush = true)
+                val isCoroutineActive = currentCoroutineContext().isActive
+                val admitted = synchronized(lifecycleLock) {
+                    val canAdmit = !isStopping.get() && isCoroutineActive && isTransportStillCurrent()
+                    if (!canAdmit) {
+                        false
+                    } else {
+                        val published = synchronized(stateOwnershipLock) {
+                            if (activeInstance !== this) {
+                                false
+                            } else {
+                                activeSession = sessionHandle
+                                activeStateOwnerSessionId = sessionId
+                                _serviceState.update {
+                                    it.copy(
+                                        status = StreamConnectionStatus.CONNECTED,
+                                        clientAddress = clientLabel,
+                                    )
+                                }
+                                true
                             }
-                        } catch (e: IOException) {
-                            Log.w(TAG, "Failed writing CONTROL_ACK to client (session=$sessionId): ${e.message}")
-                            sessionHandle.close()
-                            break
                         }
+                        if (published) {
+                            updateNotification(buildConnectedNotificationText(clientLabel, initialActiveState))
+                        }
+                        published
                     }
                 }
+                if (!admitted) {
+                    closeTransportBeforeStreams(closeTransport, inputStream, outputStream)
+                    return
+                }
+
+                val capturedSessionId = sessionHandle.sessionId
+                val appContext = applicationContext ?: this
+                val sessionAudioEngine = AudioStreamEngine(appContext) { packetType, ptsUs, payload, length ->
+                    handleAudioPacketFromEngine(capturedSessionId, packetType, ptsUs, payload, length)
+                }
+                var ackWriterJob: Job? = null
 
                 try {
-                    // 1. Send CONTROL_HELLO (0x10)
+                    // 1. Send and flush CONTROL_HELLO (0x10) BEFORE starting ackWriterJob so any ACKs
+                    //    queued during setup follow HELLO in order.
                     val hello = createDeviceHello(_serviceState.value.activeState, this)
                     val helloPacket = CcftPacket.controlHello(System.nanoTime() / 1_000L, hello)
                     synchronized(sessionHandle.outputLock) {
@@ -822,20 +896,50 @@ class CamCraftStreamService : Service() {
                     }
                     Log.i(TAG, "Sent CONTROL_HELLO to $clientLabel (session=$sessionId)")
 
-                    // 2. Start real CameraX + H.264 hardware encoder pipeline scoped to this session
-                    val activeState = _serviceState.value.activeState
-                    cameraStreamManager?.startStream(
-                        sessionId = sessionHandle.sessionId,
-                        cameraId = activeState.cameraId,
-                        width = activeState.width,
-                        height = activeState.height,
-                        fps = activeState.fps,
-                        bitrateKbps = activeState.bitrateKbps,
-                    )
+                    ackWriterJob = serviceScope.launch {
+                        for (ack in sessionHandle.ackChannel) {
+                            if (isStopping.get() || activeSession !== sessionHandle) {
+                                break
+                            }
+                            try {
+                                val packet = CcftPacket.controlAck(
+                                    ptsUs = System.nanoTime() / 1_000L,
+                                    ack = ack,
+                                )
+                                synchronized(sessionHandle.outputLock) {
+                                    packet.encodeTo(sessionHandle.output, flush = true)
+                                }
+                            } catch (e: IOException) {
+                                Log.w(TAG, "Failed writing CONTROL_ACK to client (session=$sessionId): ${e.message}")
+                                sessionHandle.close()
+                                break
+                            }
+                        }
+                    }
+
+                    // 2. Start CameraX + H.264 encoder serialized with UI lens/config commits under orderLock.
+                    controlCoordinator.runLocked { activeState, seq ->
+                        if (!isStopping.get() && activeSession === sessionHandle) {
+                            activeTransformFlags = computeTransformFlags(
+                                mirrorHorizontal = activeState.mirrorHorizontal,
+                                rotationDeg = activeState.rotationDeg,
+                            )
+                            cameraStreamManager?.startStream(
+                                sessionId = sessionHandle.sessionId,
+                                configSeq = seq,
+                                cameraId = activeState.cameraId,
+                                width = activeState.width,
+                                height = activeState.height,
+                                fps = activeState.fps,
+                                bitrateKbps = activeState.bitrateKbps,
+                            )
+                        }
+                    }
 
                     // 3. If encoder already cached SPS/PPS config for this session, immediately dispatch it
-                    cameraStreamManager?.cachedConfigForSession(sessionHandle.sessionId)?.let { spsPps ->
-                        synchronized(sessionHandle.outputLock) {
+                    var sentCachedConfig = false
+                    synchronized(sessionHandle.outputLock) {
+                        cameraStreamManager?.cachedConfigForSession(sessionHandle.sessionId)?.let { spsPps ->
                             CcftPacket.writePacket(
                                 output = sessionHandle.output,
                                 type = PacketType.VIDEO_CONFIG,
@@ -846,16 +950,36 @@ class CamCraftStreamService : Service() {
                                 length = spsPps.size,
                                 flush = true,
                             )
+                            sentCachedConfig = true
                         }
+                    }
+                    if (sentCachedConfig) {
                         cameraStreamManager?.requestKeyFrame(sessionHandle.sessionId)
                     }
 
-                    // 4. Start AudioStreamEngine if audio forwarding is enabled
-                    if (activeState.audioEnabled) {
-                        val audioStarted = audioStreamEngine?.start(initiallyMuted = activeState.audioMuted) ?: false
-                        if (!audioStarted) {
+                    // 4. Start AudioStreamEngine initially muted off orderLock, then apply committed mute under orderLock
+                    val shouldStartAudio = controlCoordinator.runLocked { state, _ ->
+                        state.audioEnabled && !isStopping.get() && activeSession === sessionHandle
+                    }
+                    if (shouldStartAudio) {
+                        val audioStarted = sessionAudioEngine.start(initiallyMuted = true)
+                        if (audioStarted) {
+                            var keepAudioRunning = false
+                            controlCoordinator.runLocked { state, _ ->
+                                if (state.audioEnabled && !isStopping.get() && activeSession === sessionHandle) {
+                                    sessionHandle.audioEngine = sessionAudioEngine
+                                    sessionAudioEngine.setMuted(state.audioMuted)
+                                    keepAudioRunning = true
+                                }
+                            }
+                            if (!keepAudioRunning) {
+                                sessionAudioEngine.stop()
+                            }
+                        } else {
                             Log.w(TAG, "AudioStreamEngine failed to start (check RECORD_AUDIO permission)")
-                            controlCoordinator.updateAndEnqueue { cur ->
+                            mutateActiveStateAndEnqueueAck(
+                                targetSession = sessionHandle,
+                            ) { cur ->
                                 cur.copy(audioEnabled = false)
                             }
                         }
@@ -871,21 +995,20 @@ class CamCraftStreamService : Service() {
                         if (activeSession === sessionHandle) {
                             activeSession = null
                         }
-                        if (audioSessionId == sessionId) {
-                            audioSessionId = 0L
-                        }
                     }
 
                     sessionHandle.close()
                     closeTransportBeforeStreams(closeTransport, inputStream, outputStream)
                     withContext(NonCancellable) {
-                        ackWriterJob.cancel()
+                        ackWriterJob?.cancel()
                         withTimeoutOrNull(1_000L) {
-                            ackWriterJob.join()
+                            ackWriterJob?.join()
                         }
                     }
 
-                    audioStreamEngine?.stop()
+                    sessionHandle.audioEngine?.release()
+                    sessionAudioEngine.release()
+                    sessionHandle.audioEngine = null
                     cameraStreamManager?.stopStream(sessionHandle.sessionId)
 
                     val isActiveCoroutine = currentCoroutineContext().isActive
@@ -896,44 +1019,33 @@ class CamCraftStreamService : Service() {
                             hasActiveServerSocket = serverSocket?.isClosed == false,
                             serverBindError = serverBindError,
                         )
-                        when (outcome) {
-                            PostSessionStatus.LISTENING -> {
-                                val refreshedIp = LocalIpResolver.resolveLocalIpv4Address(this)
-                                val listenPort = _serviceState.value.listenPort
-                                _serviceState.update {
-                                    it.copy(
-                                        status = StreamConnectionStatus.LISTENING,
-                                        clientAddress = null,
-                                        localIpAddress = refreshedIp,
-                                        currentFps = 0f,
-                                        errorMessage = null,
-                                    )
+                        val refreshedIp = if (outcome == PostSessionStatus.LISTENING) {
+                            LocalIpResolver.resolveLocalIpv4Address(this)
+                        } else {
+                            null
+                        }
+                        val listenPort = _serviceState.value.listenPort
+                        val ownedAndUpdated = applyPostSessionStateIfOwned(
+                            callerInstance = this,
+                            sessionId = sessionId,
+                            outcome = outcome,
+                            listenPort = listenPort,
+                            refreshedIp = refreshedIp,
+                            serverBindError = serverBindError,
+                            serviceState = _serviceState,
+                        )
+                        if (ownedAndUpdated) {
+                            when (outcome) {
+                                PostSessionStatus.LISTENING ->
+                                    updateNotification(buildListeningNotificationText(refreshedIp, listenPort))
+                                PostSessionStatus.ERROR -> {
+                                    val err = serverBindError ?: "Server error"
+                                    updateNotification("Error: $err")
                                 }
-                                updateNotification(buildListeningNotificationText(refreshedIp, listenPort))
-                            }
-                            PostSessionStatus.ERROR -> {
-                                val err = serverBindError ?: "Server error"
-                                _serviceState.update {
-                                    it.copy(
-                                        status = StreamConnectionStatus.ERROR,
-                                        clientAddress = null,
-                                        currentFps = 0f,
-                                        errorMessage = err,
-                                    )
-                                }
-                                updateNotification("Error: $err")
-                            }
-                            PostSessionStatus.STOPPED -> {
-                                _serviceState.update {
-                                    it.copy(
-                                        status = StreamConnectionStatus.STOPPED,
-                                        clientAddress = null,
-                                        currentFps = 0f,
-                                        errorMessage = null,
-                                    )
-                                }
-                                if (!isStopping.get()) {
-                                    updateNotification("Standby • Ready to connect")
+                                PostSessionStatus.STOPPED -> {
+                                    if (!isStopping.get()) {
+                                        updateNotification("Standby • Ready to connect")
+                                    }
                                 }
                             }
                         }
@@ -1039,7 +1151,11 @@ class CamCraftStreamService : Service() {
                         applyConfigureStreamPatch(cur, cmd, targetCam)
                     }
                     if (clientLabel.isNotBlank()) {
-                        updateNotification(buildConnectedNotificationText(clientLabel, updated))
+                        synchronized(lifecycleLock) {
+                            if (!isStopping.get() && activeSession === sessionHandle) {
+                                updateNotification(buildConnectedNotificationText(clientLabel, updated))
+                            }
+                        }
                     }
                 }
                 is ControlCmd.SetCameraParams -> {
@@ -1061,8 +1177,13 @@ class CamCraftStreamService : Service() {
                 }
                 is ControlCmd.SetAudioState -> {
                     if (cmd.enabled) {
-                        val engineActive = audioStreamEngine?.isActive == true ||
-                            (audioStreamEngine?.start(initiallyMuted = cmd.muted) == true)
+                        val capturedSessionId = sessionHandle.sessionId
+                        val engine = sessionHandle.audioEngine ?: AudioStreamEngine(
+                            applicationContext ?: this,
+                        ) { packetType, ptsUs, payload, length ->
+                            handleAudioPacketFromEngine(capturedSessionId, packetType, ptsUs, payload, length)
+                        }
+                        val engineActive = engine.isActive || engine.start(initiallyMuted = true)
                         if (!engineActive) {
                             controlCoordinator.updateWithCustomAck(
                                 ackBuilder = { fallbackState ->
@@ -1076,7 +1197,7 @@ class CamCraftStreamService : Service() {
                                     null
                                 },
                                 onCommittedLocked = { next, _ ->
-                                    audioStreamEngine?.setMuted(next.audioMuted)
+                                    sessionHandle.audioEngine?.setMuted(next.audioMuted)
                                 },
                                 mutate = { cur ->
                                     applyAudioStatePatch(cur, enabled = false, muted = cmd.muted)
@@ -1087,17 +1208,23 @@ class CamCraftStreamService : Service() {
                         mutateActiveStateAndEnqueueAck(
                             targetSession = sessionHandle,
                             onCommittedLocked = { next, _ ->
-                                audioStreamEngine?.setMuted(next.audioMuted)
+                                if (!isStopping.get() && activeSession === sessionHandle) {
+                                    sessionHandle.audioEngine = engine
+                                    engine.setMuted(next.audioMuted)
+                                }
                             },
                         ) { cur ->
                             applyAudioStatePatch(cur, enabled = true, muted = cmd.muted)
                         }
+                        if (isStopping.get() || activeSession !== sessionHandle) {
+                            engine.stop()
+                        }
                     } else {
-                        audioStreamEngine?.stop()
+                        sessionHandle.audioEngine?.stop()
                         mutateActiveStateAndEnqueueAck(
                             targetSession = sessionHandle,
                             onCommittedLocked = { next, _ ->
-                                audioStreamEngine?.setMuted(next.audioMuted)
+                                sessionHandle.audioEngine?.setMuted(next.audioMuted)
                             },
                         ) { cur ->
                             applyAudioStatePatch(cur, enabled = false, muted = cmd.muted)
@@ -1105,8 +1232,8 @@ class CamCraftStreamService : Service() {
                     }
                 }
                 is ControlCmd.RequestKeyframe -> {
-                    cameraStreamManager?.cachedConfigForSession(sessionHandle.sessionId)?.let { spsPps ->
-                        synchronized(sessionHandle.outputLock) {
+                    synchronized(sessionHandle.outputLock) {
+                        cameraStreamManager?.cachedConfigForSession(sessionHandle.sessionId)?.let { spsPps ->
                             CcftPacket.writePacket(
                                 output = sessionHandle.output,
                                 type = PacketType.VIDEO_CONFIG,
@@ -1202,7 +1329,7 @@ class CamCraftStreamService : Service() {
     fun toggleMuteFromUi() {
         mutateActiveStateAndEnqueueAck(
             onCommittedLocked = { next, _ ->
-                audioStreamEngine?.setMuted(next.audioMuted)
+                activeSession?.audioEngine?.setMuted(next.audioMuted)
             },
         ) { cur ->
             cur.copy(audioMuted = !cur.audioMuted)
@@ -1220,7 +1347,6 @@ class CamCraftStreamService : Service() {
         mdnsAdvertiser?.unregister()
         activeSession?.close()
         activeSession = null
-        audioSessionId = 0L
         closeActiveUsbTransport()
         val socketsToClose = activeTcpSockets.toList()
         activeTcpSockets.clear()
@@ -1291,6 +1417,12 @@ class CamCraftStreamService : Service() {
         const val ACTION_START_USB_ACCESSORY = "org.artcraft.camcraft.action.START_USB_ACCESSORY"
         const val ACTION_STOP = "org.artcraft.camcraft.action.STOP"
         const val USB_CLIENT_LABEL = "USB Direct"
+
+        private val nextSessionId = AtomicLong(1L)
+        private val stateOwnershipLock = Any()
+
+        @Volatile
+        private var activeStateOwnerSessionId: Long = 0L
 
         @Volatile
         private var activeInstance: CamCraftStreamService? = null
@@ -1552,6 +1684,94 @@ class CamCraftStreamService : Service() {
             else -> PostSessionStatus.STOPPED
         }
 
+        internal fun canMutateServiceStateForSession(
+            activeInstance: Any?,
+            callerInstance: Any?,
+            activeOwnerSessionId: Long,
+            sessionId: Long,
+        ): Boolean = activeInstance != null &&
+            activeInstance === callerInstance &&
+            sessionId != 0L &&
+            activeOwnerSessionId == sessionId
+
+        internal fun applyPostSessionStateWithOwnership(
+            ownershipLock: Any,
+            isOwned: () -> Boolean,
+            clearSessionOwnership: () -> Unit,
+            outcome: PostSessionStatus,
+            listenPort: Int,
+            refreshedIp: String?,
+            serverBindError: String?,
+            serviceState: MutableStateFlow<StreamServiceState>,
+        ): Boolean = synchronized(ownershipLock) {
+            if (!isOwned()) {
+                return@synchronized false
+            }
+            clearSessionOwnership()
+            when (outcome) {
+                PostSessionStatus.LISTENING -> {
+                    serviceState.update {
+                        it.copy(
+                            status = StreamConnectionStatus.LISTENING,
+                            clientAddress = null,
+                            localIpAddress = refreshedIp,
+                            listenPort = listenPort,
+                            currentFps = 0f,
+                            errorMessage = null,
+                        )
+                    }
+                }
+                PostSessionStatus.ERROR -> {
+                    val err = serverBindError ?: "Server error"
+                    serviceState.update {
+                        it.copy(
+                            status = StreamConnectionStatus.ERROR,
+                            clientAddress = null,
+                            currentFps = 0f,
+                            errorMessage = err,
+                        )
+                    }
+                }
+                PostSessionStatus.STOPPED -> {
+                    serviceState.update {
+                        it.copy(
+                            status = StreamConnectionStatus.STOPPED,
+                            clientAddress = null,
+                            currentFps = 0f,
+                            errorMessage = null,
+                        )
+                    }
+                }
+            }
+            true
+        }
+
+        internal fun applyPostSessionStateIfOwned(
+            callerInstance: CamCraftStreamService,
+            sessionId: Long,
+            outcome: PostSessionStatus,
+            listenPort: Int,
+            refreshedIp: String?,
+            serverBindError: String?,
+            serviceState: MutableStateFlow<StreamServiceState>,
+        ): Boolean = applyPostSessionStateWithOwnership(
+            ownershipLock = stateOwnershipLock,
+            isOwned = {
+                canMutateServiceStateForSession(
+                    activeInstance = activeInstance,
+                    callerInstance = callerInstance,
+                    activeOwnerSessionId = activeStateOwnerSessionId,
+                    sessionId = sessionId,
+                )
+            },
+            clearSessionOwnership = { activeStateOwnerSessionId = 0L },
+            outcome = outcome,
+            listenPort = listenPort,
+            refreshedIp = refreshedIp,
+            serverBindError = serverBindError,
+            serviceState = serviceState,
+        )
+
         internal fun decideWifiIpChangeAction(
             isStopping: Boolean,
             status: StreamConnectionStatus,
@@ -1639,19 +1859,31 @@ internal class ClientSessionHandle(
     val closeTransport: () -> Unit,
     private val ackQueueCapacity: Int = CamCraftStreamService.CONTROL_ACK_QUEUE_CAPACITY,
     private val onQueueOverflow: ((ClientSessionHandle) -> Unit)? = null,
+    private val dispatchClose: (() -> Unit) -> Unit = { it() },
 ) {
     val ackChannel = Channel<ControlAck>(ackQueueCapacity)
     private val closed = AtomicBoolean(false)
+    private val transportClosed = AtomicBoolean(false)
+
+    @Volatile
+    var audioEngine: AudioStreamEngine? = null
 
     val isClosed: Boolean
         get() = closed.get()
+
+    private fun closeTransportOnce() {
+        if (transportClosed.compareAndSet(false, true)) {
+            closeTransport()
+        }
+    }
 
     fun enqueueAck(ack: ControlAck): Boolean {
         if (closed.get()) return false
         val result = ackChannel.trySend(ack)
         if (result.isSuccess) return true
         val channelClosed = result.isClosed || closed.get()
-        if (!channelClosed && closeInternal()) {
+        if (!channelClosed && closed.compareAndSet(false, true)) {
+            ackChannel.close()
             try {
                 Log.w(
                     CamCraftStreamService.TAG,
@@ -1661,19 +1893,17 @@ internal class ClientSessionHandle(
                 // JVM unit tests do not mock android.util.Log.
             }
             onQueueOverflow?.invoke(this)
+            dispatchClose {
+                closeTransportOnce()
+            }
         }
         return false
     }
 
     fun close() {
-        closeInternal()
-    }
-
-    private fun closeInternal(): Boolean {
-        if (!closed.compareAndSet(false, true)) return false
+        closed.compareAndSet(false, true)
         ackChannel.close()
-        closeTransport()
-        return true
+        closeTransportOnce()
     }
 }
 
@@ -1688,6 +1918,12 @@ internal class ControlStateAckCoordinator(
 ) {
     private val orderLock = Any()
     private var commitSeq: Long = 0L
+
+    fun <T> runLocked(block: (ActiveCameraState, Long) -> T): T = synchronized(orderLock) {
+        val state = serviceState.value.activeState
+        val seq = ++commitSeq
+        block(state, seq)
+    }
 
     fun updateAndEnqueue(
         camerasOverride: List<CameraInfo>? = null,
