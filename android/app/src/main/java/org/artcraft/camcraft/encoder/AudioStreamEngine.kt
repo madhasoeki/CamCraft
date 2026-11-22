@@ -30,15 +30,14 @@ class AudioStreamEngine(
     private val onAudioPacket: (packetType: PacketType, ptsUs: Long, payload: ByteArray, length: Int) -> Unit,
 ) {
 
-    private val lifecycleLock = Any()
-    private val isRunning = AtomicBoolean(false)
+    private val lifecycleCoordinator = AudioLifecycleCoordinator<AudioRecord>(
+        stopResource = { it.stop() },
+        releaseResource = { it.release() },
+    )
     private val isMuted = AtomicBoolean(false)
 
-    private var audioRecord: AudioRecord? = null
-    private var captureThread: Thread? = null
-
     val isActive: Boolean
-        get() = isRunning.get()
+        get() = lifecycleCoordinator.isActive
 
     /**
      * Updates mute state in real time without stopping [AudioRecord].
@@ -56,65 +55,64 @@ class AudioStreamEngine(
 
     /**
      * Initializes [AudioRecord] and starts the background capture thread.
+     * Serialized against [stop] so a new [AudioRecord] is never opened until the previous
+     * instance and capture thread have completely stopped and released.
      *
      * Returns `false` if `RECORD_AUDIO` permission is missing or the audio device fails to initialize.
      */
     fun start(initiallyMuted: Boolean = false): Boolean {
-        synchronized(lifecycleLock) {
-            isMuted.set(initiallyMuted)
-            if (isRunning.get()) {
-                return true
-            }
+        isMuted.set(initiallyMuted)
+        val started = lifecycleCoordinator.start(
+            createAndStart = {
+                if (!hasRecordAudioPermission()) {
+                    Log.w(TAG, "RECORD_AUDIO permission not granted; skipping audio capture start")
+                    return@start null
+                }
 
-            if (!hasRecordAudioPermission()) {
-                Log.w(TAG, "RECORD_AUDIO permission not granted; skipping audio capture start")
-                return false
-            }
+                val minBuf = AudioRecord.getMinBufferSize(
+                    SAMPLE_RATE_HZ,
+                    AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                )
+                if (minBuf <= 0) {
+                    Log.e(TAG, "AudioRecord.getMinBufferSize failed with code $minBuf")
+                    return@start null
+                }
 
-            val minBuf = AudioRecord.getMinBufferSize(
-                SAMPLE_RATE_HZ,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT,
-            )
-            if (minBuf <= 0) {
-                Log.e(TAG, "AudioRecord.getMinBufferSize failed with code $minBuf")
-                return false
-            }
+                val bufferSizeBytes = calculateBufferSizeBytes(minBuf)
+                val record = buildAudioRecord(bufferSizeBytes)
+                if (record == null) {
+                    Log.e(TAG, "Failed to initialize AudioRecord (bufferSize=$bufferSizeBytes)")
+                    return@start null
+                }
 
-            val bufferSizeBytes = calculateBufferSizeBytes(minBuf)
-            val record = buildAudioRecord(bufferSizeBytes)
-            if (record == null) {
-                Log.e(TAG, "Failed to initialize AudioRecord (bufferSize=$bufferSizeBytes)")
-                return false
-            }
-
-            try {
-                record.startRecording()
-            } catch (e: Exception) {
-                Log.e(TAG, "AudioRecord.startRecording failed: ${e.message}", e)
                 try {
-                    record.release()
-                } catch (_: Exception) {}
-                return false
-            }
-
-            audioRecord = record
-            isRunning.set(true)
-
-            val thread = Thread({
-                captureLoop(record)
-            }, "CamCraft-Audio-Capture").apply {
-                isDaemon = true
-            }
-            captureThread = thread
-            thread.start()
-
+                    record.startRecording()
+                } catch (e: Exception) {
+                    Log.e(TAG, "AudioRecord.startRecording failed: ${e.message}", e)
+                    try {
+                        record.release()
+                    } catch (_: Exception) {}
+                    return@start null
+                }
+                record
+            },
+            spawnWorker = { record ->
+                Thread({
+                    captureLoop(record)
+                }, "CamCraft-Audio-Capture").apply {
+                    isDaemon = true
+                    start()
+                }
+            },
+        )
+        if (started) {
             Log.i(
                 TAG,
                 "AudioStreamEngine started (${SAMPLE_RATE_HZ}Hz Mono PCM_16BIT, ${FRAME_SIZE_BYTES}B/20ms, muted=$initiallyMuted)",
             )
-            return true
         }
+        return started
     }
 
     @SuppressLint("MissingPermission")
@@ -162,10 +160,11 @@ class AudioStreamEngine(
 
             val pcmBuffer = ByteArray(FRAME_SIZE_BYTES)
             val silentBuffer = ByteArray(FRAME_SIZE_BYTES)
+            var abortCapture = false
 
-            while (isRunning.get()) {
+            while (lifecycleCoordinator.isActive && !abortCapture) {
                 var filled = 0
-                while (filled < FRAME_SIZE_BYTES && isRunning.get()) {
+                while (filled < FRAME_SIZE_BYTES && lifecycleCoordinator.isActive) {
                     val read = try {
                         record.read(
                             pcmBuffer,
@@ -174,22 +173,26 @@ class AudioStreamEngine(
                             AudioRecord.READ_BLOCKING,
                         )
                     } catch (e: Exception) {
-                        if (isRunning.get()) {
+                        if (lifecycleCoordinator.isActive) {
                             Log.w(TAG, "AudioRecord.read exception: ${e.message}")
                         }
                         -1
                     }
 
-                    if (read <= 0) {
-                        if (read < 0 && isRunning.get()) {
-                            Log.w(TAG, "AudioRecord.read returned error code $read")
+                    when (evaluateReadStep(read, filled)) {
+                        ReadStepDecision.ADVANCE -> filled += read
+                        ReadStepDecision.RETRY_FRAME -> break
+                        ReadStepDecision.ABORT_CAPTURE -> {
+                            if (read < 0 && lifecycleCoordinator.isActive) {
+                                Log.w(TAG, "AudioRecord.read returned error code $read (filled=$filled)")
+                            }
+                            abortCapture = true
+                            break
                         }
-                        break
                     }
-                    filled += read
                 }
 
-                if (!isRunning.get()) {
+                if (abortCapture || !lifecycleCoordinator.isActive) {
                     break
                 }
 
@@ -197,31 +200,11 @@ class AudioStreamEngine(
                     val ptsUs = System.nanoTime() / 1_000L
                     val payload = selectFramePayload(pcmBuffer, silentBuffer, isMuted.get())
                     onAudioPacket(PacketType.AUDIO_FRAME, ptsUs, payload, FRAME_SIZE_BYTES)
-                } else if (filled == 0) {
-                    // Avoid tight spin if AudioRecord stopped reporting samples
-                    break
                 }
             }
         } finally {
-            val orphanRecord = synchronized(lifecycleLock) {
-                if (audioRecord === record) {
-                    isRunning.set(false)
-                    audioRecord = null
-                    if (captureThread === Thread.currentThread()) {
-                        captureThread = null
-                    }
-                    record
-                } else {
-                    null
-                }
-            }
-            if (orphanRecord != null) {
-                try {
-                    orphanRecord.stop()
-                } catch (_: Exception) {}
-                try {
-                    orphanRecord.release()
-                } catch (_: Exception) {}
+            val releasedOrphan = lifecycleCoordinator.onWorkerExit(record)
+            if (releasedOrphan) {
                 Log.w(TAG, "AudioStreamEngine captureLoop exited unexpectedly; AudioRecord released")
             }
         }
@@ -231,38 +214,7 @@ class AudioStreamEngine(
      * Stops audio recording, joins the capture thread, and releases [AudioRecord].
      */
     fun stop() {
-        val (record, thread) = synchronized(lifecycleLock) {
-            val wasRunning = isRunning.getAndSet(false)
-            val activeRecord = audioRecord
-            val activeThread = captureThread
-            if (!wasRunning && activeRecord == null && activeThread == null) {
-                return
-            }
-            audioRecord = null
-            captureThread = null
-            activeRecord to activeThread
-        }
-
-        try {
-            record?.stop()
-        } catch (_: Exception) {}
-
-        if (thread != null && thread !== Thread.currentThread()) {
-            try {
-                thread.join(500)
-                if (thread.isAlive) {
-                    thread.interrupt()
-                    thread.join(100)
-                }
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-            }
-        }
-
-        try {
-            record?.release()
-        } catch (_: Exception) {}
-
+        lifecycleCoordinator.stop()
         Log.i(TAG, "AudioStreamEngine stopped")
     }
 
@@ -319,6 +271,148 @@ class AudioStreamEngine(
                 candidate
             } else {
                 candidate + (FRAME_SIZE_BYTES - remainder)
+            }
+        }
+
+        internal enum class ReadStepDecision {
+            ADVANCE,
+            RETRY_FRAME,
+            ABORT_CAPTURE,
+        }
+
+        /**
+         * Classifies an `AudioRecord.read` return value given how many bytes [filledBefore]
+         * have already been accumulated into the current 20 ms frame.
+         * Any negative error code aborts capture immediately (discarding partial bytes).
+         */
+        internal fun evaluateReadStep(read: Int, filledBefore: Int): ReadStepDecision = when {
+            read < 0 -> ReadStepDecision.ABORT_CAPTURE
+            read == 0 && filledBefore == 0 -> ReadStepDecision.ABORT_CAPTURE
+            read == 0 -> ReadStepDecision.RETRY_FRAME
+            else -> ReadStepDecision.ADVANCE
+        }
+    }
+}
+
+/**
+ * Serializes [start] and [stop] calls across threads without deadlocking against [onWorkerExit],
+ * guaranteeing any prior audio resource and worker thread are stopped, joined, and released
+ * before a subsequent resource can be constructed.
+ */
+internal class AudioLifecycleCoordinator<R : Any>(
+    private val stopResource: (R) -> Unit,
+    private val releaseResource: (R) -> Unit,
+) {
+    private val startStopLock = Any()
+    private val stateLock = Any()
+    private val running = AtomicBoolean(false)
+
+    private var activeResource: R? = null
+    private var activeThread: Thread? = null
+
+    val isActive: Boolean
+        get() = running.get()
+
+    fun start(
+        createAndStart: () -> R?,
+        spawnWorker: (R) -> Thread,
+    ): Boolean {
+        synchronized(startStopLock) {
+            val staleThread = synchronized(stateLock) {
+                if (running.get()) return true
+                activeThread.also { activeThread = null }
+            }
+            joinThread(staleThread)
+
+            val resource = createAndStart() ?: return false
+            synchronized(stateLock) {
+                activeResource = resource
+                running.set(true)
+                try {
+                    activeThread = spawnWorker(resource)
+                } catch (e: Throwable) {
+                    running.set(false)
+                    activeResource = null
+                    activeThread = null
+                    try {
+                        stopResource(resource)
+                    } catch (_: Exception) {}
+                    try {
+                        releaseResource(resource)
+                    } catch (_: Exception) {}
+                    throw e
+                }
+            }
+            return true
+        }
+    }
+
+    fun stop() {
+        synchronized(startStopLock) {
+            val (resource, thread) = synchronized(stateLock) {
+                val wasRunning = running.getAndSet(false)
+                val res = activeResource
+                val thr = activeThread
+                if (!wasRunning && res == null && thr == null) {
+                    return
+                }
+                activeResource = null
+                activeThread = null
+                res to thr
+            }
+
+            if (resource != null) {
+                try {
+                    stopResource(resource)
+                } catch (_: Exception) {}
+            }
+
+            joinThread(thread)
+
+            if (resource != null) {
+                try {
+                    releaseResource(resource)
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
+    fun onWorkerExit(resource: R): Boolean {
+        val orphan = synchronized(stateLock) {
+            if (activeResource === resource) {
+                running.set(false)
+                activeResource = null
+                resource
+            } else {
+                null
+            }
+        }
+        if (orphan != null) {
+            try {
+                stopResource(orphan)
+            } catch (_: Exception) {}
+            try {
+                releaseResource(orphan)
+            } catch (_: Exception) {}
+        }
+        synchronized(stateLock) {
+            if (activeThread === Thread.currentThread()) {
+                activeThread = null
+            }
+        }
+        return orphan != null
+    }
+
+    private fun joinThread(thread: Thread?) {
+        if (thread != null && thread !== Thread.currentThread()) {
+            try {
+                thread.join(500)
+                if (thread.isAlive) {
+                    thread.interrupt()
+                    thread.join(100)
+                }
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
             }
         }
     }

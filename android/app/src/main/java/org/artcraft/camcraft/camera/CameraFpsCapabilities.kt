@@ -98,41 +98,45 @@ object CameraFpsCapabilities {
     /**
      * Parses `CustomHFRFpsTable` / `algoCustomHFRFpsTable` (`int32` stride-3 `[w, h, fps]`
      * or stride-5 `[w, h, fps, ...]`).
+     *
+     * When `raw.size % 15 == 0`, both stride-3 and stride-5 layouts divide the array evenly, so we
+     * validate both and choose stride-5 when its valid-tuple proportion exceeds stride-3.
      */
     fun parseCustomHfrFpsTable(raw: IntArray?): List<StreamFpsEntry> {
         if (raw == null || raw.size < 3) return emptyList()
 
+        val divisibleBy3 = raw.size % 3 == 0
+        val divisibleBy5 = raw.size % 5 == 0
         return when {
-            raw.size % 3 == 0 -> {
-                val entries = ArrayList<StreamFpsEntry>(raw.size / 3)
-                var i = 0
-                while (i < raw.size) {
-                    val w = raw[i]
-                    val h = raw[i + 1]
-                    val fps = raw[i + 2]
-                    if (w in 160..16384 && h in 120..16384 && fps in 24..480) {
-                        entries.add(StreamFpsEntry(width = w, height = h, minFps = fps, maxFps = fps))
-                    }
-                    i += 3
+            divisibleBy3 && divisibleBy5 -> {
+                val stride3 = parseCustomHfrWithStride(raw, stride = 3)
+                val stride5 = parseCustomHfrWithStride(raw, stride = 5)
+                // Cross-multiply valid fractions: stride5.size / (n / 5) vs stride3.size / (n / 3)
+                if (stride5.size * 5 > stride3.size * 3) {
+                    stride5
+                } else {
+                    stride3
                 }
-                entries
             }
-            raw.size % 5 == 0 -> {
-                val entries = ArrayList<StreamFpsEntry>(raw.size / 5)
-                var i = 0
-                while (i < raw.size) {
-                    val w = raw[i]
-                    val h = raw[i + 1]
-                    val fps = raw[i + 2]
-                    if (w in 160..16384 && h in 120..16384 && fps in 24..480) {
-                        entries.add(StreamFpsEntry(width = w, height = h, minFps = fps, maxFps = fps))
-                    }
-                    i += 5
-                }
-                entries
-            }
+            divisibleBy3 -> parseCustomHfrWithStride(raw, stride = 3)
+            divisibleBy5 -> parseCustomHfrWithStride(raw, stride = 5)
             else -> emptyList()
         }
+    }
+
+    private fun parseCustomHfrWithStride(raw: IntArray, stride: Int): List<StreamFpsEntry> {
+        val entries = ArrayList<StreamFpsEntry>(raw.size / stride)
+        var i = 0
+        while (i < raw.size) {
+            val w = raw[i]
+            val h = raw[i + 1]
+            val fps = raw[i + 2]
+            if (w in 160..16384 && h in 120..16384 && fps in 24..480) {
+                entries.add(StreamFpsEntry(width = w, height = h, minFps = fps, maxFps = fps))
+            }
+            i += stride
+        }
+        return entries
     }
 
     private fun matchesSize(entry: StreamFpsEntry, width: Int, height: Int): Boolean =

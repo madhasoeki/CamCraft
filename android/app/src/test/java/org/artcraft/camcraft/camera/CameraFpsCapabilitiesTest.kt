@@ -280,6 +280,40 @@ class CameraFpsCapabilitiesTest {
         val stride5 = CameraFpsCapabilities.parseCustomHfrFpsTable(intArrayOf(1920, 1080, 60, 0, 1))
         assertEquals(listOf(StreamFpsEntry(1920, 1080, 60, 60)), stride5)
 
+        // 15-int (divisible by both 3 and 5) stride-5 table (3 entries) must not be misparsed as stride-3
+        val stride5Len15 = intArrayOf(
+            3840, 2160, 30, 0, 0,
+            1920, 1080, 60, 0, 0,
+            1280, 720, 60, 0, 0,
+        )
+        assertEquals(
+            listOf(
+                StreamFpsEntry(3840, 2160, 30, 30),
+                StreamFpsEntry(1920, 1080, 60, 60),
+                StreamFpsEntry(1280, 720, 60, 60),
+            ),
+            CameraFpsCapabilities.parseCustomHfrFpsTable(stride5Len15),
+        )
+
+        // 15-int stride-3 table (5 entries) must still parse all 5 entries as stride-3
+        val stride3Len15 = intArrayOf(
+            4080, 1832, 60,
+            2304, 1296, 60,
+            1920, 1080, 60,
+            1280, 720, 60,
+            640, 480, 60,
+        )
+        assertEquals(
+            listOf(
+                StreamFpsEntry(4080, 1832, 60, 60),
+                StreamFpsEntry(2304, 1296, 60, 60),
+                StreamFpsEntry(1920, 1080, 60, 60),
+                StreamFpsEntry(1280, 720, 60, 60),
+                StreamFpsEntry(640, 480, 60, 60),
+            ),
+            CameraFpsCapabilities.parseCustomHfrFpsTable(stride3Len15),
+        )
+
         // Zero/negative requestedFps safely returns null
         assertNull(
             CameraFpsCapabilities.resolveTargetFpsPlan(
