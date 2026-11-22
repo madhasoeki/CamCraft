@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Android Audio Capture & Vendor HFR FPS Parsing:**
+  - Serialized `AudioStreamEngine.start()`/`stop()` transitions via `AudioLifecycleCoordinator` without deadlocking worker exit, and terminated capture loops immediately on negative `AudioRecord.read` returns even after partial frame bytes (`BUG-08`).
+  - Disambiguated vendor `CustomHFRFpsTable` stride-3 vs stride-5 layouts on lengths divisible by 15 using valid `(width, height, fps)` entry proportion (`BUG-18`).
+
 ## [0.0.3] - 2026-11-21
 
 ### Fixed
