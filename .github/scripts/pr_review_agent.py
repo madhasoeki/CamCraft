@@ -9,6 +9,7 @@ Configured purely via GitHub Repository Secrets:
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import sys
@@ -259,15 +260,131 @@ def parse_ai_response_body(raw: str) -> dict[str, Any]:
 
 
 def _set_response_socket_timeout(resp: Any, sock_timeout: float) -> None:
-    fp = getattr(resp, "fp", None)
-    raw_fp = getattr(fp, "raw", None)
-    for owner in (fp, raw_fp):
-        sock = getattr(owner, "_sock", None)
-        if sock is not None:
-            try:
-                sock.settimeout(sock_timeout)
-            except (AttributeError, OSError):
-                pass
+    cur: Any = resp
+    visited: set[int] = set()
+    for _ in range(4):
+        if cur is None or id(cur) in visited:
+            break
+        visited.add(id(cur))
+        raw_cur = getattr(cur, "raw", None)
+        for owner in (cur, raw_cur):
+            sock = getattr(owner, "_sock", None)
+            if sock is not None:
+                try:
+                    sock.settimeout(sock_timeout)
+                except (AttributeError, OSError):
+                    pass
+                return
+        cur = getattr(cur, "fp", None)
+
+
+def _get_header(headers: Any, name: str) -> str | None:
+    if headers is None:
+        return None
+    target = name.lower()
+    if hasattr(headers, "items"):
+        values = [str(v) for k, v in headers.items() if str(k).lower() == target]
+        if values:
+            return ", ".join(values)
+    getter = getattr(headers, "get", None)
+    if callable(getter):
+        val = getter(name)
+        return None if val is None else str(val)
+    return None
+
+
+def _parse_content_length(resp: Any) -> int | None:
+    status = getattr(resp, "status", None)
+    if isinstance(status, int) and (status in (204, 304) or 100 <= status < 200):
+        return None
+    if getattr(resp, "chunked", False):
+        return None
+    headers = getattr(resp, "headers", None)
+    transfer_encoding = _get_header(headers, "Transfer-Encoding")
+    if transfer_encoding and "chunked" in transfer_encoding.lower():
+        return None
+    raw_len = _get_header(headers, "Content-Length")
+    if raw_len is None:
+        return None
+    parts = {part.strip() for part in raw_len.split(",") if part.strip()}
+    if len(parts) != 1:
+        return None
+    try:
+        parsed = int(next(iter(parts)))
+    except ValueError:
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _read_response_bytes(
+    resp: Any,
+    *,
+    timeout: float,
+    deadline: float | None,
+    clean_url: str,
+    max_bytes: int | None = None,
+    allow_partial_on_deadline: bool = False,
+) -> bytes:
+    chunks: list[bytes] = []
+    total_read = 0
+    read_fn = getattr(resp, "read1", resp.read)
+    declared_len = None if allow_partial_on_deadline else _parse_content_length(resp)
+
+    while True:
+        if max_bytes is not None:
+            to_read = min(65536, max_bytes - total_read)
+            if to_read <= 0:
+                break
+        else:
+            to_read = 65536
+
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if allow_partial_on_deadline:
+                    break
+                raise RuntimeError(f"AI stage total timeout exceeded reading from {clean_url}")
+            _set_response_socket_timeout(resp, min(float(timeout), remaining))
+
+        try:
+            block = read_fn(to_read)
+        except http.client.IncompleteRead as inc_err:
+            if allow_partial_on_deadline:
+                if inc_err.partial:
+                    remaining_cap = None if max_bytes is None else max(0, max_bytes - total_read)
+                    chunks.append(
+                        inc_err.partial if remaining_cap is None else inc_err.partial[:remaining_cap]
+                    )
+                break
+            raise RuntimeError(
+                f"Incomplete response body from {clean_url}: "
+                f"read {total_read + len(inc_err.partial)} bytes before premature EOF"
+            ) from None
+        except (TimeoutError, OSError, http.client.HTTPException):
+            if allow_partial_on_deadline:
+                break
+            raise
+
+        if not block:
+            if not allow_partial_on_deadline:
+                if declared_len is not None and total_read < declared_len:
+                    raise RuntimeError(
+                        f"Incomplete response body from {clean_url}: "
+                        f"read {total_read} of {declared_len} bytes"
+                    )
+                if declared_len is None and not getattr(resp, "chunked", False):
+                    unread_len = getattr(resp, "length", None)
+                    if isinstance(unread_len, int) and unread_len > 0:
+                        raise RuntimeError(
+                            f"Incomplete response body from {clean_url}: "
+                            f"{unread_len} unread bytes remaining"
+                        )
+            break
+
+        chunks.append(block)
+        total_read += len(block)
+
+    return b"".join(chunks)
 
 
 def http_json(
@@ -298,21 +415,12 @@ def http_json(
 
     try:
         with urllib.request.urlopen(req, timeout=eff_timeout) as resp:
-            if deadline is None:
-                raw = resp.read().decode("utf-8", errors="replace")
-            else:
-                chunks: list[bytes] = []
-                read_fn = getattr(resp, "read1", resp.read)
-                while True:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise RuntimeError(f"AI stage total timeout exceeded reading from {clean_url}")
-                    _set_response_socket_timeout(resp, min(float(timeout), remaining))
-                    block = read_fn(65536)
-                    if not block:
-                        break
-                    chunks.append(block)
-                raw = b"".join(chunks).decode("utf-8", errors="replace")
+            raw = _read_response_bytes(
+                resp,
+                timeout=timeout,
+                deadline=deadline,
+                clean_url=clean_url,
+            ).decode("utf-8", errors="replace")
 
             content_type = resp.headers.get("Content-Type", "unknown") if resp.headers else "unknown"
             if not raw.strip():
@@ -332,7 +440,20 @@ def http_json(
                     ) from None
             return resp.status, parsed
     except urllib.error.HTTPError as err:
-        raw_err = err.read().decode("utf-8", errors="replace")
+        try:
+            raw_err = _read_response_bytes(
+                err,
+                timeout=timeout,
+                deadline=deadline,
+                clean_url=clean_url,
+                max_bytes=65536,
+                allow_partial_on_deadline=True,
+            ).decode("utf-8", errors="replace")
+        finally:
+            try:
+                err.close()
+            except OSError:
+                pass
         # Never surface request headers (e.g. API keys) in exceptions.
         snippet = raw_err.strip()[:400]
         raise RuntimeError(f"HTTP {err.code} from {clean_url}: {snippet}") from None
@@ -340,6 +461,8 @@ def http_json(
         raise RuntimeError(f"Network error calling {clean_url}: {err.reason}") from None
     except TimeoutError as err:
         raise RuntimeError(f"Request timed out calling {clean_url}: {err}") from None
+    except http.client.HTTPException as err:
+        raise RuntimeError(f"HTTP protocol error calling {clean_url}: {err}") from None
 
 
 def _is_permanent_http_error(err: Exception) -> bool:
