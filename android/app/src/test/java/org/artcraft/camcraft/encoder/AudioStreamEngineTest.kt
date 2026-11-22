@@ -181,7 +181,57 @@ class AudioStreamEngineTest {
         assertEquals(1, maxConcurrent.get())
         assertEquals(listOf("release-1", "create-2"), synchronized(releaseEvents) { releaseEvents.toList() })
 
-        coordinator.stop()
+        assertTrue(coordinator.stop())
+        assertFalse(coordinator.stop())
         assertFalse(coordinator.isActive)
+    }
+
+    @Test
+    fun lifecycleCoordinatorStopReturnsTrueWhenActiveAndFalseWhenIdle() {
+        val stopCalls = AtomicInteger(0)
+        val releaseCalls = AtomicInteger(0)
+        val allowExit = CountDownLatch(1)
+        val workerStarted = CountDownLatch(1)
+
+        val coordinator = AudioLifecycleCoordinator<String>(
+            stopResource = {
+                stopCalls.incrementAndGet()
+                allowExit.countDown()
+            },
+            releaseResource = {
+                releaseCalls.incrementAndGet()
+            },
+        )
+
+        // Idle before ever starting.
+        assertFalse(coordinator.stop())
+        assertEquals(0, stopCalls.get())
+        assertEquals(0, releaseCalls.get())
+
+        // Active engine tears down cleanly and returns true once.
+        assertTrue(
+            coordinator.start(
+                createAndStart = { "record-1" },
+                spawnWorker = { rec ->
+                    Thread {
+                        workerStarted.countDown()
+                        allowExit.await(1, TimeUnit.SECONDS)
+                        coordinator.onWorkerExit(rec)
+                    }.apply { start() }
+                },
+            ),
+        )
+        assertTrue(workerStarted.await(1, TimeUnit.SECONDS))
+
+        assertTrue(coordinator.stop())
+        assertEquals(1, stopCalls.get())
+        assertEquals(1, releaseCalls.get())
+        assertFalse(coordinator.isActive)
+
+        // Redundant idle calls return false without re-invoking resource teardown.
+        assertFalse(coordinator.stop())
+        assertFalse(coordinator.stop())
+        assertEquals(1, stopCalls.get())
+        assertEquals(1, releaseCalls.get())
     }
 }

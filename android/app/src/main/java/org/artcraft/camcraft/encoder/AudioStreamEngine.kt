@@ -214,8 +214,9 @@ class AudioStreamEngine(
      * Stops audio recording, joins the capture thread, and releases [AudioRecord].
      */
     fun stop() {
-        lifecycleCoordinator.stop()
-        Log.i(TAG, "AudioStreamEngine stopped")
+        if (lifecycleCoordinator.stop()) {
+            Log.i(TAG, "AudioStreamEngine stopped")
+        }
     }
 
     fun release() {
@@ -347,34 +348,33 @@ internal class AudioLifecycleCoordinator<R : Any>(
         }
     }
 
-    fun stop() {
-        synchronized(startStopLock) {
-            val (resource, thread) = synchronized(stateLock) {
-                val wasRunning = running.getAndSet(false)
-                val res = activeResource
-                val thr = activeThread
-                if (!wasRunning && res == null && thr == null) {
-                    return
-                }
-                activeResource = null
-                activeThread = null
-                res to thr
+    fun stop(): Boolean = synchronized(startStopLock) {
+        val (resource, thread) = synchronized(stateLock) {
+            val wasRunning = running.getAndSet(false)
+            val res = activeResource
+            val thr = activeThread
+            if (!wasRunning && res == null && thr == null) {
+                return false
             }
-
-            if (resource != null) {
-                try {
-                    stopResource(resource)
-                } catch (_: Exception) {}
-            }
-
-            joinThread(thread)
-
-            if (resource != null) {
-                try {
-                    releaseResource(resource)
-                } catch (_: Exception) {}
-            }
+            activeResource = null
+            activeThread = null
+            res to thr
         }
+
+        if (resource != null) {
+            try {
+                stopResource(resource)
+            } catch (_: Exception) {}
+        }
+
+        joinThread(thread)
+
+        if (resource != null) {
+            try {
+                releaseResource(resource)
+            } catch (_: Exception) {}
+        }
+        true
     }
 
     fun onWorkerExit(resource: R): Boolean {
