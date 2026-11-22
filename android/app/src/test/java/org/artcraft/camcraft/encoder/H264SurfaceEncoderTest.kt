@@ -4,6 +4,8 @@ import android.media.MediaCodecInfo
 import java.nio.ByteBuffer
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class H264SurfaceEncoderTest {
@@ -120,5 +122,41 @@ class H264SurfaceEncoderTest {
             byteArrayOf(0, 0, 0, 1, 0x65, 0x88.toByte(), 0x84.toByte()),
             scratch.copyOfRange(slice.offset, slice.offset + slice.length),
         )
+    }
+
+    @Test
+    fun drainReleaseCoordinatorDefersCleanupWhileCallbackStalledAndFinalizesOnce() {
+        // 1. Stalled drain thread still running when release() is requested:
+        //    requestRelease() must return false so codec/surface are NOT released early,
+        //    and markDrainExited() must trigger cleanup exactly once once drain finishes.
+        val stalledCoord = DrainReleaseCoordinator()
+        stalledCoord.markDrainStarted()
+        assertFalse(stalledCoord.requestRelease())
+        assertTrue(stalledCoord.isReleaseRequested())
+        assertFalse(stalledCoord.isFinalized())
+
+        // Repeated release request remains safe and returns false.
+        assertFalse(stalledCoord.requestRelease())
+        assertFalse(stalledCoord.isFinalized())
+
+        // Stalled callback unblocks and drain exits -> finalizes once.
+        assertTrue(stalledCoord.markDrainExited())
+        assertTrue(stalledCoord.isFinalized())
+        assertFalse(stalledCoord.markDrainExited())
+        assertFalse(stalledCoord.requestRelease())
+
+        // 2. Normal exit before release(): requestRelease() finalizes immediately and idempotently.
+        val normalCoord = DrainReleaseCoordinator()
+        normalCoord.markDrainStarted()
+        assertFalse(normalCoord.markDrainExited())
+        assertTrue(normalCoord.requestRelease())
+        assertTrue(normalCoord.isFinalized())
+        assertFalse(normalCoord.requestRelease())
+
+        // 3. Never-started release(): requestRelease() finalizes immediately once.
+        val unstartedCoord = DrainReleaseCoordinator()
+        assertTrue(unstartedCoord.requestRelease())
+        assertTrue(unstartedCoord.isFinalized())
+        assertFalse(unstartedCoord.requestRelease())
     }
 }

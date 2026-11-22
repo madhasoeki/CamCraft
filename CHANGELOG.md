@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Android CameraX, H.264 Encoder & Streaming Service Lifecycle:**
+  - Restarted `H264SurfaceEncoder` (`VIDEO_CONFIG` + IDR) on camera lens switches as well as geometry/FPS changes and serialized stream state updates (`BUG-05`).
+  - Made `attachPreviewView`/`detachPreviewView` idempotent and rebound only `uiPreview` without tearing down live `encoderPreview` (`BUG-06`).
+  - Moved `H264SurfaceEncoder` create/release off the Main thread, coordinated safe deferred codec/surface release when `drainThread` stalls via `DrainReleaseCoordinator`, and closed transports before stopping audio/camera on teardown (`BUG-07`).
+  - Isolated stale-session `IOException` cleanup in `sendStreamPacket` so old writers cannot close newer active sessions (`BUG-09`).
+  - Ensured `handleClientSession` always exits `CONNECTED` on disconnect/bind failure and `startServer()` checks `activeSessionCloser != null` (`BUG-10`).
+  - Clamped `zoomRatio`, `exposureEv`, and `torchOn` to target camera capabilities on `ConfigureStream` (`BUG-14`), serialized `activeState` updates and ordered `CONTROL_ACK` emissions (`BUG-15`), and guarded `WifiNetworkMonitor`/mDNS registration/unregistration during Wi-Fi drops and `onDestroy()` (`BUG-16`).
+
 ## [0.0.3] - 2026-11-21
 
 ### Fixed

@@ -32,6 +32,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
 import java.lang.ref.WeakReference
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -125,34 +126,51 @@ class CameraStreamManager(
 
     private val lifecycleOwner = ServiceLifecycleOwner()
     private val cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val encoderExecutor: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "CamCraft-Encoder-Lifecycle").apply { isDaemon = true }
+    }
     private val mainExecutor = ContextCompat.getMainExecutor(context)
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val isReleased = AtomicBoolean(false)
+    private val surfaceLock = Any()
+    private val pipelineGeneration = AtomicLong(0L)
 
     private var cameraProvider: ProcessCameraProvider? = null
     @Volatile
     private var activeCamera: Camera? = null
+    @Volatile
     private var encoder: H264SurfaceEncoder? = null
 
     private var encoderPreview: Preview? = null
     private var uiPreview: Preview? = null
     private var attachedPreviewViewRef: WeakReference<PreviewView>? = null
+    private var currentFpsPlan: TargetFpsPlan? = null
 
-    // Active streaming parameters
+    // Active streaming parameters (mutated sequentially on encoderExecutor)
+    @Volatile
     var currentCameraId: String = "0"
         private set
+    @Volatile
     var currentWidth: Int = 1920
         private set
+    @Volatile
     var currentHeight: Int = 1080
         private set
+    @Volatile
     var currentFps: Int = 60
         private set
+    @Volatile
     var currentBitrateKbps: Int = 12_000
         private set
 
     // Control states
+    @Volatile
     private var targetZoomRatio: Float = 1.0f
+    @Volatile
     private var targetExposureEv: Float = 0.0f
+    @Volatile
     private var targetTorch: Boolean = false
+    @Volatile
     private var targetAutoFocus: Boolean = true
 
     @Volatile
@@ -160,7 +178,7 @@ class CameraStreamManager(
         private set
 
     val cachedConfig: ByteArray?
-        get() = encoder?.cachedConfig
+        get() = synchronized(surfaceLock) { encoder?.cachedConfig }
 
     init {
         initCameraProvider()
@@ -171,6 +189,36 @@ class CameraStreamManager(
             block()
         } else {
             mainExecutor.execute(block)
+        }
+    }
+
+    private fun runOnMainBlocking(timeoutMs: Long = 1_500L, block: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            block()
+            return
+        }
+        val latch = CountDownLatch(1)
+        mainHandler.post {
+            try {
+                block()
+            } finally {
+                latch.countDown()
+            }
+        }
+        try {
+            if (!latch.await(timeoutMs, TimeUnit.MILLISECONDS)) {
+                Log.w(TAG, "Timed out waiting ${timeoutMs}ms for Main camera unbind")
+            }
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+    }
+
+    private fun executeOnEncoderExecutor(task: () -> Unit) {
+        try {
+            encoderExecutor.execute(task)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed scheduling encoder lifecycle task: ${e.message}")
         }
     }
 
@@ -196,7 +244,8 @@ class CameraStreamManager(
     }
 
     /**
-     * Starts the H.264 encoder and binds CameraX to stream directly to the encoder's input surface.
+     * Starts the H.264 encoder off the Main thread and binds CameraX to stream directly
+     * to the encoder's input surface.
      */
     fun startStream(
         cameraId: String,
@@ -207,35 +256,46 @@ class CameraStreamManager(
     ) {
         if (isReleased.get()) return
 
-        currentCameraId = cameraId
-        currentWidth = width
-        currentHeight = height
-        currentFps = fps
-        currentBitrateKbps = bitrateKbps
-
         isStreaming = true
+        val generation = pipelineGeneration.incrementAndGet()
+        executeOnEncoderExecutor {
+            if (isReleased.get() || !isStreaming || pipelineGeneration.get() != generation) {
+                return@executeOnEncoderExecutor
+            }
+            currentCameraId = cameraId
+            currentWidth = width
+            currentHeight = height
+            currentFps = fps
+            currentBitrateKbps = bitrateKbps
 
-        runOnMain {
-            if (isReleased.get() || !isStreaming) return@runOnMain
-            lifecycleOwner.start()
-            setupEncoderAndBind()
+            runOnMain {
+                if (!isReleased.get() && isStreaming) {
+                    lifecycleOwner.start()
+                }
+            }
+            setupEncoderAndBindSync(generation)
         }
     }
 
     /**
-     * Unbinds CameraX, stops the encoder, and releases resources.
+     * Unbinds CameraX on Main and stops/releases the encoder on [encoderExecutor].
      */
     fun stopStream() {
         isStreaming = false
+        pipelineGeneration.incrementAndGet()
 
-        runOnMain {
-            cleanupActivePipeline()
-            lifecycleOwner.stop()
-            Log.i(TAG, "CameraStreamManager stopped")
+        executeOnEncoderExecutor {
+            cleanupActivePipelineOnEncoderThread()
+            runOnMain {
+                if (!isReleased.get() && !isStreaming) {
+                    lifecycleOwner.stop()
+                }
+                Log.i(TAG, "CameraStreamManager stopped")
+            }
         }
     }
 
-    private fun cleanupActivePipeline() {
+    private fun unbindCameraUseCasesOnMain() {
         try {
             cameraProvider?.unbindAll()
         } catch (e: Exception) {
@@ -244,43 +304,123 @@ class CameraStreamManager(
         activeCamera = null
         encoderPreview = null
         uiPreview = null
+        currentFpsPlan = null
+    }
 
-        encoder?.release()
-        encoder = null
+    private fun cleanupActivePipelineOnEncoderThread() {
+        runOnMainBlocking {
+            unbindCameraUseCasesOnMain()
+        }
+        val encoderToRelease = synchronized(surfaceLock) {
+            encoder.also { encoder = null }
+        }
+        encoderToRelease?.release()
     }
 
     /**
      * Attaches a [PreviewView] from the UI to display the camera viewfinder on phone screen.
+     * Deduplicated if the same [PreviewView] is already attached and bound; binds only `uiPreview`
+     * when `encoderPreview` is already healthy to avoid interrupting live H.264 encoding.
      */
     fun attachPreviewView(previewView: PreviewView) {
         if (isReleased.get()) return
-        attachedPreviewViewRef = WeakReference(previewView)
-        if (isStreaming) {
-            runOnMain {
-                if (isStreaming && !isReleased.get()) {
-                    bindUseCases()
+        runOnMain {
+            if (isReleased.get()) return@runOnMain
+            val existingView = attachedPreviewViewRef?.get()
+            val sameView = existingView === previewView
+            val provider = cameraProvider
+            val encPrev = encoderPreview
+            val existingUi = uiPreview
+            val encoderBound = provider != null && encPrev != null && provider.isBound(encPrev)
+            val uiBound = provider != null && existingUi != null && provider.isBound(existingUi)
+
+            val action = decideAttachPreviewAction(
+                isStreaming = isStreaming,
+                isReleased = isReleased.get(),
+                sameViewAlreadyAttached = sameView,
+                uiPreviewBound = uiBound,
+                encoderPreviewBound = encoderBound,
+            )
+            if (!sameView) {
+                attachedPreviewViewRef = WeakReference(previewView)
+            }
+
+            when (action) {
+                PreviewSyncAction.NO_OP -> return@runOnMain
+                PreviewSyncAction.REBIND_UI_ONLY -> {
+                    val activeProvider = provider ?: return@runOnMain
+                    if (existingUi != null) {
+                        runCatching { activeProvider.unbind(existingUi) }
+                        uiPreview = null
+                    }
+                    val plan = currentFpsPlan ?: CameraFpsCapabilities.resolveForCamera(
+                        context = context,
+                        cameraId = currentCameraId,
+                        width = currentWidth,
+                        height = currentHeight,
+                        requestedFps = currentFps,
+                    )
+                    val newUiPrev = buildUiPreview(previewView, plan)
+                    try {
+                        activeCamera = activeProvider.bindToLifecycle(
+                            lifecycleOwner,
+                            buildCameraSelector(currentCameraId),
+                            newUiPrev,
+                        )
+                        uiPreview = newUiPrev
+                        applyActiveControls()
+                    } catch (dualError: Exception) {
+                        Log.w(
+                            TAG,
+                            "Incremental UI preview binding failed (${dualError.message}); falling back to bindWithFallback",
+                        )
+                        runCatching { activeProvider.unbind(newUiPrev) }
+                        uiPreview = null
+                        bindUseCases()
+                    }
                 }
+                PreviewSyncAction.FULL_REBIND -> bindUseCases()
+                PreviewSyncAction.UNBIND_UI_ONLY -> Unit
             }
         }
     }
 
     /**
      * Detaches the UI [PreviewView] when screen is dimmed or Activity is backgrounded.
+     * Idempotent when already detached, and unbinds only `uiPreview` when `encoderPreview`
+     * is healthy so H.264 streaming to PC continues uninterrupted.
      */
     fun detachPreviewView() {
-        attachedPreviewViewRef = null
-        if (isStreaming && !isReleased.get()) {
-            runOnMain {
-                if (isStreaming && !isReleased.get()) {
-                    bindUseCases()
-                }
+        runOnMain {
+            val hasAttachedOrUi = attachedPreviewViewRef != null || uiPreview != null
+            val provider = cameraProvider
+            val encPrev = encoderPreview
+            val encoderBound = provider != null && encPrev != null && provider.isBound(encPrev)
+
+            val action = decideDetachPreviewAction(
+                isStreaming = isStreaming,
+                isReleased = isReleased.get(),
+                hasAttachedOrUiPreview = hasAttachedOrUi,
+            )
+            attachedPreviewViewRef = null
+            if (action == PreviewSyncAction.NO_OP) {
+                return@runOnMain
+            }
+
+            val existingUi = uiPreview
+            uiPreview = null
+            if (existingUi != null && provider != null) {
+                runCatching { provider.unbind(existingUi) }
+            } else if (!encoderBound && isStreaming && !isReleased.get()) {
+                bindUseCases()
             }
         }
     }
 
     /**
      * Dynamically reconfigures resolution, framerate, bitrate, or switches lens.
-     * Bitrate-only updates adjust [MediaCodec] dynamically without restarting CameraX.
+     * Bitrate-only updates adjust [MediaCodec] dynamically without restarting CameraX;
+     * camera/geometry/FPS changes restart the encoder so fresh `VIDEO_CONFIG` + IDR are sent.
      */
     fun rebindCamera(
         cameraId: String,
@@ -291,41 +431,46 @@ class CameraStreamManager(
     ) {
         if (isReleased.get()) return
 
-        val streamGeometryOrFpsChanged = width != currentWidth ||
-            height != currentHeight ||
-            fps != currentFps
-        val bitrateChanged = bitrateKbps != currentBitrateKbps
-        val cameraChanged = cameraId != currentCameraId
+        executeOnEncoderExecutor {
+            if (isReleased.get()) return@executeOnEncoderExecutor
 
-        currentCameraId = cameraId
-        currentWidth = width
-        currentHeight = height
-        currentFps = fps
-        currentBitrateKbps = bitrateKbps
+            val cameraChanged = cameraId != currentCameraId
+            val geometryOrFpsChanged = width != currentWidth ||
+                height != currentHeight ||
+                fps != currentFps
+            val bitrateChanged = bitrateKbps != currentBitrateKbps
+            val activeEncoder = synchronized(surfaceLock) { encoder }
 
-        if (!isStreaming) return
+            val decision = evaluateRebindDecision(
+                cameraChanged = cameraChanged,
+                geometryOrFpsChanged = geometryOrFpsChanged,
+                bitrateChanged = bitrateChanged,
+                hasEncoder = activeEncoder != null,
+            )
 
-        runOnMain {
-            if (!isStreaming || isReleased.get()) return@runOnMain
-            val activeEncoder = encoder
-            if (streamGeometryOrFpsChanged || activeEncoder == null) {
-                setupEncoderAndBind()
-            } else {
-                if (bitrateChanged) {
-                    activeEncoder.updateBitrate(bitrateKbps)
-                }
-                if (cameraChanged) {
-                    bindUseCases()
-                }
+            currentCameraId = cameraId
+            currentWidth = width
+            currentHeight = height
+            currentFps = fps
+            currentBitrateKbps = bitrateKbps
+
+            if (!isStreaming) return@executeOnEncoderExecutor
+
+            if (decision.needsEncoderRestart) {
+                val generation = pipelineGeneration.incrementAndGet()
+                setupEncoderAndBindSync(generation)
+            } else if (decision.needsBitrateUpdate) {
+                activeEncoder?.updateBitrate(bitrateKbps)
             }
         }
     }
 
-    private fun setupEncoderAndBind() {
-        if (!isStreaming || isReleased.get()) return
+    private fun setupEncoderAndBindSync(generation: Long) {
+        if (!isStreaming || isReleased.get() || pipelineGeneration.get() != generation) return
 
         // Unbind CameraX before releasing the old encoder so CameraX never renders to a closed Surface.
-        cleanupActivePipeline()
+        cleanupActivePipelineOnEncoderThread()
+        if (!isStreaming || isReleased.get() || pipelineGeneration.get() != generation) return
 
         var newEncoder: H264SurfaceEncoder? = null
         try {
@@ -337,15 +482,27 @@ class CameraStreamManager(
                 onVideoPacketSlice = onVideoPacketSlice,
             )
             newEncoder.start()
-            encoder = newEncoder
+            synchronized(surfaceLock) {
+                if (!isStreaming || isReleased.get() || pipelineGeneration.get() != generation) {
+                    newEncoder.release()
+                    return
+                }
+                encoder = newEncoder
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to instantiate H264SurfaceEncoder: ${e.message}", e)
             runCatching { newEncoder?.release() }
-            encoder = null
+            synchronized(surfaceLock) {
+                encoder = null
+            }
             return
         }
 
-        bindUseCases()
+        runOnMain {
+            if (isStreaming && !isReleased.get() && pipelineGeneration.get() == generation) {
+                bindUseCases()
+            }
+        }
     }
 
     private fun createFpsTelemetryCallback(): CameraCaptureSession.CaptureCallback {
@@ -463,12 +620,19 @@ class CameraStreamManager(
 
         return encPreviewBuilder.build().apply {
             setSurfaceProvider(cameraExecutor) { request ->
-                if (!isReleased.get() && surface.isValid) {
-                    request.provideSurface(surface, cameraExecutor) { result ->
-                        Log.d(TAG, "Encoder surface provider result: ${result.resultCode}")
+                synchronized(surfaceLock) {
+                    val activeSurface = encoder?.inputSurface
+                    if (!isReleased.get() &&
+                        isStreaming &&
+                        activeSurface === surface &&
+                        surface.isValid
+                    ) {
+                        request.provideSurface(surface, cameraExecutor) { result ->
+                            Log.d(TAG, "Encoder surface provider result: ${result.resultCode}")
+                        }
+                    } else {
+                        request.willNotProvideSurface()
                     }
-                } else {
-                    request.willNotProvideSurface()
                 }
             }
         }
@@ -617,9 +781,10 @@ class CameraStreamManager(
             return
         }
 
-        val activeEncoder = encoder
-        val surface = activeEncoder?.inputSurface
-        if (surface == null || !surface.isValid) {
+        val surface = synchronized(surfaceLock) {
+            encoder?.inputSurface?.takeIf { it.isValid }
+        }
+        if (surface == null) {
             Log.w(TAG, "Encoder surface not valid for binding")
             return
         }
@@ -631,6 +796,7 @@ class CameraStreamManager(
             height = currentHeight,
             requestedFps = currentFps,
         )
+        currentFpsPlan = fpsPlan
         Log.i(
             TAG,
             "Resolved FPS plan for cam=$currentCameraId ${currentWidth}x$currentHeight@${currentFps}fps: " +
@@ -732,24 +898,89 @@ class CameraStreamManager(
     }
 
     fun requestKeyFrame() {
-        encoder?.requestKeyFrame()
+        synchronized(surfaceLock) { encoder }?.requestKeyFrame()
     }
 
     fun release() {
         if (!isReleased.compareAndSet(false, true)) return
         isStreaming = false
-        attachedPreviewViewRef = null
+        pipelineGeneration.incrementAndGet()
 
         runOnMain {
-            cleanupActivePipeline()
-            cameraProvider = null
-            lifecycleOwner.destroy()
-            cameraExecutor.shutdown()
-            Log.i(TAG, "CameraStreamManager released")
+            attachedPreviewViewRef = null
         }
+
+        executeOnEncoderExecutor {
+            cleanupActivePipelineOnEncoderThread()
+            runOnMain {
+                cameraProvider = null
+                lifecycleOwner.destroy()
+                cameraExecutor.shutdown()
+                Log.i(TAG, "CameraStreamManager released")
+            }
+        }
+        encoderExecutor.shutdown()
+    }
+
+    internal data class RebindDecision(
+        val needsEncoderRestart: Boolean,
+        val needsBitrateUpdate: Boolean,
+    )
+
+    internal enum class PreviewSyncAction {
+        NO_OP,
+        REBIND_UI_ONLY,
+        FULL_REBIND,
+        UNBIND_UI_ONLY,
     }
 
     companion object {
         private const val TAG = "CameraStreamManager"
+
+        internal fun needsEncoderRestart(
+            cameraChanged: Boolean,
+            geometryOrFpsChanged: Boolean,
+            hasEncoder: Boolean,
+        ): Boolean = cameraChanged || geometryOrFpsChanged || !hasEncoder
+
+        internal fun evaluateRebindDecision(
+            cameraChanged: Boolean,
+            geometryOrFpsChanged: Boolean,
+            bitrateChanged: Boolean,
+            hasEncoder: Boolean,
+        ): RebindDecision {
+            val restart = needsEncoderRestart(
+                cameraChanged = cameraChanged,
+                geometryOrFpsChanged = geometryOrFpsChanged,
+                hasEncoder = hasEncoder,
+            )
+            return RebindDecision(
+                needsEncoderRestart = restart,
+                needsBitrateUpdate = !restart && bitrateChanged,
+            )
+        }
+
+        internal fun decideAttachPreviewAction(
+            isStreaming: Boolean,
+            isReleased: Boolean,
+            sameViewAlreadyAttached: Boolean,
+            uiPreviewBound: Boolean,
+            encoderPreviewBound: Boolean,
+        ): PreviewSyncAction = when {
+            isReleased || !isStreaming -> PreviewSyncAction.NO_OP
+            sameViewAlreadyAttached && uiPreviewBound -> PreviewSyncAction.NO_OP
+            encoderPreviewBound -> PreviewSyncAction.REBIND_UI_ONLY
+            else -> PreviewSyncAction.FULL_REBIND
+        }
+
+        internal fun decideDetachPreviewAction(
+            isStreaming: Boolean,
+            isReleased: Boolean,
+            hasAttachedOrUiPreview: Boolean,
+        ): PreviewSyncAction = when {
+            !hasAttachedOrUiPreview -> PreviewSyncAction.NO_OP
+            isReleased || !isStreaming -> PreviewSyncAction.NO_OP
+            else -> PreviewSyncAction.UNBIND_UI_ONLY
+        }
     }
 }

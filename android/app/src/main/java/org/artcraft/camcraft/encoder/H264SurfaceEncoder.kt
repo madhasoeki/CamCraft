@@ -71,6 +71,7 @@ class H264SurfaceEncoder(
         private set
 
     private val isRunning = AtomicBoolean(false)
+    private val releaseCoordinator = DrainReleaseCoordinator()
     private var drainThread: Thread? = null
 
     init {
@@ -169,6 +170,7 @@ class H264SurfaceEncoder(
             }
             hasStarted = true
             isRunning.set(true)
+            releaseCoordinator.markDrainStarted()
 
             val thread = Thread({
                 drainEncoderLoop(existing)
@@ -177,7 +179,14 @@ class H264SurfaceEncoder(
                 isDaemon = true
             }
             drainThread = thread
-            thread.start()
+            try {
+                thread.start()
+            } catch (e: Throwable) {
+                isRunning.set(false)
+                drainThread = null
+                releaseCoordinator.markDrainExited()
+                throw e
+            }
             existing
         }
         Log.i(TAG, "H264SurfaceEncoder started ($width x $height @ $fps fps, $bitrateKbps kbps, codec=$activeCodec)")
@@ -190,82 +199,109 @@ class H264SurfaceEncoder(
         val bufferInfo = MediaCodec.BufferInfo()
         var scratchBuffer = ByteArray(INITIAL_SCRATCH_BUFFER_BYTES)
 
-        while (isRunning.get()) {
-            try {
-                val outputIndex = activeCodec.dequeueOutputBuffer(bufferInfo, 10_000L)
-                when (outputIndex) {
-                    MediaCodec.INFO_TRY_AGAIN_LATER -> {
-                        // Polling timeout - continue loop
-                    }
-                    MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                        val newFormat = activeCodec.outputFormat
-                        Log.i(TAG, "Encoder output format changed: $newFormat")
-                        val csd0 = try { newFormat.getByteBuffer("csd-0") } catch (_: Exception) { null }
-                        val csd1 = try { newFormat.getByteBuffer("csd-1") } catch (_: Exception) { null }
-                        val config = combineSpsPps(csd0, csd1)
-                        if (config.isNotEmpty()) {
-                            cachedConfig = config
-                            val ptsUs = System.nanoTime() / 1_000L
-                            onVideoPacketSlice(PacketType.VIDEO_CONFIG, CcftFlags.NONE, ptsUs, config, 0, config.size)
-                            Log.i(TAG, "Dispatched VIDEO_CONFIG SPS/PPS (${config.size} bytes)")
+        try {
+            while (isRunning.get() && !releaseCoordinator.isReleaseRequested()) {
+                try {
+                    val outputIndex = activeCodec.dequeueOutputBuffer(bufferInfo, 10_000L)
+                    when (outputIndex) {
+                        MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                            // Polling timeout - continue loop
                         }
-                    }
-                    else -> {
-                        if (outputIndex >= 0) {
-                            val outputBuffer = activeCodec.getOutputBuffer(outputIndex)
-                            val size = bufferInfo.size
-                            if (outputBuffer != null && size > 0) {
-                                val requiredCapacity = size + ANNEX_B_PREFIX_HEADROOM
-                                if (requiredCapacity > scratchBuffer.size) {
-                                    scratchBuffer = ByteArray(maxOf(scratchBuffer.size * 2, requiredCapacity))
+                        MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                            if (!isRunning.get() || releaseCoordinator.isReleaseRequested()) break
+                            val newFormat = activeCodec.outputFormat
+                            Log.i(TAG, "Encoder output format changed: $newFormat")
+                            val csd0 = try { newFormat.getByteBuffer("csd-0") } catch (_: Exception) { null }
+                            val csd1 = try { newFormat.getByteBuffer("csd-1") } catch (_: Exception) { null }
+                            val config = combineSpsPps(csd0, csd1)
+                            if (config.isNotEmpty()) {
+                                cachedConfig = config
+                                val ptsUs = System.nanoTime() / 1_000L
+                                onVideoPacketSlice(PacketType.VIDEO_CONFIG, CcftFlags.NONE, ptsUs, config, 0, config.size)
+                                Log.i(TAG, "Dispatched VIDEO_CONFIG SPS/PPS (${config.size} bytes)")
+                            }
+                        }
+                        else -> {
+                            if (outputIndex >= 0) {
+                                var shouldDispatch = false
+                                var sliceOffset = 0
+                                var sliceLength = 0
+                                var ptsUs = 0L
+                                var isConfig = false
+                                var isKeyframe = false
+
+                                if (isRunning.get() && !releaseCoordinator.isReleaseRequested()) {
+                                    val outputBuffer = activeCodec.getOutputBuffer(outputIndex)
+                                    val size = bufferInfo.size
+                                    if (outputBuffer != null && size > 0) {
+                                        val requiredCapacity = size + ANNEX_B_PREFIX_HEADROOM
+                                        if (requiredCapacity > scratchBuffer.size) {
+                                            scratchBuffer = ByteArray(maxOf(scratchBuffer.size * 2, requiredCapacity))
+                                        }
+
+                                        outputBuffer.position(bufferInfo.offset)
+                                        outputBuffer.limit(bufferInfo.offset + size)
+                                        outputBuffer.get(scratchBuffer, ANNEX_B_PREFIX_HEADROOM, size)
+
+                                        val slice = formatAnnexBInPlace(scratchBuffer, size)
+                                        sliceOffset = slice.offset
+                                        sliceLength = slice.length
+                                        ptsUs = if (bufferInfo.presentationTimeUs > 0) {
+                                            bufferInfo.presentationTimeUs
+                                        } else {
+                                            System.nanoTime() / 1_000L
+                                        }
+                                        isConfig = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+                                        isKeyframe = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+                                        shouldDispatch = true
+                                    }
                                 }
 
-                                outputBuffer.position(bufferInfo.offset)
-                                outputBuffer.limit(bufferInfo.offset + size)
-                                outputBuffer.get(scratchBuffer, ANNEX_B_PREFIX_HEADROOM, size)
-
-                                val slice = formatAnnexBInPlace(scratchBuffer, size)
-                                val ptsUs = if (bufferInfo.presentationTimeUs > 0) {
-                                    bufferInfo.presentationTimeUs
-                                } else {
-                                    System.nanoTime() / 1_000L
+                                // Return buffer to MediaCodec before dispatching over I/O so we never
+                                // touch activeCodec after a potentially stalled callback returns.
+                                if (isRunning.get() && !releaseCoordinator.isReleaseRequested()) {
+                                    activeCodec.releaseOutputBuffer(outputIndex, false)
                                 }
 
-                                if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
-                                    val configCopy = scratchBuffer.copyOfRange(slice.offset, slice.offset + slice.length)
-                                    cachedConfig = configCopy
-                                    onVideoPacketSlice(
-                                        PacketType.VIDEO_CONFIG,
-                                        CcftFlags.NONE,
-                                        ptsUs,
-                                        configCopy,
-                                        0,
-                                        configCopy.size,
-                                    )
-                                } else {
-                                    val isKeyframe = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
-                                    val flags = if (isKeyframe) CcftFlags.KEYFRAME else CcftFlags.NONE
-                                    onVideoPacketSlice(
-                                        PacketType.VIDEO_FRAME,
-                                        flags,
-                                        ptsUs,
-                                        scratchBuffer,
-                                        slice.offset,
-                                        slice.length,
-                                    )
+                                if (shouldDispatch && isRunning.get() && !releaseCoordinator.isReleaseRequested()) {
+                                    if (isConfig) {
+                                        val configCopy = scratchBuffer.copyOfRange(sliceOffset, sliceOffset + sliceLength)
+                                        cachedConfig = configCopy
+                                        onVideoPacketSlice(
+                                            PacketType.VIDEO_CONFIG,
+                                            CcftFlags.NONE,
+                                            ptsUs,
+                                            configCopy,
+                                            0,
+                                            configCopy.size,
+                                        )
+                                    } else {
+                                        val flags = if (isKeyframe) CcftFlags.KEYFRAME else CcftFlags.NONE
+                                        onVideoPacketSlice(
+                                            PacketType.VIDEO_FRAME,
+                                            flags,
+                                            ptsUs,
+                                            scratchBuffer,
+                                            sliceOffset,
+                                            sliceLength,
+                                        )
+                                    }
                                 }
                             }
-                            activeCodec.releaseOutputBuffer(outputIndex, false)
                         }
                     }
+                } catch (_: IllegalStateException) {
+                    // Codec was stopped or released
+                    break
+                } catch (e: Exception) {
+                    if (isRunning.get()) {
+                        Log.e(TAG, "Exception during drainEncoderLoop: ${e.message}", e)
+                    }
                 }
-            } catch (_: IllegalStateException) {
-                // Codec was stopped or released
-                break
-            } catch (e: Exception) {
-                if (isRunning.get()) {
-                    Log.e(TAG, "Exception during drainEncoderLoop: ${e.message}", e)
-                }
+            }
+        } finally {
+            if (releaseCoordinator.markDrainExited()) {
+                releaseCodecAndSurfaceLocked()
             }
         }
     }
@@ -333,6 +369,14 @@ class H264SurfaceEncoder(
             }
         }
 
+        if (releaseCoordinator.requestRelease()) {
+            releaseCodecAndSurfaceLocked()
+        } else {
+            Log.w(TAG, "H264 drain thread still exiting stalled callback; deferring MediaCodec release to drain exit")
+        }
+    }
+
+    private fun releaseCodecAndSurfaceLocked() {
         synchronized(lifecycleLock) {
             val activeCodec = codec
             val wasStarted = hasStarted
@@ -503,4 +547,49 @@ class H264SurfaceEncoder(
             return combined
         }
     }
+}
+
+/**
+ * Coordinates safe one-time MediaCodec & Surface teardown between [H264SurfaceEncoder.release]
+ * and the background drain thread so resources are never released while the drain loop can
+ * still touch [MediaCodec], without blocking `release()` indefinitely on stalled callbacks.
+ */
+internal class DrainReleaseCoordinator {
+    private val lock = Any()
+    private var started = false
+    private var drainActive = false
+    private var releaseRequested = false
+    private var finalized = false
+
+    fun markDrainStarted() {
+        synchronized(lock) {
+            started = true
+            drainActive = true
+        }
+    }
+
+    fun markDrainExited(): Boolean {
+        synchronized(lock) {
+            drainActive = false
+            if (releaseRequested && !finalized) {
+                finalized = true
+                return true
+            }
+            return false
+        }
+    }
+
+    fun requestRelease(): Boolean {
+        synchronized(lock) {
+            releaseRequested = true
+            if ((!started || !drainActive) && !finalized) {
+                finalized = true
+                return true
+            }
+            return false
+        }
+    }
+
+    fun isReleaseRequested(): Boolean = synchronized(lock) { releaseRequested }
+    fun isFinalized(): Boolean = synchronized(lock) { finalized }
 }
