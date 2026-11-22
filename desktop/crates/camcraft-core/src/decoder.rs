@@ -1312,11 +1312,11 @@ impl DecoderSender {
         freed
     }
 
-    /// Fallback used by `push_config` / `enter_standby` / `stop` when no frames are queued:
-    /// drops the oldest queued `Config` while preserving relative order of remaining commands.
+    /// Drains queued commands up to capacity, drops the oldest queued command matching
+    /// `predicate` while preserving relative order of remaining commands, and re-inserts them.
     ///
     /// Caller must hold `self.op_lock`.
-    fn drop_oldest_config(&self) -> bool {
+    fn drop_oldest_matching(&self, predicate: impl Fn(&DecoderCommand) -> bool) -> bool {
         let mut drained: Vec<Option<DecoderCommand>> = Vec::with_capacity(self.capacity);
         while drained.len() < self.capacity {
             match self.cmd_rx_drain.try_recv() {
@@ -1327,7 +1327,7 @@ impl DecoderSender {
 
         let mut freed = false;
         for slot in &mut drained {
-            if matches!(slot, Some(DecoderCommand::Config { .. })) {
+            if slot.as_ref().is_some_and(&predicate) {
                 *slot = None;
                 freed = true;
                 break;
@@ -1343,34 +1343,19 @@ impl DecoderSender {
         freed
     }
 
+    /// Fallback used by `push_config` / `enter_standby` / `stop` when no frames are queued:
+    /// drops the oldest queued `Config` while preserving relative order of remaining commands.
+    ///
+    /// Caller must hold `self.op_lock`.
+    fn drop_oldest_config(&self) -> bool {
+        self.drop_oldest_matching(|cmd| matches!(cmd, DecoderCommand::Config { .. }))
+    }
+
     /// Fallback used by `enter_standby` / `stop` when queue is full of `EnterStandby` commands.
     ///
     /// Caller must hold `self.op_lock`.
     fn drop_oldest_standby(&self) -> bool {
-        let mut drained: Vec<Option<DecoderCommand>> = Vec::with_capacity(self.capacity);
-        while drained.len() < self.capacity {
-            match self.cmd_rx_drain.try_recv() {
-                Ok(cmd) => drained.push(Some(cmd)),
-                Err(_) => break,
-            }
-        }
-
-        let mut freed = false;
-        for slot in &mut drained {
-            if matches!(slot, Some(DecoderCommand::EnterStandby)) {
-                *slot = None;
-                freed = true;
-                break;
-            }
-        }
-
-        for slot in &mut drained {
-            if let Some(cmd) = slot.take() {
-                let _ = self.cmd_tx.try_send(cmd);
-            }
-        }
-
-        freed
+        self.drop_oldest_matching(|cmd| matches!(cmd, DecoderCommand::EnterStandby))
     }
 
     /// Pushes a `VIDEO_CONFIG` packet into the queue without blocking the async network loop.
@@ -2595,5 +2580,39 @@ mod tests {
                 "round {round}: EnterStandby was lost"
             );
         }
+    }
+
+    #[test]
+    fn decoder_sender_drop_oldest_matching_preserves_order_and_evicts_target() {
+        let (tx, rx) = DecoderSender::new_with_capacity(3);
+        tx.push_config(10, Bytes::from_static(b"\x00\x00\x00\x01\x67"))
+            .expect("queue first config");
+        tx.enter_standby();
+        tx.push_config(20, Bytes::from_static(b"\x00\x00\x00\x01\x68"))
+            .expect("queue second config");
+
+        {
+            let _guard = tx.op_lock.lock().unwrap();
+            assert!(tx.drop_oldest_config());
+            assert!(!tx.drop_oldest_matching(|c| matches!(c, DecoderCommand::Stop)));
+            assert!(tx.drop_oldest_standby());
+        }
+
+        let remaining: Vec<_> = rx.try_iter().collect();
+        assert_eq!(remaining.len(), 1);
+        assert!(matches!(
+            remaining[0],
+            DecoderCommand::Config { pts_us: 20, .. }
+        ));
+
+        // Verify `stop()` evicts oldest `EnterStandby` when queue is saturated with standbys.
+        let (tx2, rx2) = DecoderSender::new_with_capacity(2);
+        tx2.enter_standby();
+        tx2.enter_standby();
+        tx2.stop();
+        let cmds: Vec<_> = rx2.try_iter().collect();
+        assert_eq!(cmds.len(), 2);
+        assert!(matches!(cmds[0], DecoderCommand::EnterStandby));
+        assert!(matches!(cmds[1], DecoderCommand::Stop));
     }
 }
