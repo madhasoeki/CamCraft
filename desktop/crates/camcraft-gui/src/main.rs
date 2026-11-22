@@ -342,8 +342,15 @@ impl CamCraftApp {
                     self.pipewire_unavailable = !pipewire_available;
                     self.udev_rules_installed = udev_rules_installed;
                 }
-                GuiUpdate::V4l2EnableResult { ok, message } => {
+                GuiUpdate::V4l2EnableResult {
+                    ok,
+                    device_path,
+                    message,
+                } => {
                     self.enabling_v4l2 = false;
+                    if ok && let Some(path) = device_path {
+                        self.vcam_device = path;
+                    }
                     self.v4l2_enable_feedback = Some((ok, message));
                 }
                 GuiUpdate::UdevInstallResult {

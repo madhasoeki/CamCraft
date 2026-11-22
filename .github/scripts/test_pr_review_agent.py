@@ -2,8 +2,10 @@ import unittest
 
 from pr_review_agent import (
     build_diff_context,
+    call_ai_chat_completion,
     extract_assistant_content,
     normalize_chat_endpoint,
+    parse_ai_response_body,
     run_review,
     should_skip_file,
 )
@@ -72,6 +74,69 @@ class PrReviewAgentTests(unittest.TestCase):
             }
         )
         self.assertEqual(rc, 0)
+
+    def test_parse_ai_response_body_handles_json_keepalive_sse_and_html(self) -> None:
+        plain = '{"choices": [{"message": {"content": "LGTM"}}]}'
+        self.assertEqual(extract_assistant_content(parse_ai_response_body(plain)), "LGTM")
+
+        with_keepalive = ': OPENROUTER PROCESSING\n\n: OPENROUTER PROCESSING\n\n{"choices": [{"message": {"content": "Reviewed cleanly"}}]}'
+        self.assertEqual(
+            extract_assistant_content(parse_ai_response_body(with_keepalive)),
+            "Reviewed cleanly",
+        )
+
+        sse = (
+            ": OPENROUTER PROCESSING\n"
+            'data: {"choices": [{"delta": {"role": "assistant"}}]}\n\n'
+            'data: {"choices": [{"delta": {"content": "### Summary\\n"}}]}\n\n'
+            'data: {"choices": [{"delta": {"content": "All good."}}]}\n\n'
+            "data: [DONE]\n"
+        )
+        self.assertEqual(
+            extract_assistant_content(parse_ai_response_body(sse)),
+            "### Summary\nAll good.",
+        )
+
+        with self.assertRaises(ValueError):
+            parse_ai_response_body("<html><body>504 Gateway Time-out</body></html>")
+
+    def test_call_ai_chat_completion_falls_back_to_stream_on_transient_error(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        def fake_requester(url, method="GET", headers=None, body=None, timeout=120):
+            calls.append({"url": url, "headers": headers, "body": body})
+            if len(calls) == 1:
+                raise RuntimeError("Non-JSON response (HTTP 504, Content-Type: text/html) from ...")
+            return 200, {"choices": [{"message": {"content": "Streamed OK"}}]}
+
+        resp = call_ai_chat_completion(
+            "https://example.invalid/v1/chat/completions",
+            "secret-token",
+            {"model": "test-model", "messages": []},
+            requester=fake_requester,
+        )
+        self.assertEqual(extract_assistant_content(resp), "Streamed OK")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["body"]["stream"], False)
+        self.assertEqual(calls[1]["body"]["stream"], True)
+        self.assertIn("text/event-stream", calls[1]["headers"]["Accept"])
+
+    def test_call_ai_chat_completion_does_not_retry_permanent_http_errors(self) -> None:
+        calls = 0
+
+        def unauthorized_requester(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("HTTP 401 from https://example.invalid: Unauthorized")
+
+        with self.assertRaises(RuntimeError):
+            call_ai_chat_completion(
+                "https://example.invalid/v1/chat/completions",
+                "bad-token",
+                {"model": "test-model", "messages": []},
+                requester=unauthorized_requester,
+            )
+        self.assertEqual(calls, 1)
 
 
 if __name__ == "__main__":

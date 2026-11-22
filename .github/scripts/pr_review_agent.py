@@ -14,7 +14,7 @@ import os
 import sys
 import urllib.error
 import urllib.request
-from typing import Any
+from typing import Any, Callable
 
 COMMENT_MARKER = "<!-- camcraft-pr-agent -->"
 MAX_DIFF_CHARS = 60_000
@@ -157,6 +157,88 @@ def extract_assistant_content(payload: dict[str, Any]) -> str:
     raise ValueError("AI response content could not be extracted")
 
 
+def _extract_chunk_text(msg: dict[str, Any]) -> str:
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        return "".join(parts)
+    return ""
+
+
+def parse_ai_response_body(raw: str) -> dict[str, Any]:
+    stripped = raw.strip()
+    if not stripped:
+        raise ValueError("Empty response body")
+
+    if stripped.startswith(("{", "[")):
+        try:
+            parsed = json.loads(stripped)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    # Strip leading SSE keep-alive comment lines (e.g. `: OPENROUTER PROCESSING`) before JSON.
+    non_comment = "\n".join(
+        line
+        for line in stripped.splitlines()
+        if line.strip() and not line.lstrip().startswith(":")
+    ).strip()
+    if non_comment.startswith("{"):
+        try:
+            parsed = json.loads(non_comment)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    # Assemble Server-Sent Events (`data: {...}`) streams when gateways return SSE.
+    sse_parts: list[str] = []
+    saw_data = False
+    last_error: str | None = None
+    for raw_line in stripped.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(":"):
+            continue
+        if line.startswith("data:"):
+            saw_data = True
+            payload_str = line[5:].strip()
+            if not payload_str or payload_str == "[DONE]":
+                continue
+            try:
+                chunk = json.loads(payload_str)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(chunk, dict):
+                continue
+            if chunk.get("error"):
+                last_error = json.dumps(chunk["error"])
+            choices = chunk.get("choices")
+            if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                first = choices[0]
+                for key in ("delta", "message"):
+                    msg = first.get(key)
+                    if isinstance(msg, dict):
+                        text = _extract_chunk_text(msg)
+                        if text:
+                            sse_parts.append(text)
+
+    if sse_parts:
+        return {"choices": [{"message": {"content": "".join(sse_parts)}}]}
+    if last_error:
+        raise ValueError(f"AI stream returned error: {last_error[:200]}")
+    if saw_data:
+        raise ValueError("AI SSE stream returned no text content")
+
+    preview = " ".join(stripped.split())[:200]
+    raise ValueError(f"Unrecognized non-JSON response: {preview}")
+
+
 def http_json(
     url: str,
     method: str = "GET",
@@ -164,9 +246,13 @@ def http_json(
     body: dict[str, Any] | None = None,
     timeout: int = 90,
 ) -> tuple[int, Any]:
+    clean_url = url.split("?")[0]
     data = None if body is None else json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, method=method)
-    for k, v in (headers or {}).items():
+    req_headers = dict(headers or {})
+    if not any(k.lower() == "accept" for k in req_headers):
+        req_headers["Accept"] = "application/json"
+    for k, v in req_headers.items():
         req.add_header(k, v)
     if data is not None:
         req.add_header("Content-Type", "application/json")
@@ -174,15 +260,81 @@ def http_json(
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
-            parsed = json.loads(raw) if raw.strip() else {}
+            content_type = resp.headers.get("Content-Type", "unknown") if resp.headers else "unknown"
+            if not raw.strip():
+                return resp.status, {}
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                try:
+                    parsed = parse_ai_response_body(raw)
+                except ValueError:
+                    snippet = " ".join(raw.split())[:200]
+                    # Never surface request headers (e.g. API keys) in exceptions.
+                    raise RuntimeError(
+                        f"Non-JSON response (HTTP {resp.status}, Content-Type: {content_type}) "
+                        f"from {clean_url}: {snippet}"
+                    ) from None
             return resp.status, parsed
     except urllib.error.HTTPError as err:
         raw_err = err.read().decode("utf-8", errors="replace")
         # Never surface request headers (e.g. API keys) in exceptions.
         snippet = raw_err.strip()[:400]
-        raise RuntimeError(f"HTTP {err.code} from {url.split('?')[0]}: {snippet}") from None
+        raise RuntimeError(f"HTTP {err.code} from {clean_url}: {snippet}") from None
     except urllib.error.URLError as err:
-        raise RuntimeError(f"Network error calling {url.split('?')[0]}: {err.reason}") from None
+        raise RuntimeError(f"Network error calling {clean_url}: {err.reason}") from None
+    except TimeoutError as err:
+        raise RuntimeError(f"Request timed out calling {clean_url}: {err}") from None
+
+
+def _is_permanent_http_error(err: Exception) -> bool:
+    msg = str(err)
+    return msg.startswith(("HTTP 400", "HTTP 401", "HTTP 403", "HTTP 404", "HTTP 422"))
+
+
+def call_ai_chat_completion(
+    chat_url: str,
+    api_key: str,
+    payload: dict[str, Any],
+    timeout: int = 120,
+    requester: Callable[..., tuple[int, Any]] = http_json,
+) -> dict[str, Any]:
+    non_stream_headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+        "User-Agent": "CamCraft-PR-Agent/1.0",
+    }
+    non_stream_payload = {**payload, "stream": False}
+    try:
+        _, resp = requester(
+            chat_url,
+            method="POST",
+            headers=non_stream_headers,
+            body=non_stream_payload,
+            timeout=timeout,
+        )
+        return resp
+    except RuntimeError as first_err:
+        if _is_permanent_http_error(first_err):
+            raise
+        print(
+            f"Non-streaming completion attempt failed ({first_err}); retrying with SSE stream=true...",
+            flush=True,
+        )
+        stream_headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "text/event-stream, application/json",
+            "User-Agent": "CamCraft-PR-Agent/1.0",
+        }
+        stream_payload = {**payload, "stream": True}
+        _, resp = requester(
+            chat_url,
+            method="POST",
+            headers=stream_headers,
+            body=stream_payload,
+            timeout=timeout,
+        )
+        return resp
 
 
 def github_headers(token: str) -> dict[str, str]:
@@ -321,10 +473,6 @@ def run_review(env: dict[str, str] | None = None) -> int:
     )
 
     chat_url = normalize_chat_endpoint(endpoint)
-    ai_headers = {
-        "Authorization": f"Bearer {api_key}",
-        "User-Agent": "CamCraft-PR-Agent/1.0",
-    }
     ai_payload = {
         "model": model,
         "temperature": 0.2,
@@ -334,8 +482,8 @@ def run_review(env: dict[str, str] | None = None) -> int:
         ],
     }
 
-    print(f"Sending PR #{pr_number} diff ({len(files)} files) to model `{model}`...")
-    _, ai_resp = http_json(chat_url, method="POST", headers=ai_headers, body=ai_payload, timeout=120)
+    print(f"Sending PR #{pr_number} diff ({len(files)} files) to model `{model}`...", flush=True)
+    ai_resp = call_ai_chat_completion(chat_url, api_key, ai_payload, timeout=120)
     review_text = extract_assistant_content(ai_resp)
 
     final_comment = (
@@ -348,7 +496,7 @@ def run_review(env: dict[str, str] | None = None) -> int:
     )
 
     action = upsert_pr_comment(gh_api, repo, pr_number, gh_token, final_comment)
-    print(f"PR #{pr_number} review posted ({action}).")
+    print(f"PR #{pr_number} review posted ({action}).", flush=True)
     return 0
 
 
