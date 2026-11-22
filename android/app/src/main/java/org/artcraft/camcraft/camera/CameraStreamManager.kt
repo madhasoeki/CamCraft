@@ -192,26 +192,15 @@ class CameraStreamManager(
         }
     }
 
-    private fun runOnMainBlocking(timeoutMs: Long = 1_500L, block: () -> Unit) {
-        if (Looper.myLooper() == Looper.getMainLooper()) {
-            block()
-            return
-        }
-        val latch = CountDownLatch(1)
-        mainHandler.post {
-            try {
-                block()
-            } finally {
-                latch.countDown()
-            }
-        }
-        try {
-            if (!latch.await(timeoutMs, TimeUnit.MILLISECONDS)) {
-                Log.w(TAG, "Timed out waiting ${timeoutMs}ms for Main camera unbind")
-            }
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
-        }
+    private fun runOnMainBlocking(timeoutMs: Long = DEFAULT_MAIN_UNBIND_TIMEOUT_MS, block: () -> Unit) {
+        runOnMainBlocking(
+            isMainThread = { Looper.myLooper() == Looper.getMainLooper() },
+            post = { runnable -> mainHandler.post(runnable) },
+            removeCallbacks = { runnable -> mainHandler.removeCallbacks(runnable) },
+            timeoutMs = timeoutMs,
+            onWarn = { message -> Log.w(TAG, message) },
+            block = block,
+        )
     }
 
     private fun executeOnEncoderExecutor(task: () -> Unit) {
@@ -936,6 +925,65 @@ class CameraStreamManager(
 
     companion object {
         private const val TAG = "CameraStreamManager"
+        private const val DEFAULT_MAIN_UNBIND_TIMEOUT_MS = 1_500L
+
+        private fun logWarnSafe(message: String) {
+            try {
+                Log.w(TAG, message)
+            } catch (_: RuntimeException) {
+                // Allow companion helper tests to run on JVM without mocked android.util.Log.
+            }
+        }
+
+        /**
+         * Posts [block] to the main thread and awaits completion up to [timeoutMs].
+         * Cancels queued work on timeout or interruption and guards execution with an
+         * [AtomicBoolean] so a late-firing [Runnable] cannot unbind a newer stream generation.
+         */
+        internal fun runOnMainBlocking(
+            isMainThread: () -> Boolean,
+            post: (Runnable) -> Boolean,
+            removeCallbacks: (Runnable) -> Unit,
+            timeoutMs: Long = DEFAULT_MAIN_UNBIND_TIMEOUT_MS,
+            onWarn: (String) -> Unit = { message -> logWarnSafe(message) },
+            block: () -> Unit,
+        ) {
+            if (isMainThread()) {
+                block()
+                return
+            }
+
+            val latch = CountDownLatch(1)
+            val executedOrCanceled = AtomicBoolean(true)
+            val runnable = Runnable {
+                try {
+                    if (executedOrCanceled.compareAndSet(true, false)) {
+                        block()
+                    }
+                } finally {
+                    latch.countDown()
+                }
+            }
+
+            if (!post(runnable)) {
+                executedOrCanceled.compareAndSet(true, false)
+                onWarn("Failed posting main-thread camera unbind task; skipping blocking wait")
+                return
+            }
+
+            try {
+                if (!latch.await(timeoutMs, TimeUnit.MILLISECONDS)) {
+                    executedOrCanceled.set(false)
+                    removeCallbacks(runnable)
+                    onWarn("Timed out waiting ${timeoutMs}ms for Main camera unbind")
+                }
+            } catch (_: InterruptedException) {
+                executedOrCanceled.set(false)
+                removeCallbacks(runnable)
+                Thread.currentThread().interrupt()
+                onWarn("Interrupted waiting for Main camera unbind")
+            }
+        }
 
         internal fun needsEncoderRestart(
             cameraChanged: Boolean,
