@@ -417,7 +417,7 @@ pub(crate) fn render_update_banner(app: &mut CamCraftApp, ui: &mut egui::Ui) {
                         );
                     });
                 }
-                UpdateUiState::RestartRequired { version } => {
+                UpdateUiState::RestartRequired { version, .. } => {
                     ui.horizontal(|ui| {
                         theme::pill_badge(
                             ui,

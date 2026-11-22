@@ -701,7 +701,11 @@ impl CamCraftApp {
 
     pub(crate) fn restart_after_update(&mut self, ctx: &egui::Context) {
         self.session.send(GuiCommand::Disconnect);
-        match std::env::current_exe().and_then(|exe| std::process::Command::new(exe).spawn()) {
+        let spawn_target = match restart_target_for_state(&self.update_state) {
+            Some(path) => Ok(path.to_path_buf()),
+            None => std::env::current_exe(),
+        };
+        match spawn_target.and_then(|exe| std::process::Command::new(exe).spawn()) {
             Ok(_) => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -711,6 +715,13 @@ impl CamCraftApp {
                 ));
             }
         }
+    }
+}
+
+fn restart_target_for_state(state: &UpdateUiState) -> Option<&std::path::Path> {
+    match state {
+        UpdateUiState::RestartRequired { binary_path, .. } => Some(binary_path.as_path()),
+        _ => None,
     }
 }
 
@@ -1085,5 +1096,30 @@ mod tests {
             ),
             "/dev/video12"
         );
+    }
+
+    #[test]
+    fn restart_target_for_state_preserves_appimage_and_portable_paths() {
+        let appimage_path = std::path::PathBuf::from("/home/user/Applications/CamCraft.AppImage");
+        let appimage_state = UpdateUiState::RestartRequired {
+            version: "0.2.0".to_owned(),
+            binary_path: appimage_path.clone(),
+        };
+        assert_eq!(
+            restart_target_for_state(&appimage_state),
+            Some(appimage_path.as_path())
+        );
+
+        let portable_path = std::path::PathBuf::from("/opt/camcraft/camcraft-gui");
+        let portable_state = UpdateUiState::RestartRequired {
+            version: "0.2.1".to_owned(),
+            binary_path: portable_path.clone(),
+        };
+        assert_eq!(
+            restart_target_for_state(&portable_state),
+            Some(portable_path.as_path())
+        );
+
+        assert_eq!(restart_target_for_state(&UpdateUiState::Idle), None);
     }
 }

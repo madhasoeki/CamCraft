@@ -147,6 +147,7 @@ pub enum UpdateUiState {
     },
     RestartRequired {
         version: String,
+        binary_path: PathBuf,
     },
     PackageDownloaded {
         version: String,
@@ -446,18 +447,27 @@ struct ActiveConnection {
 }
 
 impl ActiveConnection {
-    fn stop(mut self) {
+    async fn stop(mut self) {
         self.decoder_running.store(false, Ordering::Relaxed);
         self.audio_running.store(false, Ordering::Relaxed);
         self.shutdown.store(true, Ordering::Relaxed);
         self.decoder_tx.stop();
         self.audio_tx.stop();
-        self.client_task.abort();
-        if let Some(handle) = self.decoder_thread.take() {
-            let _ = handle.join();
-        }
-        if let Some(handle) = self.audio_thread.take() {
-            let _ = handle.join();
+
+        let _ = self.client_task.await;
+
+        let decoder_thread = self.decoder_thread.take();
+        let audio_thread = self.audio_thread.take();
+        if decoder_thread.is_some() || audio_thread.is_some() {
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Some(handle) = decoder_thread {
+                    let _ = handle.join();
+                }
+                if let Some(handle) = audio_thread {
+                    let _ = handle.join();
+                }
+            })
+            .await;
         }
     }
 }
@@ -540,7 +550,7 @@ async fn run_session_supervisor(
                         auto_reconnect,
                     } => {
                         if let Some(conn) = active.take() {
-                            conn.stop();
+                            conn.stop().await;
                         }
                         if let Some(ref s) = scanner {
                             s.set_active_queries_paused(false);
@@ -617,7 +627,7 @@ async fn run_session_supervisor(
                         auto_reconnect,
                     } => {
                         if let Some(conn) = active.take() {
-                            conn.stop();
+                            conn.stop().await;
                         }
                         if let Some(ref s) = scanner {
                             s.set_active_queries_paused(false);
@@ -718,7 +728,7 @@ async fn run_session_supervisor(
                     }
                     GuiCommand::Disconnect => {
                         if let Some(conn) = active.take() {
-                            conn.stop();
+                            conn.stop().await;
                             emit(&update_tx, &ctx, GuiUpdate::Disconnected("Disconnected by user".to_owned()));
                         }
                         if let Some(ref s) = scanner {
@@ -833,7 +843,7 @@ async fn run_session_supervisor(
                     }
                     InternalEvent::SessionEnded => {
                         if let Some(conn) = active.take() {
-                            conn.stop();
+                            conn.stop().await;
                         }
                         if let Some(ref s) = scanner {
                             s.set_active_queries_paused(false);
@@ -845,7 +855,7 @@ async fn run_session_supervisor(
     }
 
     if let Some(conn) = active.take() {
-        conn.stop();
+        conn.stop().await;
     }
     if let Some(mut s) = scanner.take() {
         s.stop();
@@ -887,6 +897,36 @@ fn vcam_backend_fallback_label(mode: VcamBackendMode, vcam_device: &str) -> Stri
 fn is_usb_permission_denied_reason(reason: &str) -> bool {
     let lower = reason.to_ascii_lowercase();
     lower.contains("usb permission denied") || lower.contains("70-camcraft-aoa.rules")
+}
+
+async fn send_internal_unless_shutdown(
+    tx: &mpsc::Sender<InternalEvent>,
+    shutdown: &AtomicBool,
+    ev: InternalEvent,
+) {
+    if shutdown.load(Ordering::Relaxed) {
+        return;
+    }
+    match tx.try_send(ev) {
+        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+        Err(mpsc::error::TrySendError::Full(ev)) => {
+            let mut reserve_fut = std::pin::pin!(tx.reserve());
+            loop {
+                if shutdown.load(Ordering::Relaxed) {
+                    return;
+                }
+                tokio::select! {
+                    res = &mut reserve_fut => {
+                        if let Ok(permit) = res {
+                            permit.send(ev);
+                        }
+                        return;
+                    }
+                    () = tokio::time::sleep(Duration::from_millis(20)) => {}
+                }
+            }
+        }
+    }
 }
 
 struct PreparedVcam {
@@ -1136,7 +1176,7 @@ async fn start_connection(
         };
         let client_shutdown = shutdown_c.clone();
 
-        let net_handle = tokio::spawn(async move {
+        let net_fut = async move {
             match (mode, auto_reconnect) {
                 (ConnectionMode::UsbAoa, true) => {
                     client::run_aoa_client_with_reconnect(
@@ -1176,150 +1216,175 @@ async fn start_connection(
                     client::run_client_loop(cfg, event_tx, client_shutdown).await
                 }
             }
-        });
+        };
 
-        let mut disconnected_emitted = false;
-        let mut last_audio_repaint: Option<Instant> = None;
+        let event_shutdown = shutdown_c.clone();
+        let event_endpoint = endpoint_c.clone();
+        let event_loop = async move {
+            let mut disconnected_emitted = false;
+            let mut last_audio_repaint: Option<Instant> = None;
 
-        while let Some(event) = event_rx.recv().await {
-            match event {
-                ClientEvent::Connected(sender) => {
-                    let _ = internal_tx_c.send(InternalEvent::SenderReady(sender)).await;
-                    if vcam_opened {
+            while let Some(event) = event_rx.recv().await {
+                match event {
+                    ClientEvent::Connected(sender) => {
+                        send_internal_unless_shutdown(
+                            &internal_tx_c,
+                            &event_shutdown,
+                            InternalEvent::SenderReady(sender),
+                        )
+                        .await;
+                        if vcam_opened {
+                            emit(
+                                &update_tx_c,
+                                &ctx_c,
+                                GuiUpdate::VcamStatus {
+                                    backend: active_vcam_backend,
+                                    display_label: vcam_label_c.clone(),
+                                    v4l2_path: v4l2_path_c.clone(),
+                                    active: true,
+                                    standby: false,
+                                    pipewire_unavailable: pw_unavailable,
+                                    error: None,
+                                },
+                            );
+                        }
+                        emit(&update_tx_c, &ctx_c, GuiUpdate::Connected(mode));
+                    }
+                    ClientEvent::Reconnecting {
+                        attempt, reason, ..
+                    } => {
+                        send_internal_unless_shutdown(
+                            &internal_tx_c,
+                            &event_shutdown,
+                            InternalEvent::ConnectionLost,
+                        )
+                        .await;
+                        decoder_tx_c.enter_standby();
+                        if vcam_opened {
+                            emit(
+                                &update_tx_c,
+                                &ctx_c,
+                                GuiUpdate::VcamStatus {
+                                    backend: active_vcam_backend,
+                                    display_label: vcam_label_c.clone(),
+                                    v4l2_path: v4l2_path_c.clone(),
+                                    active: true,
+                                    standby: true,
+                                    pipewire_unavailable: pw_unavailable,
+                                    error: None,
+                                },
+                            );
+                        }
+                        let formatted_reason = format_disconnect_reason(&reason);
+                        if is_usb_permission_denied_reason(&reason) {
+                            emit(
+                                &update_tx_c,
+                                &ctx_c,
+                                GuiUpdate::UsbPermissionDenied(formatted_reason.clone()),
+                            );
+                        }
                         emit(
                             &update_tx_c,
                             &ctx_c,
-                            GuiUpdate::VcamStatus {
-                                backend: active_vcam_backend,
-                                display_label: vcam_label_c.clone(),
-                                v4l2_path: v4l2_path_c.clone(),
-                                active: true,
-                                standby: false,
-                                pipewire_unavailable: pw_unavailable,
-                                error: None,
+                            GuiUpdate::Reconnecting {
+                                mode,
+                                endpoint: event_endpoint.clone(),
+                                attempt,
+                                reason: formatted_reason,
                             },
                         );
                     }
-                    emit(&update_tx_c, &ctx_c, GuiUpdate::Connected(mode));
-                }
-                ClientEvent::Reconnecting {
-                    attempt, reason, ..
-                } => {
-                    let _ = internal_tx_c.send(InternalEvent::ConnectionLost).await;
-                    decoder_tx_c.enter_standby();
-                    if vcam_opened {
-                        emit(
-                            &update_tx_c,
-                            &ctx_c,
-                            GuiUpdate::VcamStatus {
-                                backend: active_vcam_backend,
-                                display_label: vcam_label_c.clone(),
-                                v4l2_path: v4l2_path_c.clone(),
-                                active: true,
-                                standby: true,
-                                pipewire_unavailable: pw_unavailable,
-                                error: None,
-                            },
+                    ClientEvent::Hello(hello) => {
+                        audio_tx_c.set_state(
+                            hello.active_state.audio_enabled,
+                            hello.active_state.audio_muted,
                         );
+                        emit(&update_tx_c, &ctx_c, GuiUpdate::Hello(hello));
                     }
-                    let formatted_reason = format_disconnect_reason(&reason);
-                    if is_usb_permission_denied_reason(&reason) {
-                        emit(
-                            &update_tx_c,
-                            &ctx_c,
-                            GuiUpdate::UsbPermissionDenied(formatted_reason.clone()),
-                        );
-                    }
-                    emit(
-                        &update_tx_c,
-                        &ctx_c,
-                        GuiUpdate::Reconnecting {
-                            mode,
-                            endpoint: endpoint_c.clone(),
-                            attempt,
-                            reason: formatted_reason,
-                        },
-                    );
-                }
-                ClientEvent::Hello(hello) => {
-                    audio_tx_c.set_state(
-                        hello.active_state.audio_enabled,
-                        hello.active_state.audio_muted,
-                    );
-                    emit(&update_tx_c, &ctx_c, GuiUpdate::Hello(hello));
-                }
-                ClientEvent::ControlAck(ack) => {
-                    if let Some(ref st) = ack.active_state {
-                        audio_tx_c.set_state(st.audio_enabled, st.audio_muted);
-                    }
-                    emit(&update_tx_c, &ctx_c, GuiUpdate::ControlAck(ack));
-                }
-                ClientEvent::Stats(stats) => {
-                    emit(&update_tx_c, &ctx_c, GuiUpdate::Stats(stats));
-                }
-                ClientEvent::VideoConfig {
-                    header, payload, ..
-                } => {
-                    if let Err(e) = decoder_tx_c.push_config(header.pts_us, payload) {
-                        warn!(error = %e, "Failed to queue VIDEO_CONFIG");
-                    }
-                }
-                ClientEvent::VideoFrame {
-                    header, payload, ..
-                } => {
-                    match decoder_tx_c.push_frame_with_flags(header.pts_us, header.flags, payload) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            let _ = internal_tx_c.try_send(InternalEvent::RequestKeyframe(
-                                KeyframeRequestReason::FrameDropped,
-                            ));
+                    ClientEvent::ControlAck(ack) => {
+                        if let Some(ref st) = ack.active_state {
+                            audio_tx_c.set_state(st.audio_enabled, st.audio_muted);
                         }
-                        Err(e) => {
-                            warn!(error = %e, "Failed to queue VIDEO_FRAME");
+                        emit(&update_tx_c, &ctx_c, GuiUpdate::ControlAck(ack));
+                    }
+                    ClientEvent::Stats(stats) => {
+                        emit(&update_tx_c, &ctx_c, GuiUpdate::Stats(stats));
+                    }
+                    ClientEvent::VideoConfig {
+                        header, payload, ..
+                    } => {
+                        if let Err(e) = decoder_tx_c.push_config(header.pts_us, payload) {
+                            warn!(error = %e, "Failed to queue VIDEO_CONFIG");
                         }
                     }
-                }
-                ClientEvent::AudioConfig { config, .. } => {
-                    if let Err(e) = audio_tx_c.push_config(config) {
-                        warn!(error = %e, "Failed to queue AUDIO_CONFIG");
+                    ClientEvent::VideoFrame {
+                        header, payload, ..
+                    } => {
+                        match decoder_tx_c.push_frame_with_flags(
+                            header.pts_us,
+                            header.flags,
+                            payload,
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                let _ = internal_tx_c.try_send(InternalEvent::RequestKeyframe(
+                                    KeyframeRequestReason::FrameDropped,
+                                ));
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Failed to queue VIDEO_FRAME");
+                            }
+                        }
                     }
-                }
-                ClientEvent::AudioFrame {
-                    header, payload, ..
-                } => {
-                    if let Err(e) = audio_tx_c.push_frame(header.pts_us, payload) {
-                        warn!(error = %e, "Failed to queue AUDIO_FRAME");
-                    } else if audio_meter_active_c.load(Ordering::Relaxed)
-                        && last_audio_repaint
-                            .is_none_or(|prev| prev.elapsed() >= AUDIO_METER_REPAINT_MIN_INTERVAL)
-                    {
-                        last_audio_repaint = Some(Instant::now());
-                        ctx_c.request_repaint();
+                    ClientEvent::AudioConfig { config, .. } => {
+                        if let Err(e) = audio_tx_c.push_config(config) {
+                            warn!(error = %e, "Failed to queue AUDIO_CONFIG");
+                        }
                     }
-                }
-                ClientEvent::Disconnected(reason) => {
-                    disconnected_emitted = true;
-                    let formatted_reason = format_disconnect_reason(&reason);
-                    if is_usb_permission_denied_reason(&reason) {
+                    ClientEvent::AudioFrame {
+                        header, payload, ..
+                    } => {
+                        if let Err(e) = audio_tx_c.push_frame(header.pts_us, payload) {
+                            warn!(error = %e, "Failed to queue AUDIO_FRAME");
+                        } else if audio_meter_active_c.load(Ordering::Relaxed)
+                            && last_audio_repaint.is_none_or(|prev| {
+                                prev.elapsed() >= AUDIO_METER_REPAINT_MIN_INTERVAL
+                            })
+                        {
+                            last_audio_repaint = Some(Instant::now());
+                            ctx_c.request_repaint();
+                        }
+                    }
+                    ClientEvent::Disconnected(reason) => {
+                        disconnected_emitted = true;
+                        let formatted_reason = format_disconnect_reason(&reason);
+                        if is_usb_permission_denied_reason(&reason) {
+                            emit(
+                                &update_tx_c,
+                                &ctx_c,
+                                GuiUpdate::UsbPermissionDenied(formatted_reason.clone()),
+                            );
+                        }
                         emit(
                             &update_tx_c,
                             &ctx_c,
-                            GuiUpdate::UsbPermissionDenied(formatted_reason.clone()),
+                            GuiUpdate::Disconnected(formatted_reason),
                         );
+                        break;
                     }
-                    emit(
-                        &update_tx_c,
-                        &ctx_c,
-                        GuiUpdate::Disconnected(formatted_reason),
-                    );
-                    break;
                 }
             }
-        }
 
-        match net_handle.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
+            drop(event_rx);
+            (disconnected_emitted, internal_tx_c, update_tx_c, ctx_c)
+        };
+
+        let (net_res, (disconnected_emitted, internal_tx_c, update_tx_c, ctx_c)) =
+            tokio::join!(net_fut, event_loop);
+
+        match net_res {
+            Ok(()) => {}
+            Err(e) => {
                 error!(error = %e, "Client network loop exited with error");
                 let formatted = format_client_error(&e);
                 if matches!(e, ClientError::UsbAoa(UsbAoaError::PermissionDenied(_))) {
@@ -1333,18 +1398,9 @@ async fn start_connection(
                     emit(&update_tx_c, &ctx_c, GuiUpdate::Error(formatted));
                 }
             }
-            Err(e) => {
-                error!(error = %e, "Client network task failed");
-                if !disconnected_emitted {
-                    emit(
-                        &update_tx_c,
-                        &ctx_c,
-                        GuiUpdate::Error(format!("Connection task failed: {e}")),
-                    );
-                }
-            }
         }
-        let _ = internal_tx_c.send(InternalEvent::SessionEnded).await;
+        send_internal_unless_shutdown(&internal_tx_c, &shutdown_c, InternalEvent::SessionEnded)
+            .await;
     });
 
     Some(ActiveConnection {
@@ -1587,6 +1643,7 @@ fn install_outcome_to_ui_state(outcome: InstallOutcome) -> UpdateUiState {
     match outcome.action {
         InstallAction::ReplacedInPlace => UpdateUiState::RestartRequired {
             version: outcome.version,
+            binary_path: outcome.binary_path,
         },
         InstallAction::DownloadedPackage {
             package_path,
@@ -1672,16 +1729,31 @@ mod tests {
 
     #[test]
     fn install_outcome_maps_replaced_in_place_and_downloaded_package() {
-        let in_place = InstallOutcome {
+        let appimage_in_place = InstallOutcome {
             version: "0.2.0".to_owned(),
             binary_path: PathBuf::from("/tmp/CamCraft.AppImage"),
             sibling_updated: false,
             action: InstallAction::ReplacedInPlace,
         };
         assert_eq!(
-            install_outcome_to_ui_state(in_place),
+            install_outcome_to_ui_state(appimage_in_place),
             UpdateUiState::RestartRequired {
                 version: "0.2.0".to_owned(),
+                binary_path: PathBuf::from("/tmp/CamCraft.AppImage"),
+            }
+        );
+
+        let portable_in_place = InstallOutcome {
+            version: "0.2.1".to_owned(),
+            binary_path: PathBuf::from("/opt/camcraft/camcraft-gui"),
+            sibling_updated: true,
+            action: InstallAction::ReplacedInPlace,
+        };
+        assert_eq!(
+            install_outcome_to_ui_state(portable_in_place),
+            UpdateUiState::RestartRequired {
+                version: "0.2.1".to_owned(),
+                binary_path: PathBuf::from("/opt/camcraft/camcraft-gui"),
             }
         );
 
@@ -1770,5 +1842,74 @@ mod tests {
 
         let join_res = handle.join().expect("decoder thread panicked");
         assert!(join_res.is_ok());
+    }
+
+    #[test]
+    fn active_connection_stop_completes_cleanly_on_current_thread_runtime() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current_thread runtime");
+
+        rt.block_on(async {
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let decoder_running = Arc::new(AtomicBool::new(true));
+            let audio_running = Arc::new(AtomicBool::new(true));
+            let (decoder_tx, decoder_rx) = DecoderSender::new_bounded();
+            let audio_enabled = Arc::new(AtomicBool::new(true));
+            let audio_muted = Arc::new(AtomicBool::new(false));
+            let (audio_tx, audio_rx) =
+                AudioWorkerSender::new_bounded(audio_enabled.clone(), audio_muted.clone());
+
+            let decoder_thread =
+                spawn_decoder_worker(decoder_rx, None, None, false, decoder_running.clone())
+                    .expect("spawn decoder worker");
+            let audio_thread = std::thread::Builder::new()
+                .name("test-vmic".to_owned())
+                .spawn(move || {
+                    run_audio_worker_loop(
+                        audio_rx,
+                        None,
+                        None,
+                        audio_running,
+                        audio_enabled,
+                        audio_muted,
+                    );
+                })
+                .expect("spawn audio worker");
+
+            let client_shutdown = shutdown.clone();
+            let client_finished = Arc::new(AtomicBool::new(false));
+            let client_finished_c = client_finished.clone();
+            let client_task = tokio::spawn(async move {
+                while !client_shutdown.load(Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                client_finished_c.store(true, Ordering::Relaxed);
+            });
+
+            let conn = ActiveConnection {
+                shutdown,
+                decoder_running,
+                decoder_tx,
+                decoder_thread: Some(decoder_thread),
+                audio_running: Arc::new(AtomicBool::new(true)),
+                audio_tx,
+                audio_thread: Some(audio_thread),
+                client_task,
+                sender: None,
+                last_keyframe_req: None,
+            };
+
+            tokio::time::timeout(Duration::from_secs(2), conn.stop())
+                .await
+                .expect(
+                    "ActiveConnection::stop must complete without stalling current_thread runtime",
+                );
+            assert!(
+                client_finished.load(Ordering::Relaxed),
+                "client_task must finish gracefully rather than being orphaned/aborted"
+            );
+        });
     }
 }

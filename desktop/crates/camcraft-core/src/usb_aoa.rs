@@ -89,10 +89,11 @@ const CTRL_REQ_TYPE_IN_VENDOR: u8 = 0xC0;
 const CTRL_REQ_TYPE_OUT_VENDOR: u8 = 0x40;
 const CTRL_TIMEOUT_MS: u32 = 1_000;
 const BULK_IN_TIMEOUT_MS: u32 = 250;
-const BULK_OUT_TIMEOUT_MS: u32 = 1_000;
+const BULK_OUT_TIMEOUT_MS: u32 = 250;
 const UNIX_IO_TIMEOUT: Duration = Duration::from_millis(250);
 const REENUMERATION_TIMEOUT: Duration = Duration::from_secs(5);
 const REENUMERATION_POLL_INTERVAL: Duration = Duration::from_millis(150);
+const REENUMERATION_SHUTDOWN_SLICE: Duration = Duration::from_millis(50);
 const MAX_DESCRIPTOR_READ_BYTES: u64 = 128 * 1024;
 
 /// Known Android phone/SoC USB Vendor IDs prioritized during candidate probing.
@@ -182,11 +183,67 @@ struct UsbdevfsBulkTransfer {
 }
 
 #[repr(C)]
+struct UsbdevfsUrb {
+    urb_type: u8,
+    endpoint: u8,
+    status: i32,
+    flags: u32,
+    buffer: *mut libc::c_void,
+    buffer_length: i32,
+    actual_length: i32,
+    start_frame: i32,
+    number_of_packets: u32,
+    error_count: i32,
+    signr: u32,
+    usercontext: *mut libc::c_void,
+}
+
+impl UsbdevfsUrb {
+    fn zeroed() -> Self {
+        Self {
+            urb_type: 0,
+            endpoint: 0,
+            status: 0,
+            flags: 0,
+            buffer: std::ptr::null_mut(),
+            buffer_length: 0,
+            actual_length: 0,
+            start_frame: 0,
+            number_of_packets: 0,
+            error_count: 0,
+            signr: 0,
+            usercontext: std::ptr::null_mut(),
+        }
+    }
+
+    fn reset_bulk_in(&mut self, ep_in: u8, buf: &mut [u8]) {
+        self.urb_type = USBDEVFS_URB_TYPE_BULK;
+        self.endpoint = ep_in;
+        self.status = 0;
+        self.flags = 0;
+        self.buffer = if buf.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            buf.as_mut_ptr().cast::<libc::c_void>()
+        };
+        self.buffer_length = i32::try_from(buf.len()).unwrap_or(i32::MAX);
+        self.actual_length = 0;
+        self.start_frame = 0;
+        self.number_of_packets = 0;
+        self.error_count = 0;
+        self.signr = 0;
+        self.usercontext = std::ptr::null_mut();
+    }
+}
+
+#[repr(C)]
 struct UsbdevfsDisconnectClaim {
     interface: u32,
     flags: u32,
     driver: [u8; 256],
 }
+
+const USBDEVFS_URB_TYPE_BULK: u8 = 3;
 
 const IOC_WRITE: u32 = 1;
 const IOC_READ: u32 = 2;
@@ -203,8 +260,16 @@ const fn ioc(dir: u32, ty: u8, nr: u8, size: usize) -> libc::Ioctl {
     raw as libc::Ioctl
 }
 
+const fn io_ioctl(ty: u8, nr: u8) -> libc::Ioctl {
+    ioc(0, ty, nr, 0)
+}
+
 const fn ior<T>(ty: u8, nr: u8) -> libc::Ioctl {
     ioc(IOC_READ, ty, nr, std::mem::size_of::<T>())
+}
+
+const fn iow<T>(ty: u8, nr: u8) -> libc::Ioctl {
+    ioc(IOC_WRITE, ty, nr, std::mem::size_of::<T>())
 }
 
 const fn iowr<T>(ty: u8, nr: u8) -> libc::Ioctl {
@@ -213,6 +278,10 @@ const fn iowr<T>(ty: u8, nr: u8) -> libc::Ioctl {
 
 const USBDEVFS_CONTROL: libc::Ioctl = iowr::<UsbdevfsCtrlTransfer>(b'U', 0);
 const USBDEVFS_BULK: libc::Ioctl = iowr::<UsbdevfsBulkTransfer>(b'U', 2);
+const USBDEVFS_SUBMITURB: libc::Ioctl = ior::<UsbdevfsUrb>(b'U', 10);
+const USBDEVFS_DISCARDURB: libc::Ioctl = io_ioctl(b'U', 11);
+const USBDEVFS_REAPURB: libc::Ioctl = iow::<*mut UsbdevfsUrb>(b'U', 12);
+const USBDEVFS_REAPURBNDELAY: libc::Ioctl = iow::<*mut UsbdevfsUrb>(b'U', 13);
 const USBDEVFS_CLAIMINTERFACE: libc::Ioctl = ior::<u32>(b'U', 15);
 const USBDEVFS_RELEASEINTERFACE: libc::Ioctl = ior::<u32>(b'U', 16);
 const USBDEVFS_CLEAR_HALT: libc::Ioctl = ior::<u32>(b'U', 21);
@@ -482,6 +551,32 @@ pub struct AoaConnection {
     endpoints: BulkEndpoints,
 }
 
+/// Join/stop handle for the OS worker threads backing an AOA [`tokio::net::UnixStream`].
+#[derive(Debug)]
+pub struct AoaStreamHandle {
+    worker_stop: Arc<AtomicBool>,
+    cleanup_stream: Option<StdUnixStream>,
+    rx_thread: Option<thread::JoinHandle<()>>,
+    tx_thread: Option<thread::JoinHandle<()>>,
+}
+
+impl AoaStreamHandle {
+    /// Signals both AOA RX/TX worker threads to stop and joins them so the claimed
+    /// `usbdevfs` interface guard is released before any subsequent reconnect attempt.
+    pub fn stop_and_join(mut self) {
+        self.worker_stop.store(true, Ordering::Relaxed);
+        if let Some(stream) = self.cleanup_stream.take() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+        if let Some(handle) = self.rx_thread.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.tx_thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 impl AoaConnection {
     /// Returns metadata for the connected USB accessory device.
     #[must_use]
@@ -504,6 +599,18 @@ impl AoaConnection {
         self,
         shutdown: Arc<AtomicBool>,
     ) -> Result<TokioUnixStream, UsbAoaError> {
+        let (stream, _handle) = self.into_tokio_stream_with_handle(shutdown)?;
+        Ok(stream)
+    }
+
+    /// Bridges this AOA bulk connection into a nonblocking [`tokio::net::UnixStream`]
+    /// and returns an [`AoaStreamHandle`] that joins the RX/TX worker threads on teardown.
+    ///
+    /// Must be called from within a Tokio runtime context.
+    pub fn into_tokio_stream_with_handle(
+        self,
+        shutdown: Arc<AtomicBool>,
+    ) -> Result<(TokioUnixStream, AoaStreamHandle), UsbAoaError> {
         let Self {
             guard,
             info: _,
@@ -518,6 +625,7 @@ impl AoaConnection {
         rx_stream.set_write_timeout(Some(UNIX_IO_TIMEOUT))?;
         let tx_stream = rx_stream.try_clone()?;
         tx_stream.set_read_timeout(Some(UNIX_IO_TIMEOUT))?;
+        let cleanup_stream = rx_stream.try_clone()?;
 
         let worker_stop = Arc::new(AtomicBool::new(false));
 
@@ -525,9 +633,8 @@ impl AoaConnection {
         let rx_shutdown = Arc::clone(&shutdown);
         let rx_stop = Arc::clone(&worker_stop);
         let rx_ep = endpoints.ep_in;
-        let rx_stream_for_cleanup = rx_stream.try_clone()?;
 
-        thread::Builder::new()
+        let rx_thread = thread::Builder::new()
             .name("camcraft-aoa-rx".to_owned())
             .spawn(move || {
                 run_aoa_rx_worker(rx_guard, rx_ep, rx_stream, rx_shutdown, rx_stop);
@@ -538,19 +645,80 @@ impl AoaConnection {
         let tx_stop = Arc::clone(&worker_stop);
         let tx_ep = endpoints.ep_out;
 
-        if let Err(err) = thread::Builder::new()
+        let tx_thread = match thread::Builder::new()
             .name("camcraft-aoa-tx".to_owned())
             .spawn(move || {
                 run_aoa_tx_worker(tx_guard, tx_ep, tx_stream, tx_shutdown, tx_stop);
-            })
-        {
-            worker_stop.store(true, Ordering::Relaxed);
-            let _ = rx_stream_for_cleanup.shutdown(std::net::Shutdown::Both);
-            return Err(UsbAoaError::Io(err));
-        }
+            }) {
+            Ok(handle) => handle,
+            Err(err) => {
+                worker_stop.store(true, Ordering::Relaxed);
+                let _ = cleanup_stream.shutdown(std::net::Shutdown::Both);
+                let _ = rx_thread.join();
+                return Err(UsbAoaError::Io(err));
+            }
+        };
 
-        Ok(tokio_stream)
+        Ok((
+            tokio_stream,
+            AoaStreamHandle {
+                worker_stop,
+                cleanup_stream: Some(cleanup_stream),
+                rx_thread: Some(rx_thread),
+                tx_thread: Some(tx_thread),
+            },
+        ))
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UrbCompletion {
+    Continue { bytes: usize },
+    Fatal { bytes: usize, os_error: i32 },
+}
+
+fn classify_reaped_urb(status: i32, actual_length: i32, max_len: usize) -> UrbCompletion {
+    let bytes = usize::try_from(actual_length).unwrap_or(0).min(max_len);
+    if status == 0 {
+        return UrbCompletion::Continue { bytes };
+    }
+    let os_error = status.saturating_neg();
+    if matches!(
+        os_error,
+        libc::ENOENT | libc::ECONNRESET | libc::ETIMEDOUT | libc::EAGAIN
+    ) {
+        UrbCompletion::Continue { bytes }
+    } else {
+        UrbCompletion::Fatal { bytes, os_error }
+    }
+}
+
+fn forward_aoa_rx_bytes(
+    scratch: &[u8],
+    len: usize,
+    stream: &mut StdUnixStream,
+    shutdown: &AtomicBool,
+    worker_stop: &AtomicBool,
+) -> bool {
+    let mut written = 0usize;
+    while written < len {
+        if shutdown.load(Ordering::Relaxed) || worker_stop.load(Ordering::Relaxed) {
+            return false;
+        }
+        match stream.write(&scratch[written..len]) {
+            Ok(0) => return false,
+            Ok(k) => written += k,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                continue;
+            }
+            Err(e) => {
+                debug!(error = %e, "AOA RX UnixStream write closed");
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn run_aoa_rx_worker(
@@ -560,53 +728,54 @@ fn run_aoa_rx_worker(
     shutdown: Arc<AtomicBool>,
     worker_stop: Arc<AtomicBool>,
 ) {
+    if (ep_in & 0x80) == 0 {
+        warn!(ep = %format!("0x{ep_in:02x}"), "AOA RX endpoint is not Bulk IN");
+        worker_stop.store(true, Ordering::Relaxed);
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        return;
+    }
+
     let mut scratch = vec![0u8; AOA_MAX_BULK_CHUNK];
+    let mut urb = Box::new(UsbdevfsUrb::zeroed());
     let fd = guard.file.as_raw_fd();
 
+    // Only RX submits async URBs on `fd`; TX uses synchronous `USBDEVFS_BULK` so RX can never reap TX URBs.
     while !shutdown.load(Ordering::Relaxed) && !worker_stop.load(Ordering::Relaxed) {
-        match usbdevfs_bulk_in(fd, ep_in, &mut scratch, BULK_IN_TIMEOUT_MS) {
-            Ok(0) => continue,
-            Ok(n) => {
-                let mut written = 0usize;
-                let mut write_failed = false;
-                while written < n {
-                    if shutdown.load(Ordering::Relaxed) || worker_stop.load(Ordering::Relaxed) {
-                        write_failed = true;
-                        break;
-                    }
-                    match stream.write(&scratch[written..n]) {
-                        Ok(0) => {
-                            write_failed = true;
-                            break;
-                        }
-                        Ok(k) => written += k,
-                        Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                        Err(e)
-                            if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
-                        {
-                            continue;
-                        }
-                        Err(e) => {
-                            debug!(error = %e, "AOA RX UnixStream write closed");
-                            write_failed = true;
-                            break;
-                        }
-                    }
-                }
-                if write_failed {
-                    break;
-                }
-            }
-            Err(e) => {
-                if matches!(
-                    e.raw_os_error(),
-                    Some(libc::ETIMEDOUT | libc::EAGAIN | libc::EINTR)
-                ) {
-                    continue;
-                }
-                debug!(error = %e, ep = %format!("0x{ep_in:02x}"), "AOA RX bulk transfer ended");
+        urb.reset_bulk_in(ep_in, &mut scratch);
+        let urb_ptr: *mut UsbdevfsUrb = &mut *urb;
+
+        // SAFETY: `fd` is an open `usbdevfs` fd kept alive by `guard`, `urb` is heap-pinned and
+        // exclusively owned by this thread, and `urb.buffer` points to `scratch` which stays alive
+        // and unaccessed until `wait_and_reap_rx_urb` reaps the URB.
+        if let Err(err) = unsafe { submit_urb(fd, urb_ptr) } {
+            debug!(error = %err, ep = %format!("0x{ep_in:02x}"), "AOA RX submit URB failed");
+            break;
+        }
+
+        // SAFETY: `urb_ptr` was just submitted on `fd` and has not yet been reaped.
+        let completion = match unsafe { wait_and_reap_rx_urb(fd, urb_ptr, &shutdown, &worker_stop) }
+        {
+            Ok(c) => c,
+            Err(err) => {
+                debug!(error = %err, ep = %format!("0x{ep_in:02x}"), "AOA RX reap URB failed");
                 break;
             }
+        };
+
+        let (bytes, fatal_err) = match completion {
+            UrbCompletion::Continue { bytes } => (bytes, None),
+            UrbCompletion::Fatal { bytes, os_error } => (bytes, Some(os_error)),
+        };
+
+        if bytes > 0 && !forward_aoa_rx_bytes(&scratch, bytes, &mut stream, &shutdown, &worker_stop)
+        {
+            break;
+        }
+
+        if let Some(os_error) = fatal_err {
+            let err = std::io::Error::from_raw_os_error(os_error);
+            debug!(error = %err, ep = %format!("0x{ep_in:02x}"), "AOA RX bulk URB ended");
+            break;
         }
     }
 
@@ -631,7 +800,9 @@ fn run_aoa_tx_worker(
                 break;
             }
             Ok(n) => {
-                if let Err(e) = write_bulk_out_chunked(fd, ep_out, &scratch[..n]) {
+                if let Err(e) =
+                    write_bulk_out_chunked(fd, ep_out, &scratch[..n], &shutdown, &worker_stop)
+                {
                     debug!(
                         error = %e,
                         ep = %format!("0x{ep_out:02x}"),
@@ -659,24 +830,70 @@ fn run_aoa_tx_worker(
     let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
-fn write_bulk_out_chunked(fd: RawFd, ep_out: u8, data: &[u8]) -> Result<(), std::io::Error> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BulkOutErrorKind {
+    Retryable,
+    Fatal,
+}
+
+fn classify_bulk_out_error(err: &std::io::Error) -> BulkOutErrorKind {
+    if matches!(
+        err.raw_os_error(),
+        Some(libc::ETIMEDOUT | libc::EAGAIN | libc::EINTR)
+    ) || matches!(
+        err.kind(),
+        ErrorKind::TimedOut | ErrorKind::WouldBlock | ErrorKind::Interrupted
+    ) {
+        BulkOutErrorKind::Retryable
+    } else {
+        BulkOutErrorKind::Fatal
+    }
+}
+
+fn write_bulk_out_chunked_with<F>(
+    data: &[u8],
+    shutdown: &AtomicBool,
+    worker_stop: &AtomicBool,
+    mut send_chunk: F,
+) -> Result<(), std::io::Error>
+where
+    F: FnMut(&[u8]) -> Result<usize, std::io::Error>,
+{
     for chunk in data.chunks(AOA_MAX_BULK_CHUNK) {
         let mut sent = 0usize;
         while sent < chunk.len() {
-            match usbdevfs_bulk_out(fd, ep_out, &chunk[sent..], BULK_OUT_TIMEOUT_MS) {
+            if shutdown.load(Ordering::Relaxed) || worker_stop.load(Ordering::Relaxed) {
+                return Err(std::io::Error::new(
+                    ErrorKind::Interrupted,
+                    "AOA bulk OUT stopped by shutdown",
+                ));
+            }
+            match send_chunk(&chunk[sent..]) {
                 Ok(0) => {
                     return Err(std::io::Error::new(
                         ErrorKind::WriteZero,
                         "usbdevfs bulk OUT wrote 0 bytes",
                     ));
                 }
-                Ok(n) => sent += n,
-                Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                Ok(n) => sent += n.min(chunk.len() - sent),
+                Err(e) if classify_bulk_out_error(&e) == BulkOutErrorKind::Retryable => continue,
                 Err(e) => return Err(e),
             }
         }
     }
     Ok(())
+}
+
+fn write_bulk_out_chunked(
+    fd: RawFd,
+    ep_out: u8,
+    data: &[u8],
+    shutdown: &AtomicBool,
+    worker_stop: &AtomicBool,
+) -> Result<(), std::io::Error> {
+    write_bulk_out_chunked_with(data, shutdown, worker_stop, |slice| {
+        usbdevfs_bulk_out(fd, ep_out, slice, BULK_OUT_TIMEOUT_MS)
+    })
 }
 
 /// Discovers and connects to an Android device over USB using Android Open Accessory (AOA v1).
@@ -686,11 +903,27 @@ fn write_bulk_out_chunked(fd: RawFd, ep_out: u8, data: &[u8]) -> Result<(), std:
 ///    runs `AOA_GET_PROTOCOL`, `AOA_SEND_STRING` (`0..=5`), and `AOA_START_ACCESSORY`,
 ///    then polls sysfs for up to 5 seconds for the re-enumerated AOA accessory.
 pub fn connect_aoa_device() -> Result<AoaConnection, UsbAoaError> {
+    let never = AtomicBool::new(false);
+    connect_aoa_device_with_shutdown(&never)
+}
+
+/// Discovers and connects to an Android device over USB AOA v1 while honoring `shutdown`
+/// to abort candidate probing and re-enumeration polling promptly on cancellation.
+pub fn connect_aoa_device_with_shutdown(
+    shutdown: &AtomicBool,
+) -> Result<AoaConnection, UsbAoaError> {
+    if shutdown.load(Ordering::Relaxed) {
+        return Err(UsbAoaError::Disconnected);
+    }
+
     let devices = enumerate_usb_devices();
     let mut permission_denied_path: Option<PathBuf> = None;
 
     // 1. Check for devices already in AOA mode first.
     for dev in devices.iter().filter(|d| is_aoa_device(d.vid, d.pid)) {
+        if shutdown.load(Ordering::Relaxed) {
+            return Err(UsbAoaError::Disconnected);
+        }
         match open_and_claim_aoa(dev) {
             Ok(conn) => return Ok(conn),
             Err(UsbAoaError::PermissionDenied(path)) => {
@@ -716,6 +949,9 @@ pub fn connect_aoa_device() -> Result<AoaConnection, UsbAoaError> {
 
     let mut aoa_start_sent = false;
     for dev in &candidates {
+        if shutdown.load(Ordering::Relaxed) {
+            return Err(UsbAoaError::Disconnected);
+        }
         let dev_path = dev.dev_path();
         let file = match open_usb_device(&dev_path) {
             Ok(f) => f,
@@ -758,11 +994,16 @@ pub fn connect_aoa_device() -> Result<AoaConnection, UsbAoaError> {
     if aoa_start_sent {
         let deadline = Instant::now() + REENUMERATION_TIMEOUT;
         while Instant::now() < deadline {
-            thread::sleep(REENUMERATION_POLL_INTERVAL);
+            if !sleep_with_shutdown(REENUMERATION_POLL_INTERVAL, shutdown) {
+                return Err(UsbAoaError::Disconnected);
+            }
             for dev in enumerate_usb_devices()
                 .into_iter()
                 .filter(|d| is_aoa_device(d.vid, d.pid))
             {
+                if shutdown.load(Ordering::Relaxed) {
+                    return Err(UsbAoaError::Disconnected);
+                }
                 match open_and_claim_aoa(&dev) {
                     Ok(conn) => return Ok(conn),
                     Err(UsbAoaError::PermissionDenied(path)) => {
@@ -791,6 +1032,18 @@ pub fn connect_aoa_device() -> Result<AoaConnection, UsbAoaError> {
     } else {
         Err(UsbAoaError::NoDeviceFound)
     }
+}
+
+fn sleep_with_shutdown(duration: Duration, shutdown: &AtomicBool) -> bool {
+    let deadline = Instant::now() + duration;
+    while !shutdown.load(Ordering::Relaxed) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        thread::sleep(remaining.min(REENUMERATION_SHUTDOWN_SLICE));
+    }
+    false
 }
 
 fn is_likely_android_device(dev: &UsbDeviceInfo) -> bool {
@@ -1141,30 +1394,221 @@ unsafe fn usbdevfs_bulk_raw(
     }
 }
 
-fn usbdevfs_bulk_in(
-    fd: RawFd,
-    ep: u8,
-    buf: &mut [u8],
-    timeout_ms: u32,
-) -> Result<usize, std::io::Error> {
-    if (ep & 0x80) == 0 {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidInput,
-            "bulk IN transfer requires IN endpoint address (bit 7 set)",
-        ));
+/// Submits an async URB via `USBDEVFS_SUBMITURB`.
+///
+/// # Safety
+/// - `fd` must be an open `usbdevfs` file descriptor.
+/// - `urb_ptr` must be valid, heap-pinned, and remain valid (along with its `buffer`) until reaped
+///   or until `fd` is disconnected.
+unsafe fn submit_urb(fd: RawFd, urb_ptr: *mut UsbdevfsUrb) -> Result<(), std::io::Error> {
+    loop {
+        // SAFETY: Caller guarantees `fd` and `urb_ptr` invariants for `USBDEVFS_SUBMITURB`.
+        let rc = unsafe { libc::ioctl(fd, USBDEVFS_SUBMITURB, urb_ptr.cast::<libc::c_void>()) };
+        if rc >= 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return Err(err);
     }
-    let len = u32::try_from(buf.len()).map_err(|_| {
-        std::io::Error::new(ErrorKind::InvalidInput, "bulk IN buffer exceeds u32::MAX")
-    })?;
-    let data_ptr = if buf.is_empty() {
-        std::ptr::null_mut()
-    } else {
-        buf.as_mut_ptr().cast::<libc::c_void>()
-    };
+}
 
-    // SAFETY: `fd` is an open `usbdevfs` fd, `ep` has bit 7 set (IN), and `buf` is exclusively
-    // borrowed mutably for `len` bytes across the synchronous ioctl.
-    unsafe { usbdevfs_bulk_raw(fd, ep, len, data_ptr, timeout_ms) }
+/// Attempts a non-blocking URB reap via `USBDEVFS_REAPURBNDELAY`.
+///
+/// # Safety
+/// - `fd` must be an open `usbdevfs` file descriptor.
+unsafe fn reap_urb_ndelay(fd: RawFd) -> Result<Option<*mut UsbdevfsUrb>, std::io::Error> {
+    let mut reaped: *mut UsbdevfsUrb = std::ptr::null_mut();
+    loop {
+        // SAFETY: `fd` is an open `usbdevfs` fd and `reaped` is a valid stack pointer receiving `*mut UsbdevfsUrb`.
+        let rc = unsafe {
+            libc::ioctl(
+                fd,
+                USBDEVFS_REAPURBNDELAY,
+                (&raw mut reaped).cast::<libc::c_void>(),
+            )
+        };
+        if rc >= 0 {
+            return Ok(Some(reaped));
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EAGAIN) => return Ok(None),
+            _ => return Err(err),
+        }
+    }
+}
+
+/// Performs a blocking URB reap via `USBDEVFS_REAPURB`, retrying on `EINTR`.
+///
+/// # Safety
+/// - `fd` must be an open `usbdevfs` file descriptor with a pending/completed URB.
+unsafe fn reap_urb_blocking(fd: RawFd) -> Result<*mut UsbdevfsUrb, std::io::Error> {
+    let mut reaped: *mut UsbdevfsUrb = std::ptr::null_mut();
+    loop {
+        // SAFETY: `fd` is an open `usbdevfs` fd and `reaped` is a valid stack pointer receiving `*mut UsbdevfsUrb`.
+        let rc = unsafe {
+            libc::ioctl(
+                fd,
+                USBDEVFS_REAPURB,
+                (&raw mut reaped).cast::<libc::c_void>(),
+            )
+        };
+        if rc >= 0 {
+            return Ok(reaped);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return Err(err);
+    }
+}
+
+/// Cancels an in-flight URB with `USBDEVFS_DISCARDURB` and reaps it with `USBDEVFS_REAPURB`.
+///
+/// # Safety
+/// - `fd` must be an open `usbdevfs` file descriptor.
+/// - `urb_ptr` must correspond to a previously submitted URB that has not yet been reaped.
+unsafe fn discard_and_reap_urb(
+    fd: RawFd,
+    urb_ptr: *mut UsbdevfsUrb,
+) -> Result<*mut UsbdevfsUrb, std::io::Error> {
+    // SAFETY: Caller guarantees `fd` is open and `urb_ptr` was submitted via `USBDEVFS_SUBMITURB`.
+    let rc = unsafe { libc::ioctl(fd, USBDEVFS_DISCARDURB, urb_ptr.cast::<libc::c_void>()) };
+    if rc < 0 {
+        let err = std::io::Error::last_os_error();
+        // `ENOENT` / `EINVAL` indicates the URB completed just before discard; still reap it.
+        if !matches!(err.raw_os_error(), Some(libc::ENOENT | libc::EINVAL)) {
+            // SAFETY: Best-effort non-blocking reap in case kernel completed the URB during disconnect.
+            if let Ok(Some(reaped)) = unsafe { reap_urb_ndelay(fd) } {
+                return Ok(reaped);
+            }
+            return Err(err);
+        }
+    }
+
+    // SAFETY: The URB was either cancelled by `USBDEVFS_DISCARDURB` or had already finished.
+    unsafe { reap_urb_blocking(fd) }
+}
+
+/// Polls `fd` for URB completion up to `BULK_IN_TIMEOUT_MS`, reaping immediately or cancelling and
+/// reaping on timeout/shutdown while preserving any `actual_length > 0` partial transfer.
+///
+/// # Safety
+/// - `fd` must be an open `usbdevfs` file descriptor.
+/// - `urb_ptr` must be a valid, currently submitted URB whose buffer has capacity `>= AOA_MAX_BULK_CHUNK`.
+unsafe fn wait_and_reap_rx_urb(
+    fd: RawFd,
+    urb_ptr: *mut UsbdevfsUrb,
+    shutdown: &AtomicBool,
+    worker_stop: &AtomicBool,
+) -> Result<UrbCompletion, std::io::Error> {
+    loop {
+        if shutdown.load(Ordering::Relaxed) || worker_stop.load(Ordering::Relaxed) {
+            // SAFETY: Caller guarantees `fd` and `urb_ptr` remain valid and submitted.
+            let reaped = unsafe { discard_and_reap_urb(fd, urb_ptr)? };
+            // SAFETY: `reaped` was returned by `USBDEVFS_REAPURB`, returning ownership to us.
+            let (status, actual_length, buffer_length) = unsafe {
+                (
+                    (*reaped).status,
+                    (*reaped).actual_length,
+                    (*reaped).buffer_length,
+                )
+            };
+            return Ok(classify_reaped_urb(
+                status,
+                actual_length,
+                usize::try_from(buffer_length).unwrap_or(0),
+            ));
+        }
+
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT | libc::POLLERR | libc::POLLHUP,
+            revents: 0,
+        };
+        // SAFETY: `pfd` points to a valid single `libc::pollfd` for the duration of `poll`.
+        let poll_rc = unsafe { libc::poll(&raw mut pfd, 1, BULK_IN_TIMEOUT_MS as libc::c_int) };
+        if poll_rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            // SAFETY: Ensure submitted URB is discarded and reaped before propagating error.
+            let _ = unsafe { discard_and_reap_urb(fd, urb_ptr) };
+            return Err(err);
+        }
+
+        if poll_rc == 0 {
+            // Timeout: flush partial exact-512B/1024B-multiple chunks received before idle.
+            // SAFETY: Caller guarantees `fd` and `urb_ptr` remain valid and submitted.
+            let reaped = unsafe { discard_and_reap_urb(fd, urb_ptr)? };
+            // SAFETY: `reaped` was returned by `USBDEVFS_REAPURB`, returning ownership to us.
+            let (status, actual_length, buffer_length) = unsafe {
+                (
+                    (*reaped).status,
+                    (*reaped).actual_length,
+                    (*reaped).buffer_length,
+                )
+            };
+            return Ok(classify_reaped_urb(
+                status,
+                actual_length,
+                usize::try_from(buffer_length).unwrap_or(0),
+            ));
+        }
+
+        // SAFETY: `fd` is an open `usbdevfs` file descriptor.
+        match unsafe { reap_urb_ndelay(fd) } {
+            Ok(Some(reaped)) => {
+                if reaped != urb_ptr {
+                    warn!("Reaped unexpected URB pointer on usbdevfs fd");
+                    continue;
+                }
+                // SAFETY: `reaped` was returned by `USBDEVFS_REAPURBNDELAY`, returning ownership to us.
+                let (status, actual_length, buffer_length) = unsafe {
+                    (
+                        (*reaped).status,
+                        (*reaped).actual_length,
+                        (*reaped).buffer_length,
+                    )
+                };
+                return Ok(classify_reaped_urb(
+                    status,
+                    actual_length,
+                    usize::try_from(buffer_length).unwrap_or(0),
+                ));
+            }
+            Ok(None) => {
+                if (pfd.revents & (libc::POLLERR | libc::POLLHUP)) != 0 {
+                    // SAFETY: Ensure submitted URB is discarded and reaped on hangup/error.
+                    let reaped = unsafe { discard_and_reap_urb(fd, urb_ptr)? };
+                    // SAFETY: `reaped` was returned by `USBDEVFS_REAPURB`, returning ownership to us.
+                    let (status, actual_length, buffer_length) = unsafe {
+                        (
+                            (*reaped).status,
+                            (*reaped).actual_length,
+                            (*reaped).buffer_length,
+                        )
+                    };
+                    return Ok(classify_reaped_urb(
+                        status,
+                        actual_length,
+                        usize::try_from(buffer_length).unwrap_or(0),
+                    ));
+                }
+            }
+            Err(err) => {
+                // SAFETY: Best-effort cleanup of submitted URB before propagating reap error.
+                let _ = unsafe { discard_and_reap_urb(fd, urb_ptr) };
+                return Err(err);
+            }
+        }
+    }
 }
 
 fn usbdevfs_bulk_out(
@@ -1309,6 +1753,26 @@ mod tests {
     fn ioctl_request_codes_match_linux_usbdevfs_abi() {
         assert_eq!(USBDEVFS_CONTROL, 0xc018_5500u32 as libc::Ioctl);
         assert_eq!(USBDEVFS_BULK, 0xc018_5502u32 as libc::Ioctl);
+        assert_eq!(USBDEVFS_DISCARDURB, 0x0000_550bu32 as libc::Ioctl);
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(std::mem::size_of::<UsbdevfsUrb>(), 56);
+            assert_eq!(std::mem::offset_of!(UsbdevfsUrb, urb_type), 0);
+            assert_eq!(std::mem::offset_of!(UsbdevfsUrb, endpoint), 1);
+            assert_eq!(std::mem::offset_of!(UsbdevfsUrb, status), 4);
+            assert_eq!(std::mem::offset_of!(UsbdevfsUrb, flags), 8);
+            assert_eq!(std::mem::offset_of!(UsbdevfsUrb, buffer), 16);
+            assert_eq!(std::mem::offset_of!(UsbdevfsUrb, buffer_length), 24);
+            assert_eq!(std::mem::offset_of!(UsbdevfsUrb, actual_length), 28);
+            assert_eq!(std::mem::offset_of!(UsbdevfsUrb, start_frame), 32);
+            assert_eq!(std::mem::offset_of!(UsbdevfsUrb, number_of_packets), 36);
+            assert_eq!(std::mem::offset_of!(UsbdevfsUrb, error_count), 40);
+            assert_eq!(std::mem::offset_of!(UsbdevfsUrb, signr), 44);
+            assert_eq!(std::mem::offset_of!(UsbdevfsUrb, usercontext), 48);
+            assert_eq!(USBDEVFS_SUBMITURB, 0x8038_550au32 as libc::Ioctl);
+            assert_eq!(USBDEVFS_REAPURB, 0x4008_550cu32 as libc::Ioctl);
+            assert_eq!(USBDEVFS_REAPURBNDELAY, 0x4008_550du32 as libc::Ioctl);
+        }
         assert_eq!(USBDEVFS_CLAIMINTERFACE, 0x8004_550fu32 as libc::Ioctl);
         assert_eq!(USBDEVFS_RELEASEINTERFACE, 0x8004_5510u32 as libc::Ioctl);
         assert_eq!(USBDEVFS_CLEAR_HALT, 0x8004_5515u32 as libc::Ioctl);
@@ -1561,6 +2025,132 @@ mod tests {
             fd_flags & libc::FD_CLOEXEC,
             0,
             "opened usbdevfs fd must set O_CLOEXEC/FD_CLOEXEC"
+        );
+    }
+
+    #[test]
+    fn urb_completion_forwards_partial_bytes_on_cancel_and_timeout() {
+        assert_eq!(
+            classify_reaped_urb(0, 1024, AOA_MAX_BULK_CHUNK),
+            UrbCompletion::Continue { bytes: 1024 }
+        );
+        assert_eq!(
+            classify_reaped_urb(-libc::ENOENT, 512, AOA_MAX_BULK_CHUNK),
+            UrbCompletion::Continue { bytes: 512 }
+        );
+        assert_eq!(
+            classify_reaped_urb(-libc::ECONNRESET, 1024, AOA_MAX_BULK_CHUNK),
+            UrbCompletion::Continue { bytes: 1024 }
+        );
+        assert_eq!(
+            classify_reaped_urb(-libc::ETIMEDOUT, 512, AOA_MAX_BULK_CHUNK),
+            UrbCompletion::Continue { bytes: 512 }
+        );
+        assert_eq!(
+            classify_reaped_urb(-libc::ENOENT, 0, AOA_MAX_BULK_CHUNK),
+            UrbCompletion::Continue { bytes: 0 }
+        );
+        assert_eq!(
+            classify_reaped_urb(-libc::ENODEV, 512, AOA_MAX_BULK_CHUNK),
+            UrbCompletion::Fatal {
+                bytes: 512,
+                os_error: libc::ENODEV
+            }
+        );
+        assert_eq!(
+            classify_reaped_urb(-libc::EPIPE, -5, AOA_MAX_BULK_CHUNK),
+            UrbCompletion::Fatal {
+                bytes: 0,
+                os_error: libc::EPIPE
+            }
+        );
+    }
+
+    #[test]
+    fn bulk_out_error_classification_and_retry_shutdown() {
+        assert_eq!(
+            classify_bulk_out_error(&std::io::Error::from_raw_os_error(libc::ETIMEDOUT)),
+            BulkOutErrorKind::Retryable
+        );
+        assert_eq!(
+            classify_bulk_out_error(&std::io::Error::from_raw_os_error(libc::EAGAIN)),
+            BulkOutErrorKind::Retryable
+        );
+        assert_eq!(
+            classify_bulk_out_error(&std::io::Error::from_raw_os_error(libc::EINTR)),
+            BulkOutErrorKind::Retryable
+        );
+        assert_eq!(
+            classify_bulk_out_error(&std::io::Error::from_raw_os_error(libc::ENODEV)),
+            BulkOutErrorKind::Fatal
+        );
+        assert_eq!(
+            classify_bulk_out_error(&std::io::Error::from_raw_os_error(libc::ESHUTDOWN)),
+            BulkOutErrorKind::Fatal
+        );
+        assert_eq!(
+            classify_bulk_out_error(&std::io::Error::from_raw_os_error(libc::EPIPE)),
+            BulkOutErrorKind::Fatal
+        );
+
+        const { assert!(BULK_OUT_TIMEOUT_MS <= 500) };
+
+        // Retries transient ETIMEDOUT/EAGAIN/EINTR and sends remaining tail.
+        let shutdown = AtomicBool::new(false);
+        let worker_stop = AtomicBool::new(false);
+        let payload = b"hello aoa";
+        let mut attempt = 0usize;
+        let mut received = Vec::new();
+        let res = write_bulk_out_chunked_with(payload, &shutdown, &worker_stop, |slice| {
+            attempt += 1;
+            match attempt {
+                1 => Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT)),
+                2 => Err(std::io::Error::from_raw_os_error(libc::EAGAIN)),
+                3 => {
+                    received.extend_from_slice(&slice[..5]);
+                    Ok(5)
+                }
+                4 => Err(std::io::Error::from_raw_os_error(libc::EINTR)),
+                _ => {
+                    received.extend_from_slice(slice);
+                    Ok(slice.len())
+                }
+            }
+        });
+        assert!(res.is_ok(), "retryable errors should recover: {res:?}");
+        assert_eq!(received, payload);
+
+        // Fatal error aborts immediately without retrying.
+        let mut fatal_attempts = 0usize;
+        let fatal_res = write_bulk_out_chunked_with(payload, &shutdown, &worker_stop, |_| {
+            fatal_attempts += 1;
+            Err(std::io::Error::from_raw_os_error(libc::ENODEV))
+        });
+        assert!(fatal_res.is_err());
+        assert_eq!(fatal_attempts, 1);
+
+        // Retry stops promptly when `shutdown` or `worker_stop` becomes true.
+        let mut stop_attempts = 0usize;
+        let stop_res = write_bulk_out_chunked_with(payload, &shutdown, &worker_stop, |_| {
+            stop_attempts += 1;
+            if stop_attempts == 2 {
+                worker_stop.store(true, Ordering::Relaxed);
+            }
+            Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT))
+        });
+        assert!(stop_res.is_err());
+        assert_eq!(stop_attempts, 2);
+    }
+
+    #[test]
+    fn connect_aoa_device_with_shutdown_aborts_promptly_when_preset() {
+        let shutdown = AtomicBool::new(true);
+        let start = Instant::now();
+        let res = connect_aoa_device_with_shutdown(&shutdown);
+        assert!(matches!(res, Err(UsbAoaError::Disconnected)));
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "pre-set shutdown should abort without sleeping/probing"
         );
     }
 }

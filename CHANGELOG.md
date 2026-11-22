@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Desktop USB AOA, Session Teardown, Heartbeat & Update Restart:**
+  - Replaced synchronous `USBDEVFS_BULK` IN reads with async URB submission/reaping (`USBDEVFS_SUBMITURB`, `poll`, `USBDEVFS_REAPURBNDELAY`, `USBDEVFS_DISCARDURB`) so partial ZLP-less chunks received before timeout/cancel are forwarded intact without corrupting the CCFT v1 stream (`BUG-01`).
+  - Made USB AOA Bulk OUT `ETIMEDOUT`/`EAGAIN`/`EINTR` errors retryable while active so initial heartbeat pings do not drop the connection before the Android USB accessory prompt is accepted (`BUG-02`).
+  - Removed orphaned `net_handle` tasks, propagated shutdown into `connect_aoa_device_with_shutdown`, joined AOA RX/TX worker threads before releasing the USB interface claim, and made `ActiveConnection::stop` async (`BUG-04`).
+  - Switched `HeartbeatPing` replies in `run_client_stream_loop` to non-blocking `try_send` so stalled outbound writers cannot deadlock receiver timeouts or shutdown (`BUG-13`).
+  - Preserved updated `binary_path` in `UpdateUiState::RestartRequired` so GUI "Restart Now" launches the newly installed AppImage or portable binary (`BUG-03`).
+
 ## [0.0.3] - 2026-11-21
 
 ### Fixed
