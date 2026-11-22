@@ -149,17 +149,13 @@ class CamCraftStreamService : Service() {
 
     private val activeTcpSockets = mutableSetOf<Socket>()
 
-    private val usbTransportLock = Any()
-
-    @Volatile
-    private var activeUsbPfd: ParcelFileDescriptor? = null
-
-    @Volatile
-    private var activeUsbPfdClosed = AtomicBoolean(false)
-
-    @Volatile
-    private var activeUsbAccessory: UsbAccessory? = null
-    private val usbSessionClosing = AtomicBoolean(true)
+    private val usbAttemptTracker = UsbSessionAttemptTracker<ParcelFileDescriptor> { pfd ->
+        try {
+            pfd.close()
+        } catch (e: IOException) {
+            Log.w(TAG, "Error closing USB accessory descriptor: ${e.message}")
+        }
+    }
     private var isUsbReceiverRegistered = false
 
     private val usbDetachedReceiver = object : BroadcastReceiver() {
@@ -170,14 +166,15 @@ class CamCraftStreamService : Service() {
                 UsbManager.EXTRA_ACCESSORY,
                 UsbAccessory::class.java,
             )
-            val currentAccessory = activeUsbAccessory
+            val currentAttempt = usbAttemptTracker.currentActiveAttempt() ?: return
+            val currentAccessory = currentAttempt.accessoryTag as? UsbAccessory
             if (detachedAccessory == null ||
                 currentAccessory == null ||
                 detachedAccessory == currentAccessory ||
                 UsbAccessoryTransport.isCamCraftAccessory(detachedAccessory)
             ) {
-                Log.i(TAG, "USB accessory detached; closing USB AOA transport")
-                closeActiveUsbTransport()
+                Log.i(TAG, "USB accessory detached; closing USB AOA transport (attempt=${currentAttempt.attemptId})")
+                usbAttemptTracker.closeAttempt(currentAttempt)
             }
         }
     }
@@ -190,8 +187,8 @@ class CamCraftStreamService : Service() {
     private var mdnsAdvertiser: MdnsAdvertiser? = null
     private var wifiNetworkMonitor: WifiNetworkMonitor? = null
 
-    private val controlCoordinator = ControlStateAckCoordinator(_serviceState) { ack ->
-        activeSession?.enqueueAck(ack)
+    private val controlCoordinator = ControlStateAckCoordinator(_serviceState) {
+        // Outbound session ACKs are dispatched atomically via ownedSession under orderLock.
     }
 
     @Volatile
@@ -265,8 +262,11 @@ class CamCraftStreamService : Service() {
                 onVideoPacketSlice = { sessionId, packetType, flags, ptsUs, payload, offset, length ->
                     handleVideoPacketFromEncoder(sessionId, packetType, flags, ptsUs, payload, offset, length)
                 },
-                onResolutionAdjusted = { sessionId, width, height ->
-                    handleEncoderResolutionAdjusted(sessionId, width, height)
+                onResolutionAdjusted = { sessionId, cameraConfigId, cameraId, width, height ->
+                    handleEncoderResolutionAdjusted(sessionId, cameraConfigId, cameraId, width, height)
+                },
+                onResolutionAdjustmentFailed = { sessionId, cameraConfigId, cameraId, reason ->
+                    handleEncoderResolutionAdjustmentFailed(sessionId, cameraConfigId, cameraId, reason)
                 },
             )
             cameraStreamManager = manager
@@ -563,16 +563,21 @@ class CamCraftStreamService : Service() {
         }
     }
 
-    private fun handleEncoderResolutionAdjusted(sessionId: Long, width: Int, height: Int) {
+    private fun handleEncoderResolutionAdjusted(
+        sessionId: Long,
+        cameraConfigId: Long,
+        cameraId: String,
+        width: Int,
+        height: Int,
+    ) {
         if (isStopping.get()) return
-        val targetSession = activeSession?.takeIf { it.sessionId == sessionId } ?: return
-        val updated = controlCoordinator.updateWithCustomAck(
+        controlCoordinator.updateIfSessionOwned(
+            expectedSessionId = sessionId,
+            expectedCameraConfigId = cameraConfigId,
+            expectedCameraId = cameraId,
+            advanceCameraConfigOnGeometryChange = false,
             ackBuilder = { next ->
-                val current = activeSession
-                if (!isStopping.get() && current === targetSession && current.sessionId == sessionId) {
-                    current.enqueueAck(ControlAck.success(next))
-                }
-                null
+                if (!isStopping.get()) ControlAck.success(next) else null
             },
             mutate = { cur ->
                 if (cur.width == width && cur.height == height) {
@@ -581,15 +586,43 @@ class CamCraftStreamService : Service() {
                     cur.copy(width = width, height = height)
                 }
             },
-        )
-        synchronized(lifecycleLock) {
-            if (!isStopping.get() && activeSession === targetSession && targetSession.sessionId == sessionId) {
-                val clientLabel = _serviceState.value.clientAddress
-                if (!clientLabel.isNullOrBlank()) {
-                    updateNotification(buildConnectedNotificationText(clientLabel, updated))
-                }
+        ) ?: return
+        publishConnectedNotificationFromCurrentState(expectedSessionId = sessionId)
+    }
+
+    private fun handleEncoderResolutionAdjustmentFailed(
+        sessionId: Long,
+        cameraConfigId: Long,
+        cameraId: String,
+        reason: String,
+    ) {
+        if (isStopping.get()) return
+        Log.w(TAG, "Resolution adjustment failed (session=$sessionId, config=$cameraConfigId, cam=$cameraId): $reason")
+        controlCoordinator.enqueueAckIfSessionOwned(
+            expectedSessionId = sessionId,
+            expectedCameraConfigId = cameraConfigId,
+            expectedCameraId = cameraId,
+        ) { cur ->
+            if (!isStopping.get()) {
+                ControlAck(
+                    ok = false,
+                    error = reason,
+                    activeState = cur,
+                )
+            } else {
+                null
             }
         }
+    }
+
+    private fun publishConnectedNotificationFromCurrentState(expectedSessionId: Long) {
+        publishConnectedNotificationFromSnapshot(
+            lock = lifecycleLock,
+            isStopping = { isStopping.get() },
+            isSessionActive = { activeSession?.sessionId == expectedSessionId },
+            serviceState = _serviceState,
+            onUpdateNotification = ::updateNotification,
+        )
     }
 
     private fun handleAudioPacketFromEngine(
@@ -626,7 +659,7 @@ class CamCraftStreamService : Service() {
 
     private suspend fun handleClientConnection(clientSocket: Socket) {
         synchronized(lifecycleLock) {
-            if (isStopping.get() || (usbJob?.isActive == true && !usbSessionClosing.get())) {
+            if (isStopping.get() || (usbJob?.isActive == true && usbAttemptTracker.hasActiveNonClosingAttempt())) {
                 Log.i(TAG, "Ignoring incoming TCP connection (stopping or USB AOA active)")
                 try {
                     clientSocket.close()
@@ -666,7 +699,7 @@ class CamCraftStreamService : Service() {
                 outputStream = outputStream,
                 closeTransport = closeTransport,
                 isTransportStillCurrent = {
-                    val usbActive = usbJob?.isActive == true && !usbSessionClosing.get()
+                    val usbActive = usbJob?.isActive == true && usbAttemptTracker.hasActiveNonClosingAttempt()
                     !usbActive && activeTcpSockets.contains(clientSocket) && !clientSocket.isClosed
                 },
             )
@@ -692,15 +725,16 @@ class CamCraftStreamService : Service() {
         }
 
         val previousUsbJob: Job?
+        val attempt: UsbSessionAttempt<ParcelFileDescriptor>
         synchronized(lifecycleLock) {
             isStopping.set(false)
             val existing = usbJob
-            if (existing?.isActive == true && !usbSessionClosing.get()) {
+            if (existing?.isActive == true && usbAttemptTracker.hasActiveNonClosingAttempt()) {
                 Log.i(TAG, "USB AOA session already active; skipping duplicate start")
                 return
             }
             previousUsbJob = existing
-            usbSessionClosing.set(false)
+            attempt = usbAttemptTracker.beginAttempt(accessoryTag = accessory)
 
             // Preempt all active or pending Wi-Fi client sockets so USB Direct takes ownership immediately.
             val socketsToPreempt = activeTcpSockets.toList()
@@ -711,58 +745,41 @@ class CamCraftStreamService : Service() {
             }
 
             usbJob = serviceScope.launch {
-                if (previousUsbJob != null && previousUsbJob.isActive) {
-                    previousUsbJob.join()
-                }
-                if (isStopping.get() || !currentCoroutineContext().isActive) {
-                    return@launch
-                }
-
-                val usbManager = getSystemService(Context.USB_SERVICE) as? UsbManager
-                if (usbManager == null) {
-                    Log.w(TAG, "UsbManager unavailable; cannot open USB accessory")
-                    return@launch
-                }
-
-                val pfd = try {
-                    usbManager.openAccessory(accessory)
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to open USB accessory: ${e.message}", e)
-                    null
-                }
-                if (pfd == null) {
-                    Log.w(TAG, "UsbManager.openAccessory returned null for ${accessory.model}")
-                    return@launch
-                }
-
-                val pfdClosedFlag = AtomicBoolean(false)
-                synchronized(usbTransportLock) {
-                    activeUsbPfd = pfd
-                    activeUsbPfdClosed = pfdClosedFlag
-                    activeUsbAccessory = accessory
-                }
-
-                val closeTransport: () -> Unit = {
-                    usbSessionClosing.set(true)
-                    if (pfdClosedFlag.compareAndSet(false, true)) {
-                        try {
-                            pfd.close()
-                        } catch (e: IOException) {
-                            Log.w(TAG, "Error closing USB accessory descriptor: ${e.message}")
-                        }
-                    }
-                    synchronized(usbTransportLock) {
-                        if (activeUsbPfd === pfd) {
-                            activeUsbPfd = null
-                            activeUsbAccessory = null
-                        }
-                    }
-                }
-
                 var inputStream: DataInputStream? = null
                 var outputStream: OutputStream? = null
                 var sessionEntered = false
                 try {
+                    if (previousUsbJob != null && previousUsbJob.isActive) {
+                        previousUsbJob.join()
+                    }
+                    if (isStopping.get() ||
+                        !currentCoroutineContext().isActive ||
+                        !usbAttemptTracker.isAttemptPendingOrActive(attempt)
+                    ) {
+                        return@launch
+                    }
+
+                    val usbManager = getSystemService(Context.USB_SERVICE) as? UsbManager
+                    if (usbManager == null) {
+                        Log.w(TAG, "UsbManager unavailable; cannot open USB accessory")
+                        return@launch
+                    }
+
+                    val pfd = try {
+                        usbManager.openAccessory(accessory)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to open USB accessory: ${e.message}", e)
+                        null
+                    }
+                    if (pfd == null) {
+                        Log.w(TAG, "UsbManager.openAccessory returned null for ${accessory.model}")
+                        return@launch
+                    }
+
+                    if (!usbAttemptTracker.attachDescriptor(attempt, pfd)) {
+                        return@launch
+                    }
+
                     val fd = pfd.fileDescriptor
                     inputStream = DataInputStream(BufferedInputStream(FileInputStream(fd), 16_384))
                     outputStream = BufferedOutputStream(
@@ -775,18 +792,18 @@ class CamCraftStreamService : Service() {
                         clientLabel = USB_CLIENT_LABEL,
                         inputStream = inputStream,
                         outputStream = outputStream,
-                        closeTransport = closeTransport,
-                        isTransportStillCurrent = {
-                            synchronized(usbTransportLock) {
-                                !usbSessionClosing.get() && activeUsbPfd === pfd
-                            }
-                        },
+                        closeTransport = { usbAttemptTracker.closeAttempt(attempt) },
+                        isTransportStillCurrent = { usbAttemptTracker.isAttemptCurrent(attempt, pfd) },
                     )
                 } catch (e: Exception) {
                     Log.w(TAG, "USB AOA session setup/teardown error: ${e.message}")
                 } finally {
                     if (!sessionEntered) {
-                        closeTransportBeforeStreams(closeTransport, inputStream, outputStream)
+                        closeTransportBeforeStreams(
+                            closeTransport = { usbAttemptTracker.closeAttempt(attempt) },
+                            inputStream = inputStream,
+                            outputStream = outputStream,
+                        )
                     }
                 }
             }
@@ -794,22 +811,7 @@ class CamCraftStreamService : Service() {
     }
 
     private fun closeActiveUsbTransport() {
-        val pfd: ParcelFileDescriptor?
-        val closedFlag: AtomicBoolean
-        synchronized(usbTransportLock) {
-            usbSessionClosing.set(true)
-            pfd = activeUsbPfd
-            closedFlag = activeUsbPfdClosed
-            activeUsbPfd = null
-            activeUsbAccessory = null
-        }
-        if (pfd != null && closedFlag.compareAndSet(false, true)) {
-            try {
-                pfd.close()
-            } catch (e: IOException) {
-                Log.w(TAG, "Error closing active USB accessory descriptor: ${e.message}")
-            }
-        }
+        usbAttemptTracker.closeActiveAttempt()
     }
 
     private suspend fun handleClientSession(
@@ -869,7 +871,8 @@ class CamCraftStreamService : Service() {
                             }
                         }
                         if (published) {
-                            updateNotification(buildConnectedNotificationText(clientLabel, initialActiveState))
+                            controlCoordinator.setActiveSession(sessionHandle)
+                            publishConnectedNotificationFromCurrentState(expectedSessionId = sessionId)
                         }
                         published
                     }
@@ -918,8 +921,11 @@ class CamCraftStreamService : Service() {
                     }
 
                     // 2. Start CameraX + H.264 encoder serialized with UI lens/config commits under orderLock.
-                    controlCoordinator.runLocked { activeState, seq ->
-                        if (!isStopping.get() && activeSession === sessionHandle) {
+                    controlCoordinator.runIfSessionActive(
+                        session = sessionHandle,
+                        advanceCameraConfig = true,
+                    ) { activeState, seq, configId ->
+                        if (!isStopping.get()) {
                             activeTransformFlags = computeTransformFlags(
                                 mirrorHorizontal = activeState.mirrorHorizontal,
                                 rotationDeg = activeState.rotationDeg,
@@ -927,6 +933,7 @@ class CamCraftStreamService : Service() {
                             cameraStreamManager?.startStream(
                                 sessionId = sessionHandle.sessionId,
                                 configSeq = seq,
+                                cameraConfigId = configId,
                                 cameraId = activeState.cameraId,
                                 width = activeState.width,
                                 height = activeState.height,
@@ -958,27 +965,32 @@ class CamCraftStreamService : Service() {
                     }
 
                     // 4. Start AudioStreamEngine initially muted off orderLock, then apply committed mute under orderLock
-                    val shouldStartAudio = controlCoordinator.runLocked { state, _ ->
-                        state.audioEnabled && !isStopping.get() && activeSession === sessionHandle
-                    }
+                    val shouldStartAudio = controlCoordinator.runIfSessionActive(sessionHandle) { state, _, _ ->
+                        state.audioEnabled && !isStopping.get()
+                    } ?: false
                     if (shouldStartAudio) {
                         val audioStarted = sessionAudioEngine.start(initiallyMuted = true)
                         if (audioStarted) {
-                            var keepAudioRunning = false
-                            controlCoordinator.runLocked { state, _ ->
-                                if (state.audioEnabled && !isStopping.get() && activeSession === sessionHandle) {
+                            val keepAudioRunning = controlCoordinator.runIfSessionActive(sessionHandle) { state, _, _ ->
+                                if (state.audioEnabled && !isStopping.get()) {
                                     sessionHandle.audioEngine = sessionAudioEngine
                                     sessionAudioEngine.setMuted(state.audioMuted)
-                                    keepAudioRunning = true
+                                    true
+                                } else {
+                                    false
                                 }
-                            }
+                            } ?: false
                             if (!keepAudioRunning) {
                                 sessionAudioEngine.stop()
                             }
                         } else {
                             Log.w(TAG, "AudioStreamEngine failed to start (check RECORD_AUDIO permission)")
-                            mutateActiveStateAndEnqueueAck(
-                                targetSession = sessionHandle,
+                            controlCoordinator.updateIfSessionOwned(
+                                expectedSessionId = sessionHandle.sessionId,
+                                advanceCameraConfigOnGeometryChange = false,
+                                ackBuilder = { next ->
+                                    if (!isStopping.get()) ControlAck.success(next) else null
+                                },
                             ) { cur ->
                                 cur.copy(audioEnabled = false)
                             }
@@ -995,6 +1007,7 @@ class CamCraftStreamService : Service() {
                         if (activeSession === sessionHandle) {
                             activeSession = null
                         }
+                        controlCoordinator.clearActiveSessionIfCurrent(sessionHandle)
                     }
 
                     sessionHandle.close()
@@ -1130,16 +1143,17 @@ class CamCraftStreamService : Service() {
                         return
                     }
 
-                    val updated = mutateActiveStateAndEnqueueAck(
-                        targetSession = sessionHandle,
+                    controlCoordinator.updateIfSessionOwned(
+                        expectedSessionId = sessionHandle.sessionId,
                         camerasOverride = cameras,
-                        onCommittedLocked = { next, seq ->
+                        onCommittedLocked = { next, seq, configId ->
                             cameraStreamManager?.setZoomRatio(next.zoomRatio)
                             cameraStreamManager?.setExposureEv(next.exposureEv)
                             cameraStreamManager?.setTorch(next.torchOn)
                             cameraStreamManager?.rebindCamera(
                                 sessionId = sessionHandle.sessionId,
                                 configSeq = seq,
+                                cameraConfigId = configId,
                                 cameraId = next.cameraId,
                                 width = next.width,
                                 height = next.height,
@@ -1149,19 +1163,18 @@ class CamCraftStreamService : Service() {
                         },
                     ) { cur ->
                         applyConfigureStreamPatch(cur, cmd, targetCam)
-                    }
-                    if (clientLabel.isNotBlank()) {
-                        synchronized(lifecycleLock) {
-                            if (!isStopping.get() && activeSession === sessionHandle) {
-                                updateNotification(buildConnectedNotificationText(clientLabel, updated))
-                            }
-                        }
-                    }
+                    } ?: return
+                    publishConnectedNotificationFromCurrentState(expectedSessionId = sessionHandle.sessionId)
                 }
                 is ControlCmd.SetCameraParams -> {
-                    val updated = mutateActiveStateAndEnqueueAck(
-                        targetSession = sessionHandle,
-                        onCommittedLocked = { next, _ ->
+                    controlCoordinator.updateIfSessionOwned(
+                        expectedSessionId = sessionHandle.sessionId,
+                        advanceCameraConfigOnGeometryChange = false,
+                        onCommittedLocked = { next, _, _ ->
+                            activeTransformFlags = computeTransformFlags(
+                                mirrorHorizontal = next.mirrorHorizontal,
+                                rotationDeg = next.rotationDeg,
+                            )
                             cmd.zoomRatio?.let { cameraStreamManager?.setZoomRatio(next.zoomRatio) }
                             cmd.exposureEv?.let { cameraStreamManager?.setExposureEv(next.exposureEv) }
                             cmd.torchOn?.let { cameraStreamManager?.setTorch(next.torchOn) }
@@ -1169,11 +1182,7 @@ class CamCraftStreamService : Service() {
                         },
                     ) { cur ->
                         applyCameraParamsPatch(cur, cmd)
-                    }
-                    activeTransformFlags = computeTransformFlags(
-                        mirrorHorizontal = updated.mirrorHorizontal,
-                        rotationDeg = updated.rotationDeg,
-                    )
+                    } ?: return
                 }
                 is ControlCmd.SetAudioState -> {
                     if (cmd.enabled) {
@@ -1185,18 +1194,17 @@ class CamCraftStreamService : Service() {
                         }
                         val engineActive = engine.isActive || engine.start(initiallyMuted = true)
                         if (!engineActive) {
-                            controlCoordinator.updateWithCustomAck(
+                            controlCoordinator.updateIfSessionOwned(
+                                expectedSessionId = sessionHandle.sessionId,
+                                advanceCameraConfigOnGeometryChange = false,
                                 ackBuilder = { fallbackState ->
-                                    sessionHandle.enqueueAck(
-                                        ControlAck(
-                                            ok = false,
-                                            error = "Microphone capture unavailable (grant RECORD_AUDIO permission on Android)",
-                                            activeState = fallbackState,
-                                        ),
+                                    ControlAck(
+                                        ok = false,
+                                        error = "Microphone capture unavailable (grant RECORD_AUDIO permission on Android)",
+                                        activeState = fallbackState,
                                     )
-                                    null
                                 },
-                                onCommittedLocked = { next, _ ->
+                                onCommittedLocked = { next, _, _ ->
                                     sessionHandle.audioEngine?.setMuted(next.audioMuted)
                                 },
                                 mutate = { cur ->
@@ -1205,10 +1213,11 @@ class CamCraftStreamService : Service() {
                             )
                             return
                         }
-                        mutateActiveStateAndEnqueueAck(
-                            targetSession = sessionHandle,
-                            onCommittedLocked = { next, _ ->
-                                if (!isStopping.get() && activeSession === sessionHandle) {
+                        val updatedAudio = controlCoordinator.updateIfSessionOwned(
+                            expectedSessionId = sessionHandle.sessionId,
+                            advanceCameraConfigOnGeometryChange = false,
+                            onCommittedLocked = { next, _, _ ->
+                                if (!isStopping.get()) {
                                     sessionHandle.audioEngine = engine
                                     engine.setMuted(next.audioMuted)
                                 }
@@ -1216,14 +1225,15 @@ class CamCraftStreamService : Service() {
                         ) { cur ->
                             applyAudioStatePatch(cur, enabled = true, muted = cmd.muted)
                         }
-                        if (isStopping.get() || activeSession !== sessionHandle) {
+                        if (updatedAudio == null || isStopping.get() || activeSession !== sessionHandle) {
                             engine.stop()
                         }
                     } else {
                         sessionHandle.audioEngine?.stop()
-                        mutateActiveStateAndEnqueueAck(
-                            targetSession = sessionHandle,
-                            onCommittedLocked = { next, _ ->
+                        controlCoordinator.updateIfSessionOwned(
+                            expectedSessionId = sessionHandle.sessionId,
+                            advanceCameraConfigOnGeometryChange = false,
+                            onCommittedLocked = { next, _, _ ->
                                 sessionHandle.audioEngine?.setMuted(next.audioMuted)
                             },
                         ) { cur ->
@@ -1247,7 +1257,11 @@ class CamCraftStreamService : Service() {
                         }
                     }
                     cameraStreamManager?.requestKeyFrame(sessionHandle.sessionId)
-                    controlCoordinator.enqueueCurrentStateAck()
+                    controlCoordinator.enqueueAckIfSessionOwned(
+                        expectedSessionId = sessionHandle.sessionId,
+                    ) { cur ->
+                        ControlAck.success(cur)
+                    }
                 }
             }
         } catch (e: Exception) {
@@ -1258,35 +1272,21 @@ class CamCraftStreamService : Service() {
         }
     }
 
-    private fun mutateActiveStateAndEnqueueAck(
-        targetSession: ClientSessionHandle? = null,
-        camerasOverride: List<CameraInfo>? = null,
-        onCommittedLocked: (ActiveCameraState, Long) -> Unit = { _, _ -> },
-        mutate: (ActiveCameraState) -> ActiveCameraState,
-    ): ActiveCameraState = controlCoordinator.updateWithCustomAck(
-        camerasOverride = camerasOverride,
-        ackBuilder = { next ->
-            val session = targetSession ?: activeSession
-            session?.enqueueAck(ControlAck.success(next))
-            null
-        },
-        onCommittedLocked = onCommittedLocked,
-        mutate = mutate,
-    )
-
     fun switchCameraFromUi() {
         val cameras = _serviceState.value.cameras.ifEmpty { CameraEnumerator.enumerateCameras(this) }
         if (cameras.isEmpty()) return
 
-        mutateActiveStateAndEnqueueAck(
+        controlCoordinator.updateWithCustomAckAndConfig(
             camerasOverride = cameras,
-            onCommittedLocked = { next, seq ->
+            ackBuilder = { next -> ControlAck.success(next) },
+            onCommittedLocked = { next, seq, configId ->
                 cameraStreamManager?.setZoomRatio(next.zoomRatio)
                 cameraStreamManager?.setExposureEv(next.exposureEv)
                 cameraStreamManager?.setTorch(next.torchOn)
                 cameraStreamManager?.rebindCamera(
-                    sessionId = activeSession?.sessionId ?: 0L,
+                    sessionId = controlCoordinator.currentActiveSessionId(),
                     configSeq = seq,
+                    cameraConfigId = configId,
                     cameraId = next.cameraId,
                     width = next.width,
                     height = next.height,
@@ -1327,9 +1327,10 @@ class CamCraftStreamService : Service() {
     }
 
     fun toggleMuteFromUi() {
-        mutateActiveStateAndEnqueueAck(
-            onCommittedLocked = { next, _ ->
-                activeSession?.audioEngine?.setMuted(next.audioMuted)
+        controlCoordinator.updateWithCustomAckAndConfig(
+            ackBuilder = { next -> ControlAck.success(next) },
+            onCommittedLocked = { next, _, _ ->
+                controlCoordinator.currentOwnedSession()?.audioEngine?.setMuted(next.audioMuted)
             },
         ) { cur ->
             cur.copy(audioMuted = !cur.audioMuted)
@@ -1347,6 +1348,7 @@ class CamCraftStreamService : Service() {
         mdnsAdvertiser?.unregister()
         activeSession?.close()
         activeSession = null
+        controlCoordinator.setActiveSession(null)
         closeActiveUsbTransport()
         val socketsToClose = activeTcpSockets.toList()
         activeTcpSockets.clear()
@@ -1844,6 +1846,137 @@ class CamCraftStreamService : Service() {
             audioEnabled = enabled,
             audioMuted = muted,
         )
+
+        internal fun isCameraGeometryChanged(
+            previous: ActiveCameraState,
+            next: ActiveCameraState,
+        ): Boolean = previous.cameraId != next.cameraId ||
+            previous.width != next.width ||
+            previous.height != next.height ||
+            previous.fps != next.fps
+
+        internal fun publishConnectedNotificationFromSnapshot(
+            lock: Any,
+            isStopping: () -> Boolean,
+            isSessionActive: () -> Boolean,
+            serviceState: StateFlow<StreamServiceState>,
+            onUpdateNotification: (String) -> Unit,
+        ): Boolean = synchronized(lock) {
+            if (isStopping() || !isSessionActive()) {
+                return@synchronized false
+            }
+            val snapshot = serviceState.value
+            val clientAddress = snapshot.clientAddress
+            if (snapshot.status != StreamConnectionStatus.CONNECTED || clientAddress.isNullOrBlank()) {
+                return@synchronized false
+            }
+            onUpdateNotification(buildConnectedNotificationText(clientAddress, snapshot.activeState))
+            true
+        }
+    }
+}
+
+internal class UsbSessionAttempt<T : Any>(
+    val attemptId: Long,
+    val accessoryTag: Any? = null,
+) {
+    private val closing = AtomicBoolean(false)
+    private val descriptorClosed = AtomicBoolean(false)
+
+    @Volatile
+    var descriptor: T? = null
+
+    val isClosing: Boolean
+        get() = closing.get()
+
+    fun markClosing() {
+        closing.set(true)
+    }
+
+    fun markDescriptorClosed(): Boolean = descriptorClosed.compareAndSet(false, true)
+}
+
+/**
+ * Tracks per-attempt USB AOA transport ownership and close state so a detached or
+ * deferred-overflow teardown of an old attempt cannot poison or close a replacement attempt.
+ */
+internal class UsbSessionAttemptTracker<T : Any>(
+    private val closeDescriptor: (T) -> Unit,
+) {
+    private val lock = Any()
+    private var nextAttemptId: Long = 0L
+    private var activeAttempt: UsbSessionAttempt<T>? = null
+
+    fun beginAttempt(accessoryTag: Any? = null): UsbSessionAttempt<T> = synchronized(lock) {
+        UsbSessionAttempt<T>(
+            attemptId = ++nextAttemptId,
+            accessoryTag = accessoryTag,
+        ).also { activeAttempt = it }
+    }
+
+    fun currentActiveAttempt(): UsbSessionAttempt<T>? = synchronized(lock) { activeAttempt }
+
+    fun hasActiveNonClosingAttempt(): Boolean = synchronized(lock) {
+        val current = activeAttempt
+        current != null && !current.isClosing
+    }
+
+    fun isAttemptPendingOrActive(attempt: UsbSessionAttempt<T>): Boolean = synchronized(lock) {
+        !attempt.isClosing && activeAttempt === attempt
+    }
+
+    fun attachDescriptor(attempt: UsbSessionAttempt<T>, descriptor: T): Boolean {
+        val accepted = synchronized(lock) {
+            if (attempt.isClosing || activeAttempt !== attempt) {
+                false
+            } else {
+                attempt.descriptor = descriptor
+                true
+            }
+        }
+        if (!accepted && attempt.markDescriptorClosed()) {
+            closeDescriptor(descriptor)
+        }
+        return accepted
+    }
+
+    fun isAttemptCurrent(attempt: UsbSessionAttempt<T>, descriptor: T): Boolean = synchronized(lock) {
+        !attempt.isClosing && activeAttempt === attempt && attempt.descriptor === descriptor
+    }
+
+    fun closeAttempt(attempt: UsbSessionAttempt<T>) {
+        val descriptorToClose = synchronized(lock) {
+            attempt.markClosing()
+            if (activeAttempt === attempt) {
+                activeAttempt = null
+            }
+            val desc = attempt.descriptor
+            if (desc != null && attempt.markDescriptorClosed()) {
+                desc
+            } else {
+                null
+            }
+        }
+        if (descriptorToClose != null) {
+            closeDescriptor(descriptorToClose)
+        }
+    }
+
+    fun closeActiveAttempt() {
+        val descriptorToClose = synchronized(lock) {
+            val current = activeAttempt ?: return
+            current.markClosing()
+            activeAttempt = null
+            val desc = current.descriptor
+            if (desc != null && current.markDescriptorClosed()) {
+                desc
+            } else {
+                null
+            }
+        }
+        if (descriptorToClose != null) {
+            closeDescriptor(descriptorToClose)
+        }
     }
 }
 
@@ -1909,8 +2042,9 @@ internal class ClientSessionHandle(
 
 /**
  * Serializes atomic [MutableStateFlow.updateAndGet] field mutations with monotonic commit
- * sequence numbers, committed side-effects, and outbound [ControlAck] enqueueing so
- * concurrent PC control commands and Android UI actions stay strictly ordered.
+ * sequence numbers, camera-geometry config IDs, active session ownership, committed side-effects,
+ * and outbound [ControlAck] enqueueing so concurrent PC control commands, encoder fallbacks, and
+ * Android UI actions stay strictly ordered.
  */
 internal class ControlStateAckCoordinator(
     private val serviceState: MutableStateFlow<StreamServiceState>,
@@ -1918,11 +2052,55 @@ internal class ControlStateAckCoordinator(
 ) {
     private val orderLock = Any()
     private var commitSeq: Long = 0L
+    private var cameraConfigId: Long = 0L
+    private var ownedSession: ClientSessionHandle? = null
+
+    fun setActiveSession(session: ClientSessionHandle?) {
+        synchronized(orderLock) {
+            ownedSession = session
+        }
+    }
+
+    fun clearActiveSessionIfCurrent(session: ClientSessionHandle) {
+        synchronized(orderLock) {
+            if (ownedSession === session) {
+                ownedSession = null
+            }
+        }
+    }
+
+    fun currentActiveSessionId(): Long = synchronized(orderLock) {
+        ownedSession?.sessionId ?: 0L
+    }
+
+    fun currentOwnedSession(): ClientSessionHandle? = synchronized(orderLock) {
+        ownedSession
+    }
+
+    fun currentCameraConfigId(): Long = synchronized(orderLock) {
+        cameraConfigId
+    }
 
     fun <T> runLocked(block: (ActiveCameraState, Long) -> T): T = synchronized(orderLock) {
         val state = serviceState.value.activeState
         val seq = ++commitSeq
         block(state, seq)
+    }
+
+    fun <T> runIfSessionActive(
+        session: ClientSessionHandle,
+        advanceCameraConfig: Boolean = false,
+        block: (ActiveCameraState, Long, Long) -> T,
+    ): T? = synchronized(orderLock) {
+        if (ownedSession !== session || session.isClosed) {
+            return@synchronized null
+        }
+        val state = serviceState.value.activeState
+        val seq = ++commitSeq
+        if (advanceCameraConfig) {
+            cameraConfigId++
+        }
+        block(state, seq, cameraConfigId)
     }
 
     fun updateAndEnqueue(
@@ -1941,7 +2119,20 @@ internal class ControlStateAckCoordinator(
         ackBuilder: (ActiveCameraState) -> ControlAck?,
         onCommittedLocked: (ActiveCameraState, Long) -> Unit = { _, _ -> },
         mutate: (ActiveCameraState) -> ActiveCameraState,
+    ): ActiveCameraState = updateWithCustomAckAndConfig(
+        camerasOverride = camerasOverride,
+        ackBuilder = ackBuilder,
+        onCommittedLocked = { next, seq, _ -> onCommittedLocked(next, seq) },
+        mutate = mutate,
+    )
+
+    fun updateWithCustomAckAndConfig(
+        camerasOverride: List<CameraInfo>? = null,
+        ackBuilder: (ActiveCameraState) -> ControlAck?,
+        onCommittedLocked: (ActiveCameraState, Long, Long) -> Unit = { _, _, _ -> },
+        mutate: (ActiveCameraState) -> ActiveCameraState,
     ): ActiveCameraState = synchronized(orderLock) {
+        val previous = serviceState.value.activeState
         val next = serviceState.updateAndGet { state ->
             val patched = mutate(state.activeState)
             state.copy(
@@ -1951,14 +2142,103 @@ internal class ControlStateAckCoordinator(
             )
         }.activeState
         val seq = ++commitSeq
-        onCommittedLocked(next, seq)
-        ackBuilder(next)?.let(onEnqueueAck)
+        if (CamCraftStreamService.isCameraGeometryChanged(previous, next)) {
+            cameraConfigId++
+        }
+        onCommittedLocked(next, seq, cameraConfigId)
+        ackBuilder(next)?.let { ack ->
+            val active = ownedSession
+            if (active != null) {
+                active.enqueueAck(ack)
+            } else {
+                onEnqueueAck(ack)
+            }
+        }
         next
+    }
+
+    fun updateIfSessionOwned(
+        expectedSessionId: Long,
+        expectedCameraConfigId: Long? = null,
+        expectedCameraId: String? = null,
+        advanceCameraConfigOnGeometryChange: Boolean = true,
+        camerasOverride: List<CameraInfo>? = null,
+        ackBuilder: (ActiveCameraState) -> ControlAck? = { next -> ControlAck.success(next) },
+        onCommittedLocked: (ActiveCameraState, Long, Long) -> Unit = { _, _, _ -> },
+        mutate: (ActiveCameraState) -> ActiveCameraState,
+    ): ActiveCameraState? = synchronized(orderLock) {
+        val currentSession = ownedSession
+        if (expectedSessionId == 0L ||
+            currentSession == null ||
+            currentSession.sessionId != expectedSessionId ||
+            currentSession.isClosed
+        ) {
+            return@synchronized null
+        }
+        if (expectedCameraConfigId != null && cameraConfigId != expectedCameraConfigId) {
+            return@synchronized null
+        }
+        val previous = serviceState.value.activeState
+        if (expectedCameraId != null && previous.cameraId != expectedCameraId) {
+            return@synchronized null
+        }
+        val next = serviceState.updateAndGet { state ->
+            val patched = mutate(state.activeState)
+            state.copy(
+                cameras = camerasOverride ?: state.cameras,
+                activeState = patched,
+                bitrateKbps = patched.bitrateKbps,
+            )
+        }.activeState
+        val seq = ++commitSeq
+        if (advanceCameraConfigOnGeometryChange &&
+            CamCraftStreamService.isCameraGeometryChanged(previous, next)
+        ) {
+            cameraConfigId++
+        }
+        onCommittedLocked(next, seq, cameraConfigId)
+        ackBuilder(next)?.let { ack ->
+            currentSession.enqueueAck(ack)
+        }
+        next
+    }
+
+    fun enqueueAckIfSessionOwned(
+        expectedSessionId: Long,
+        expectedCameraConfigId: Long? = null,
+        expectedCameraId: String? = null,
+        ackBuilder: (ActiveCameraState) -> ControlAck?,
+    ): Boolean = synchronized(orderLock) {
+        val currentSession = ownedSession
+        if (expectedSessionId == 0L ||
+            currentSession == null ||
+            currentSession.sessionId != expectedSessionId ||
+            currentSession.isClosed
+        ) {
+            return@synchronized false
+        }
+        if (expectedCameraConfigId != null && cameraConfigId != expectedCameraConfigId) {
+            return@synchronized false
+        }
+        val currentState = serviceState.value.activeState
+        if (expectedCameraId != null && currentState.cameraId != expectedCameraId) {
+            return@synchronized false
+        }
+        ackBuilder(currentState)?.let { ack ->
+            currentSession.enqueueAck(ack)
+        }
+        true
     }
 
     fun enqueueCurrentStateAck() {
         synchronized(orderLock) {
-            onEnqueueAck(ControlAck.success(serviceState.value.activeState))
+            val ack = ControlAck.success(serviceState.value.activeState)
+            val active = ownedSession
+            if (active != null) {
+                active.enqueueAck(ack)
+            } else {
+                onEnqueueAck(ack)
+            }
         }
     }
 }

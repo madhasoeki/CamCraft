@@ -929,31 +929,317 @@ class CamCraftStreamServiceTest {
             assertEquals(1, transportCloses.get())
             assertTrue(closeThread.get() !== callerThread)
 
-            // Also verify synchronous close() before pending dispatchClose runs transport once total.
+            // Verify synchronous close() before pending dispatchClose runs transport once total.
             val syncTransportCloses = AtomicInteger(0)
-            val pendingClose = AtomicReference<(() -> Unit)?>(null)
-            val racingHandle = ClientSessionHandle(
+            val syncPendingClose = AtomicReference<(() -> Unit)?>(null)
+            val syncRacingHandle = ClientSessionHandle(
                 sessionId = 21L,
                 output = ByteArrayOutputStream(),
                 outputLock = Any(),
                 closeTransport = { syncTransportCloses.incrementAndGet() },
+                ackQueueCapacity = 1,
+                dispatchClose = { task -> syncPendingClose.set(task) },
+            )
+            assertTrue(syncRacingHandle.enqueueAck(ControlAck.success(defaultActiveCameraState())))
+            assertFalse(syncRacingHandle.enqueueAck(ControlAck.success(defaultActiveCameraState())))
+            assertNotNull(syncPendingClose.get())
+            assertEquals(0, syncTransportCloses.get())
+
+            // I/O teardown calls close() synchronously -> closes transport once.
+            syncRacingHandle.close()
+            assertEquals(1, syncTransportCloses.get())
+
+            // Late dispatched task runs -> must NOT close transport a second time.
+            syncPendingClose.get()!!.invoke()
+            assertEquals(1, syncTransportCloses.get())
+
+            // Extend the USB close race: pause A's dispatched closer, install USB attempt B while A's
+            // close is still in progress, then resume A's closer and assert B passes admission.
+            val usbACloses = AtomicInteger(0)
+            val usbBCloses = AtomicInteger(0)
+            val attemptACloseEntered = CountDownLatch(1)
+            val allowAttemptACloseFinish = CountDownLatch(1)
+            val closeRaceExecutor = Executors.newSingleThreadExecutor { r ->
+                Thread(r, "test-usb-close-race").apply { isDaemon = true }
+            }
+            val tracker = UsbSessionAttemptTracker<String> { descriptor ->
+                when (descriptor) {
+                    "usb-desc-A" -> {
+                        attemptACloseEntered.countDown()
+                        allowAttemptACloseFinish.await(2, TimeUnit.SECONDS)
+                        usbACloses.incrementAndGet()
+                    }
+                    "usb-desc-B" -> usbBCloses.incrementAndGet()
+                }
+            }
+            val attemptA = tracker.beginAttempt(accessoryTag = "acc-A")
+            assertTrue(tracker.attachDescriptor(attemptA, "usb-desc-A"))
+
+            val pendingClose = AtomicReference<(() -> Unit)?>(null)
+            val racingHandle = ClientSessionHandle(
+                sessionId = 22L,
+                output = ByteArrayOutputStream(),
+                outputLock = Any(),
+                closeTransport = {
+                    tracker.closeAttempt(attemptA)
+                },
                 ackQueueCapacity = 1,
                 dispatchClose = { task -> pendingClose.set(task) },
             )
             assertTrue(racingHandle.enqueueAck(ControlAck.success(defaultActiveCameraState())))
             assertFalse(racingHandle.enqueueAck(ControlAck.success(defaultActiveCameraState())))
             assertNotNull(pendingClose.get())
-            assertEquals(0, syncTransportCloses.get())
+            assertEquals(0, usbACloses.get())
 
-            // I/O teardown calls close() synchronously -> closes transport once.
+            // Pause A's dispatched closer mid-close inside closeDescriptor, then install USB attempt B
+            // while A's close is still in progress.
+            val closeFutureA = closeRaceExecutor.submit { pendingClose.get()!!.invoke() }
+            assertTrue(attemptACloseEntered.await(2, TimeUnit.SECONDS))
+            assertFalse(tracker.hasActiveNonClosingAttempt())
+
+            val attemptB = tracker.beginAttempt(accessoryTag = "acc-B")
+            assertTrue(tracker.attachDescriptor(attemptB, "usb-desc-B"))
+            assertTrue(tracker.isAttemptCurrent(attemptB, "usb-desc-B"))
+            assertTrue(tracker.hasActiveNonClosingAttempt())
+
+            // Resume A's closer; B must continue passing admission and remain open.
+            allowAttemptACloseFinish.countDown()
+            closeFutureA.get(2, TimeUnit.SECONDS)
             racingHandle.close()
-            assertEquals(1, syncTransportCloses.get())
 
-            // Late dispatched task runs -> must NOT close transport a second time.
-            pendingClose.get()!!.invoke()
-            assertEquals(1, syncTransportCloses.get())
+            assertEquals(1, usbACloses.get())
+            assertEquals(0, usbBCloses.get())
+            assertFalse(tracker.isAttemptCurrent(attemptA, "usb-desc-A"))
+            assertTrue(tracker.isAttemptCurrent(attemptB, "usb-desc-B"))
+            assertTrue(tracker.hasActiveNonClosingAttempt())
+            closeRaceExecutor.shutdownNow()
         } finally {
             ioExecutor.shutdownNow()
         }
+    }
+
+    @Test
+    fun usbSessionAttemptTrackerIsolatesDetachedAndEarlyCloseFromReplacementAttempt() {
+        val closedDescriptors = Collections.synchronizedList(mutableListOf<String>())
+        val tracker = UsbSessionAttemptTracker<String> { descriptor ->
+            closedDescriptors.add(descriptor)
+        }
+
+        // 1. If attempt A closes before descriptor attachment completes, late attachDescriptor closes and rejects it.
+        val attemptA = tracker.beginAttempt(accessoryTag = "acc-A")
+        assertTrue(tracker.isAttemptPendingOrActive(attemptA))
+        tracker.closeAttempt(attemptA)
+        assertTrue(attemptA.isClosing)
+        assertFalse(tracker.isAttemptPendingOrActive(attemptA))
+        assertFalse(tracker.attachDescriptor(attemptA, "usb-desc-early"))
+        assertEquals(listOf("usb-desc-early"), closedDescriptors)
+
+        // 2. Detached close targeting A after B began leaves B active and current.
+        val attemptA2 = tracker.beginAttempt(accessoryTag = "acc-A2")
+        assertTrue(tracker.attachDescriptor(attemptA2, "usb-desc-A2"))
+        val attemptB = tracker.beginAttempt(accessoryTag = "acc-B")
+        assertTrue(tracker.attachDescriptor(attemptB, "usb-desc-B"))
+
+        tracker.closeAttempt(attemptA2)
+        assertTrue(tracker.isAttemptCurrent(attemptB, "usb-desc-B"))
+        assertEquals(listOf("usb-desc-early", "usb-desc-A2"), closedDescriptors)
+    }
+
+    @Test
+    fun controlCoordinatorRejectsStaleSessionAtomicallyForResolutionAndFailedAudioBranches() {
+        val stateFlow = MutableStateFlow(StreamServiceState())
+        val coordinator = ControlStateAckCoordinator(stateFlow) { }
+        val session1 = ClientSessionHandle(
+            sessionId = 1L,
+            output = ByteArrayOutputStream(),
+            outputLock = Any(),
+            closeTransport = {},
+        )
+        val session2 = ClientSessionHandle(
+            sessionId = 2L,
+            output = ByteArrayOutputStream(),
+            outputLock = Any(),
+            closeTransport = {},
+        )
+
+        coordinator.setActiveSession(session1)
+        val initialConfigId = coordinator.runIfSessionActive(session1, advanceCameraConfig = true) { _, _, configId ->
+            configId
+        }!!
+
+        // Retire session 1 and switch ownership to session 2.
+        coordinator.clearActiveSessionIfCurrent(session1)
+        coordinator.setActiveSession(session2)
+
+        // Stale session 1 resolution adjustment must reject both _serviceState update and ACK.
+        val staleResolutionResult = coordinator.updateIfSessionOwned(
+            expectedSessionId = 1L,
+            expectedCameraConfigId = initialConfigId,
+            expectedCameraId = "0",
+            advanceCameraConfigOnGeometryChange = false,
+            ackBuilder = { next -> ControlAck.success(next) },
+        ) { cur -> cur.copy(width = 1280, height = 720) }
+        assertNull(staleResolutionResult)
+        assertEquals(1920, stateFlow.value.activeState.width)
+        assertEquals(1080, stateFlow.value.activeState.height)
+        assertNull(session1.ackChannel.tryReceive().getOrNull())
+        assertNull(session2.ackChannel.tryReceive().getOrNull())
+
+        // Stale session 1 failed-audio fallback must also reject both _serviceState update and ACK.
+        val staleAudioResult = coordinator.updateIfSessionOwned(
+            expectedSessionId = 1L,
+            advanceCameraConfigOnGeometryChange = false,
+            ackBuilder = { fallbackState ->
+                ControlAck(ok = false, error = "Microphone unavailable", activeState = fallbackState)
+            },
+        ) { cur -> cur.copy(audioEnabled = false, audioMuted = true) }
+        assertNull(staleAudioResult)
+        assertTrue(stateFlow.value.activeState.audioEnabled)
+        assertFalse(stateFlow.value.activeState.audioMuted)
+        assertNull(session1.ackChannel.tryReceive().getOrNull())
+        assertNull(session2.ackChannel.tryReceive().getOrNull())
+
+        // Active session 2 updates dimensions and failed-audio state atomically and receives its ACKs.
+        val activeConfigId = coordinator.runIfSessionActive(session2, advanceCameraConfig = true) { _, _, configId ->
+            configId
+        }!!
+        val currentResolutionResult = coordinator.updateIfSessionOwned(
+            expectedSessionId = 2L,
+            expectedCameraConfigId = activeConfigId,
+            expectedCameraId = "0",
+            advanceCameraConfigOnGeometryChange = false,
+        ) { cur -> cur.copy(width = 1280, height = 720) }
+        assertNotNull(currentResolutionResult)
+        assertEquals(1280, stateFlow.value.activeState.width)
+        assertEquals(1280, session2.ackChannel.tryReceive().getOrNull()?.activeState?.width)
+
+        val currentAudioResult = coordinator.updateIfSessionOwned(
+            expectedSessionId = 2L,
+            advanceCameraConfigOnGeometryChange = false,
+            ackBuilder = { fallbackState ->
+                ControlAck(ok = false, error = "Microphone unavailable", activeState = fallbackState)
+            },
+        ) { cur -> cur.copy(audioEnabled = false, audioMuted = true) }
+        assertNotNull(currentAudioResult)
+        assertFalse(stateFlow.value.activeState.audioEnabled)
+        val audioAck = session2.ackChannel.tryReceive().getOrNull()!!
+        assertFalse(audioAck.ok)
+        assertFalse(audioAck.activeState!!.audioEnabled)
+    }
+
+    @Test
+    fun controlCoordinatorConfigIdSurvivesMuteAndBlocksStaleRearCameraFallback() {
+        val stateFlow = MutableStateFlow(StreamServiceState())
+        val coordinator = ControlStateAckCoordinator(stateFlow) { }
+        val session = ClientSessionHandle(
+            sessionId = 10L,
+            output = ByteArrayOutputStream(),
+            outputLock = Any(),
+            closeTransport = {},
+        )
+        coordinator.setActiveSession(session)
+
+        // Rear camera ("0") stream starts at 1920x1080 with configId = 1.
+        val rearConfigId = coordinator.runIfSessionActive(session, advanceCameraConfig = true) { _, _, configId ->
+            configId
+        }!!
+
+        // Unrelated mute change must NOT advance cameraConfigId; pending rear fallback must still apply.
+        coordinator.updateWithCustomAckAndConfig(
+            ackBuilder = { ControlAck.success(it) },
+        ) { cur -> cur.copy(audioMuted = true) }
+        assertEquals(rearConfigId, coordinator.currentCameraConfigId())
+
+        val validAdjusted = coordinator.updateIfSessionOwned(
+            expectedSessionId = 10L,
+            expectedCameraConfigId = rearConfigId,
+            expectedCameraId = "0",
+            advanceCameraConfigOnGeometryChange = false,
+        ) { cur -> cur.copy(width = 1280, height = 720) }
+        assertNotNull(validAdjusted)
+        assertEquals(1280, stateFlow.value.activeState.width)
+        assertEquals(720, stateFlow.value.activeState.height)
+        assertTrue(stateFlow.value.activeState.audioMuted)
+
+        // Now rebind to front camera ("1") at 1920x1080 -> advances cameraConfigId.
+        val frontCommitted = coordinator.updateIfSessionOwned(
+            expectedSessionId = 10L,
+        ) { cur -> cur.copy(cameraId = "1", width = 1920, height = 1080) }
+        assertNotNull(frontCommitted)
+        val frontConfigId = coordinator.currentCameraConfigId()
+        assertTrue(frontConfigId > rearConfigId)
+
+        // Late rear-camera ("0") fallback (e.g., 640x480 for rearConfigId) must NOT overwrite front dimensions!
+        val staleRearFallback = coordinator.updateIfSessionOwned(
+            expectedSessionId = 10L,
+            expectedCameraConfigId = rearConfigId,
+            expectedCameraId = "0",
+            advanceCameraConfigOnGeometryChange = false,
+        ) { cur -> cur.copy(width = 640, height = 480) }
+        assertNull(staleRearFallback)
+        assertEquals("1", stateFlow.value.activeState.cameraId)
+        assertEquals(1920, stateFlow.value.activeState.width)
+        assertEquals(1080, stateFlow.value.activeState.height)
+    }
+
+    @Test
+    fun publishConnectedNotificationFromSnapshotReadsAtomicCurrentStateAndSkipsStaleSession() {
+        val lock = Any()
+        val stopping = AtomicBoolean(false)
+        val sessionActive = AtomicBoolean(true)
+        val stateFlow = MutableStateFlow(
+            StreamServiceState(
+                status = StreamConnectionStatus.CONNECTED,
+                clientAddress = "192.168.1.42",
+                activeState = defaultActiveCameraState().copy(
+                    cameraId = "1",
+                    width = 1280,
+                    height = 720,
+                    fps = 30,
+                ),
+            ),
+        )
+        val publishedNotifications = mutableListOf<String>()
+
+        assertTrue(
+            CamCraftStreamService.publishConnectedNotificationFromSnapshot(
+                lock = lock,
+                isStopping = { stopping.get() },
+                isSessionActive = { sessionActive.get() },
+                serviceState = stateFlow,
+                onUpdateNotification = { publishedNotifications.add(it) },
+            ),
+        )
+        assertEquals(
+            listOf("Connected (192.168.1.42) • 1280x720 @ 30 FPS"),
+            publishedNotifications,
+        )
+
+        // Inactive/retired session skips publication.
+        sessionActive.set(false)
+        assertFalse(
+            CamCraftStreamService.publishConnectedNotificationFromSnapshot(
+                lock = lock,
+                isStopping = { stopping.get() },
+                isSessionActive = { sessionActive.get() },
+                serviceState = stateFlow,
+                onUpdateNotification = { publishedNotifications.add(it) },
+            ),
+        )
+        assertEquals(1, publishedNotifications.size)
+
+        // Non-CONNECTED state skips publication even if session flag still toggling.
+        sessionActive.set(true)
+        stateFlow.value = stateFlow.value.copy(status = StreamConnectionStatus.LISTENING, clientAddress = null)
+        assertFalse(
+            CamCraftStreamService.publishConnectedNotificationFromSnapshot(
+                lock = lock,
+                isStopping = { stopping.get() },
+                isSessionActive = { sessionActive.get() },
+                serviceState = stateFlow,
+                onUpdateNotification = { publishedNotifications.add(it) },
+            ),
+        )
+        assertEquals(1, publishedNotifications.size)
     }
 }

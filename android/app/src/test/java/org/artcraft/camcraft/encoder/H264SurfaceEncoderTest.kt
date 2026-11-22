@@ -2,6 +2,7 @@ package org.artcraft.camcraft.encoder
 
 import android.media.MediaCodecInfo
 import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicInteger
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -158,5 +159,45 @@ class H264SurfaceEncoderTest {
         assertTrue(unstartedCoord.requestRelease())
         assertTrue(unstartedCoord.isFinalized())
         assertFalse(unstartedCoord.requestRelease())
+    }
+
+    @Test
+    fun drainReleaseCoordinatorSignalsCompletionOnlyAfterTeardownIncludingDeferredExit() {
+        // 1. Deferred teardown: callback must NOT fire at requestRelease() nor merely at markDrainExited()
+        //    before releaseCodecAndSurfaceLocked() calls markTeardownCompleted().
+        val deferredCoord = DrainReleaseCoordinator()
+        val deferredCalls = AtomicInteger(0)
+        deferredCoord.markDrainStarted()
+        deferredCoord.onTeardownCompleted { deferredCalls.incrementAndGet() }
+
+        assertFalse(deferredCoord.requestRelease())
+        assertFalse(deferredCoord.isTeardownCompleted())
+        assertEquals(0, deferredCalls.get())
+
+        assertTrue(deferredCoord.markDrainExited())
+        assertFalse(deferredCoord.isTeardownCompleted())
+        assertEquals(0, deferredCalls.get())
+
+        deferredCoord.markTeardownCompleted()
+        assertTrue(deferredCoord.isTeardownCompleted())
+        assertEquals(1, deferredCalls.get())
+
+        // Idempotent markTeardownCompleted() must not re-fire, and late listener fires immediately once.
+        deferredCoord.markTeardownCompleted()
+        assertEquals(1, deferredCalls.get())
+        val lateCalls = AtomicInteger(0)
+        deferredCoord.onTeardownCompleted { lateCalls.incrementAndGet() }
+        assertEquals(1, lateCalls.get())
+
+        // 2. Synchronous teardown: signals once markTeardownCompleted() runs after requestRelease().
+        val syncCoord = DrainReleaseCoordinator()
+        val syncCalls = AtomicInteger(0)
+        syncCoord.markDrainStarted()
+        assertFalse(syncCoord.markDrainExited())
+        syncCoord.onTeardownCompleted { syncCalls.incrementAndGet() }
+        assertTrue(syncCoord.requestRelease())
+        assertEquals(0, syncCalls.get())
+        syncCoord.markTeardownCompleted()
+        assertEquals(1, syncCalls.get())
     }
 }

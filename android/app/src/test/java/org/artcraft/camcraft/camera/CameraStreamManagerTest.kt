@@ -1035,4 +1035,112 @@ class CameraStreamManagerTest {
             ),
         )
     }
+
+    @Test
+    fun resolutionAdjustmentPublishAndFailureHelpersGateUntilSurfaceAcceptance() {
+        val normalSlot = ActiveEncoderSlot(
+            sessionId = 7L,
+            generation = 1L,
+            encoder = null,
+            width = 1920,
+            height = 1080,
+            fps = 60,
+            cameraId = "0",
+            surfaceTracker = EncoderSurfaceRetirementTracker(),
+            cameraConfigId = 4L,
+            pendingResolutionAdjustment = false,
+        )
+        assertFalse(normalSlot.markResolutionAdjustmentReported())
+        assertFalse(
+            CameraStreamManager.shouldPublishResolutionAdjustment(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 7L,
+                snapshotSessionId = 7L,
+                activeSlotMatchesSnapshot = true,
+                snapshotRetiring = false,
+                pendingResolutionAdjustment = normalSlot.pendingResolutionAdjustment,
+            ),
+        )
+
+        val adjustedSlot = ActiveEncoderSlot(
+            sessionId = 7L,
+            generation = 2L,
+            encoder = null,
+            width = 1280,
+            height = 720,
+            fps = 60,
+            cameraId = "0",
+            surfaceTracker = EncoderSurfaceRetirementTracker(),
+            cameraConfigId = 4L,
+            pendingResolutionAdjustment = true,
+            fallbackWidth = 1920,
+            fallbackHeight = 1080,
+        )
+        assertTrue(
+            CameraStreamManager.shouldPublishResolutionAdjustment(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 7L,
+                snapshotSessionId = 7L,
+                activeSlotMatchesSnapshot = true,
+                snapshotRetiring = false,
+                pendingResolutionAdjustment = adjustedSlot.pendingResolutionAdjustment,
+            ),
+        )
+        // Outcome reporting is strictly one-shot per adjusted slot.
+        assertTrue(adjustedSlot.markResolutionAdjustmentReported())
+        assertFalse(adjustedSlot.markResolutionAdjustmentReported())
+
+        // Unaccepted mismatched size on an active pending slot reports negotiation failure instead of success.
+        assertTrue(
+            CameraStreamManager.shouldReportResolutionNegotiationFailure(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 7L,
+                snapshotSessionId = 7L,
+                activeSlotMatchesSnapshot = true,
+                snapshotRetiring = false,
+                surfaceValid = true,
+                pendingResolutionAdjustment = true,
+                snapshotWidth = 1280,
+                snapshotHeight = 720,
+                requestWidth = 640,
+                requestHeight = 480,
+            ),
+        )
+        // Matching size or retired slot never triggers unaccepted-negotiation failure.
+        assertFalse(
+            CameraStreamManager.shouldReportResolutionNegotiationFailure(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 7L,
+                snapshotSessionId = 7L,
+                activeSlotMatchesSnapshot = true,
+                snapshotRetiring = false,
+                surfaceValid = true,
+                pendingResolutionAdjustment = true,
+                snapshotWidth = 1280,
+                snapshotHeight = 720,
+                requestWidth = 1280,
+                requestHeight = 720,
+            ),
+        )
+        assertFalse(
+            CameraStreamManager.shouldReportResolutionNegotiationFailure(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 7L,
+                snapshotSessionId = 7L,
+                activeSlotMatchesSnapshot = true,
+                snapshotRetiring = true,
+                surfaceValid = true,
+                pendingResolutionAdjustment = true,
+                snapshotWidth = 1280,
+                snapshotHeight = 720,
+                requestWidth = 640,
+                requestHeight = 480,
+            ),
+        )
+    }
 }
