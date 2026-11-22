@@ -37,6 +37,8 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 const AUDIO_METER_REPAINT_MIN_INTERVAL: Duration = Duration::from_millis(66);
+const CLIENT_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const CLIENT_TASK_ABORT_WAIT: Duration = Duration::from_millis(250);
 
 /// USB transport method selected in the desktop GUI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -447,14 +449,28 @@ struct ActiveConnection {
 }
 
 impl ActiveConnection {
-    async fn stop(mut self) {
+    async fn stop(self) {
+        self.stop_with_timeout(CLIENT_TASK_STOP_TIMEOUT).await;
+    }
+
+    async fn stop_with_timeout(mut self, timeout: Duration) {
         self.decoder_running.store(false, Ordering::Relaxed);
         self.audio_running.store(false, Ordering::Relaxed);
         self.shutdown.store(true, Ordering::Relaxed);
         self.decoder_tx.stop();
         self.audio_tx.stop();
 
-        let _ = self.client_task.await;
+        if tokio::time::timeout(timeout, &mut self.client_task)
+            .await
+            .is_err()
+        {
+            warn!(
+                timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                "Timed out waiting for client_task during disconnect; aborting task"
+            );
+            self.client_task.abort();
+            let _ = tokio::time::timeout(CLIENT_TASK_ABORT_WAIT, self.client_task).await;
+        }
 
         let decoder_thread = self.decoder_thread.take();
         let audio_thread = self.audio_thread.take();
@@ -1909,6 +1925,94 @@ mod tests {
             assert!(
                 client_finished.load(Ordering::Relaxed),
                 "client_task must finish gracefully rather than being orphaned/aborted"
+            );
+        });
+    }
+
+    #[test]
+    fn active_connection_stop_with_timeout_aborts_stalled_client_task() {
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current_thread runtime");
+
+        rt.block_on(async {
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let decoder_running = Arc::new(AtomicBool::new(true));
+            let audio_running = Arc::new(AtomicBool::new(true));
+            let (decoder_tx, decoder_rx) = DecoderSender::new_bounded();
+            let audio_enabled = Arc::new(AtomicBool::new(true));
+            let audio_muted = Arc::new(AtomicBool::new(false));
+            let (audio_tx, audio_rx) =
+                AudioWorkerSender::new_bounded(audio_enabled.clone(), audio_muted.clone());
+
+            let decoder_thread =
+                spawn_decoder_worker(decoder_rx, None, None, false, decoder_running.clone())
+                    .expect("spawn decoder worker");
+            let audio_running_thread = audio_running.clone();
+            let audio_thread = std::thread::Builder::new()
+                .name("test-vmic-timeout".to_owned())
+                .spawn(move || {
+                    run_audio_worker_loop(
+                        audio_rx,
+                        None,
+                        None,
+                        audio_running_thread,
+                        audio_enabled,
+                        audio_muted,
+                    );
+                })
+                .expect("spawn audio worker");
+
+            let task_dropped = Arc::new(AtomicBool::new(false));
+            let task_dropped_c = task_dropped.clone();
+            let completed_normally = Arc::new(AtomicBool::new(false));
+            let completed_normally_c = completed_normally.clone();
+            let client_task = tokio::spawn(async move {
+                let _drop_guard = DropFlag(task_dropped_c);
+                std::future::pending::<()>().await;
+                completed_normally_c.store(true, Ordering::Relaxed);
+            });
+
+            // Yield once so `client_task` starts and enters `pending()`.
+            tokio::task::yield_now().await;
+
+            let shutdown_check = shutdown.clone();
+            let conn = ActiveConnection {
+                shutdown,
+                decoder_running,
+                decoder_tx,
+                decoder_thread: Some(decoder_thread),
+                audio_running,
+                audio_tx,
+                audio_thread: Some(audio_thread),
+                client_task,
+                sender: None,
+                last_keyframe_req: None,
+            };
+
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                conn.stop_with_timeout(Duration::from_millis(50)),
+            )
+            .await
+            .expect("stop_with_timeout must abort stalled client_task promptly instead of hanging");
+
+            assert!(shutdown_check.load(Ordering::Relaxed));
+            assert!(
+                task_dropped.load(Ordering::Relaxed),
+                "stalled client_task must be aborted and dropped after timeout"
+            );
+            assert!(
+                !completed_normally.load(Ordering::Relaxed),
+                "stalled client_task must not complete normally"
             );
         });
     }
