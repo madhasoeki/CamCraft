@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Android Status UI & In-App Updater:**
+  - Rendered `"USB Direct"` connections alongside `"127.0.0.1"` (`"USB ADB • 127.0.0.1"`) with the USB icon in `TopStatusHeader` (`BUG-17`).
+  - Used `applicationContext` for APK installer launches, escalated manual update checks over active silent startup checks via `UpdateCheckCoordinator`, resolved relative HTTP redirect `Location` headers with `URL(URL(current), next)`, and gated `"SHA-256 verified"` UI text on `checksumsUrl != null` (`BUG-19`).
+
 ## [0.0.3] - 2026-11-21
 
 ### Fixed

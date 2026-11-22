@@ -321,11 +321,14 @@ object AppUpdater {
                 val next = conn.getHeaderField("Location")
                 conn.disconnect()
                 if (next.isNullOrBlank()) throw IOException("Redirect without Location header")
-                current = next
+                current = resolveRedirectUrl(current, next)
             } else {
                 return conn
             }
         }
         throw IOException("Too many HTTP redirects")
     }
+
+    internal fun resolveRedirectUrl(currentUrl: String, location: String): String =
+        URL(URL(currentUrl), location).toString()
 }

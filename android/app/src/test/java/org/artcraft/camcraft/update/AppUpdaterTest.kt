@@ -1,5 +1,9 @@
 package org.artcraft.camcraft.update
 
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -129,5 +133,66 @@ class AppUpdaterTest {
             AppUpdater.parseSha256Sums(text, "camcraft-android-v0.0.2.apk"),
         )
         assertNull(AppUpdater.parseSha256Sums(text, "missing.apk"))
+    }
+
+    @Test
+    fun resolveRedirectUrlResolvesRelativeAndAbsoluteLocations() {
+        val base = "https://github.com/madhasoeki/CamCraft/releases/download/v0.2.0/app.apk"
+        assertEquals(
+            "https://github.com/cdn/v0.2.0/app.apk",
+            AppUpdater.resolveRedirectUrl(base, "/cdn/v0.2.0/app.apk"),
+        )
+        assertEquals(
+            "https://github.com/madhasoeki/CamCraft/releases/download/v0.2.0/mirror.apk",
+            AppUpdater.resolveRedirectUrl(base, "mirror.apk"),
+        )
+        assertEquals(
+            "https://objects.githubusercontent.com/assets/app.apk",
+            AppUpdater.resolveRedirectUrl(base, "//objects.githubusercontent.com/assets/app.apk"),
+        )
+        assertEquals(
+            "https://cdn.example.invalid/app.apk",
+            AppUpdater.resolveRedirectUrl(base, "https://cdn.example.invalid/app.apk"),
+        )
+    }
+
+    @Test
+    fun updateCheckCoordinatorEscalatesActiveSilentCheckToManualFeedback() = runBlocking {
+        val gate = CompletableDeferred<UpdateCheckResult>()
+        val state = MutableStateFlow<UpdateUiState>(UpdateUiState.Idle)
+        val coordinator = UpdateCheckCoordinator(
+            stateFlow = state,
+            scope = this,
+            performCheck = { gate.await() },
+        )
+
+        // Silent startup check starts in background without showing Checking UI.
+        coordinator.check(silent = true)
+        assertEquals(UpdateUiState.Idle, state.value)
+
+        // Manual check while silent check is active escalates immediately to Checking.
+        coordinator.check(silent = false)
+        assertEquals(UpdateUiState.Checking, state.value)
+
+        // Once the in-flight check resolves UpToDate, manual feedback is surfaced.
+        gate.complete(UpdateCheckResult.UpToDate("0.0.3", "0.0.3"))
+        val resolved = state.first { it !is UpdateUiState.Checking }
+        assertEquals(UpdateUiState.UpToDate, resolved)
+
+        // Subsequent silent check failing stays silent; manual escalation surfaces Error.
+        val errGate = CompletableDeferred<UpdateCheckResult>()
+        val errState = MutableStateFlow<UpdateUiState>(UpdateUiState.Idle)
+        val errCoordinator = UpdateCheckCoordinator(
+            stateFlow = errState,
+            scope = this,
+            performCheck = { errGate.await() },
+        )
+        errCoordinator.check(silent = true)
+        errCoordinator.check(silent = false)
+        assertEquals(UpdateUiState.Checking, errState.value)
+        errGate.completeExceptionally(IllegalStateException("network offline"))
+        val errResolved = errState.first { it !is UpdateUiState.Checking }
+        assertTrue(errResolved is UpdateUiState.Error)
+        assertEquals("network offline", (errResolved as UpdateUiState.Error).message)
     }
 }
