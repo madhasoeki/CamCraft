@@ -11,7 +11,7 @@
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::Duration;
 
@@ -215,7 +215,7 @@ static STREAM_EVENTS: PwStreamEvents = PwStreamEvents {
     control_info: None,
     io_changed: None,
     param_changed: Some(on_param_changed),
-    add_buffer: None,
+    add_buffer: Some(on_add_buffer),
     remove_buffer: None,
     process: Some(on_process),
     drained: None,
@@ -233,7 +233,7 @@ type PwThreadLoopStartFn = unsafe extern "C" fn(loop_: *mut PwThreadLoop) -> c_i
 type PwThreadLoopStopFn = unsafe extern "C" fn(loop_: *mut PwThreadLoop);
 type PwThreadLoopLockFn = unsafe extern "C" fn(loop_: *mut PwThreadLoop);
 type PwThreadLoopUnlockFn = unsafe extern "C" fn(loop_: *mut PwThreadLoop);
-type PwPropertiesNewFn = unsafe extern "C" fn(key: *const c_char) -> *mut PwProperties;
+type PwPropertiesNewFn = unsafe extern "C" fn(key: *const c_char, ...) -> *mut PwProperties;
 type PwPropertiesSetFn = unsafe extern "C" fn(
     props: *mut PwProperties,
     key: *const c_char,
@@ -935,7 +935,55 @@ struct SharedState {
     width: AtomicU32,
     height: AtomicU32,
     negotiated_format: AtomicU32,
+    renegotiating: AtomicBool,
     latest_frame: Mutex<LatestFrame>,
+}
+
+#[derive(Clone, Copy)]
+struct PwStreamFrameSpec {
+    format: u32,
+    width: u32,
+    height: u32,
+    renegotiating: bool,
+}
+
+fn should_copy_pw_frame(
+    frame: &LatestFrame,
+    spec: PwStreamFrameSpec,
+    buffer_maxsize: usize,
+) -> Option<(u32, usize)> {
+    if spec.renegotiating
+        || frame.data.is_empty()
+        || frame.width != spec.width
+        || frame.height != spec.height
+    {
+        return None;
+    }
+    let (stride, req_size) = video_format_stride_and_size(spec.format, spec.width, spec.height)?;
+    if buffer_maxsize < req_size {
+        return None;
+    }
+    Some((stride, req_size))
+}
+
+/// Checks whether `pw_buf` exposes at least `req_size` writable bytes on plane 0.
+///
+/// # Safety
+/// `pw_buf` must be a valid non-null `PwBuffer` pointer owned by PipeWire.
+unsafe fn pw_buffer_has_capacity(pw_buf: *mut PwBuffer, req_size: usize) -> bool {
+    // SAFETY: `pw_buf` is a non-null `PwBuffer` pointer passed by PipeWire.
+    let spa_buf = unsafe { (*pw_buf).buffer };
+    if spa_buf.is_null() {
+        return false;
+    }
+    // SAFETY: `spa_buf` points to a valid `SpaBuffer`.
+    let (n_datas, datas_ptr) = unsafe { ((*spa_buf).n_datas, (*spa_buf).datas) };
+    if n_datas == 0 || datas_ptr.is_null() {
+        return false;
+    }
+    // SAFETY: `n_datas >= 1` guarantees `datas_ptr[0]` is a valid `SpaData`.
+    let d0 = unsafe { &*datas_ptr };
+    !d0.data.is_null() && !d0.chunk.is_null() && (d0.maxsize as usize) >= req_size
 }
 
 struct ThreadLoopLockGuard<'a> {
@@ -973,9 +1021,7 @@ unsafe fn fill_and_queue_pw_buffer(
     stream: *mut PwStream,
     pw_buf: *mut PwBuffer,
     frame: &LatestFrame,
-    format: u32,
-    stream_width: u32,
-    stream_height: u32,
+    spec: PwStreamFrameSpec,
 ) {
     // SAFETY: `pw_buf` is a non-null buffer returned by `pw_stream_dequeue_buffer`.
     let spa_buf = unsafe { (*pw_buf).buffer };
@@ -991,28 +1037,22 @@ unsafe fn fill_and_queue_pw_buffer(
 
             if !dst_ptr.is_null() && !chunk_ptr.is_null() {
                 let mut written = None;
-                if !frame.data.is_empty()
-                    && frame.width == stream_width
-                    && frame.height == stream_height
-                    && let Some((stride, req_size)) =
-                        video_format_stride_and_size(format, stream_width, stream_height)
-                    && maxsize >= req_size
-                {
+                if let Some((stride, req_size)) = should_copy_pw_frame(frame, spec, maxsize) {
                     // SAFETY: `dst_ptr` points to a mapped PipeWire buffer of at least `maxsize`
                     // bytes (`>= req_size`) and does not overlap with Rust-owned `frame.data`.
                     let dst_slice = unsafe { std::slice::from_raw_parts_mut(dst_ptr, maxsize) };
-                    let converted = match format {
+                    let converted = match spec.format {
                         SPA_VIDEO_FORMAT_YUY2 => convert_yuv420p_to_yuy2(
                             &frame.data,
                             dst_slice,
-                            stream_width as usize,
-                            stream_height as usize,
+                            spec.width as usize,
+                            spec.height as usize,
                         ),
                         SPA_VIDEO_FORMAT_RGBA => convert_yuv420p_to_rgba(
                             &frame.data,
                             dst_slice,
-                            stream_width as usize,
-                            stream_height as usize,
+                            spec.width as usize,
+                            spec.height as usize,
                         ),
                         SPA_VIDEO_FORMAT_I420 => {
                             if frame.data.len() == req_size && dst_slice.len() >= req_size {
@@ -1130,6 +1170,24 @@ unsafe extern "C" fn on_param_changed(data: *mut c_void, id: u32, param: *const 
     }
 }
 
+unsafe extern "C" fn on_add_buffer(data: *mut c_void, buffer: *mut PwBuffer) {
+    if data.is_null() || buffer.is_null() {
+        return;
+    }
+    // SAFETY: `data` is the boxed `SharedState` pointer kept alive until after loop stop.
+    let shared = unsafe { &*data.cast::<SharedState>() };
+    let format = shared.negotiated_format.load(Ordering::Acquire);
+    let width = shared.width.load(Ordering::Acquire);
+    let height = shared.height.load(Ordering::Acquire);
+    let Some((_, req_size)) = video_format_stride_and_size(format, width, height) else {
+        return;
+    };
+    // SAFETY: `buffer` is a valid non-null `PwBuffer` supplied by PipeWire's `add_buffer` event.
+    if unsafe { pw_buffer_has_capacity(buffer, req_size) } {
+        shared.renegotiating.store(false, Ordering::Release);
+    }
+}
+
 unsafe extern "C" fn on_process(data: *mut c_void) {
     if data.is_null() {
         return;
@@ -1147,9 +1205,12 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
         return;
     }
 
-    let format = shared.negotiated_format.load(Ordering::Acquire);
-    let stream_width = shared.width.load(Ordering::Acquire);
-    let stream_height = shared.height.load(Ordering::Acquire);
+    let spec = PwStreamFrameSpec {
+        format: shared.negotiated_format.load(Ordering::Acquire),
+        width: shared.width.load(Ordering::Acquire),
+        height: shared.height.load(Ordering::Acquire),
+        renegotiating: shared.renegotiating.load(Ordering::Acquire),
+    };
     let latest = shared
         .latest_frame
         .lock()
@@ -1157,15 +1218,7 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
 
     // SAFETY: `stream` and `pw_buf` are valid and we are inside PipeWire's process callback.
     unsafe {
-        fill_and_queue_pw_buffer(
-            &shared.api,
-            stream,
-            pw_buf,
-            &latest,
-            format,
-            stream_width,
-            stream_height,
-        );
+        fill_and_queue_pw_buffer(&shared.api, stream, pw_buf, &latest, spec);
     }
 }
 
@@ -1312,8 +1365,9 @@ impl PipeWireCameraSink {
         }
 
         if dims_changed {
-            shared.width.store(width, Ordering::Release);
-            shared.height.store(height, Ordering::Release);
+            let prev_width = shared.width.swap(width, Ordering::AcqRel);
+            let prev_height = shared.height.swap(height, Ordering::AcqRel);
+            let prev_renegotiating = shared.renegotiating.swap(true, Ordering::AcqRel);
             let mut param_ptrs = self.build_enum_format_ptrs(width, height);
             // SAFETY: `stream` is valid, loop lock is held by `_lock`, and `param_ptrs` point to
             // 8-byte aligned `EnumFormat` SPA pods alive for the duration of this call.
@@ -1325,6 +1379,11 @@ impl PipeWireCameraSink {
                 )
             };
             if rc < 0 {
+                shared.width.store(prev_width, Ordering::Release);
+                shared.height.store(prev_height, Ordering::Release);
+                shared
+                    .renegotiating
+                    .store(prev_renegotiating, Ordering::Release);
                 return Err(VcamError::FormatError {
                     path: dev_path.to_path_buf(),
                     width,
@@ -1336,7 +1395,7 @@ impl PipeWireCameraSink {
             self.configured_height = height;
         }
 
-        if shared.state.load(Ordering::Acquire) == PW_STREAM_STATE_STREAMING {
+        if !dims_changed && shared.state.load(Ordering::Acquire) == PW_STREAM_STATE_STREAMING {
             // SAFETY: `stream` is valid and loop lock is held; trigger graph processing so
             // `on_process` dequeues and queues the latest frame cleanly without double-dequeueing.
             let rc = unsafe { (shared.api.pw_stream_trigger_process)(stream) };
@@ -1467,6 +1526,7 @@ impl VirtualCameraSink for PipeWireCameraSink {
             width: AtomicU32::new(DEFAULT_WIDTH),
             height: AtomicU32::new(DEFAULT_HEIGHT),
             negotiated_format: AtomicU32::new(SPA_VIDEO_FORMAT_YUY2),
+            renegotiating: AtomicBool::new(false),
             latest_frame: Mutex::new(LatestFrame {
                 width: DEFAULT_WIDTH,
                 height: DEFAULT_HEIGHT,
@@ -2040,6 +2100,117 @@ mod tests {
                 assert!(!sink.is_open());
             }
             Err(other) => panic!("unexpected PipeWire open error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_renegotiation_and_variadic_pw_properties_abi() {
+        assert_eq!(size_of::<PwPropertiesNewFn>(), size_of::<*const c_void>());
+        let _vararg_null_caller: unsafe fn(PwPropertiesNewFn) -> *mut PwProperties =
+            |f| unsafe { f(ptr::null()) };
+
+        let frame_720 = LatestFrame {
+            width: 1280,
+            height: 720,
+            data: vec![0u8; 1280 * 720 * 3 / 2],
+        };
+        let yuy2_720_bytes = 1280 * 720 * 2;
+        let yuy2_1080_bytes = 1920 * 1080 * 2;
+
+        // During renegotiation (e.g., 1080p -> 720p downscale), an old 1080p buffer still has
+        // maxsize >= req_size, so `should_copy_pw_frame` must reject copying until `add_buffer`
+        // clears `renegotiating`.
+        assert_eq!(
+            should_copy_pw_frame(
+                &frame_720,
+                PwStreamFrameSpec {
+                    format: SPA_VIDEO_FORMAT_YUY2,
+                    width: 1280,
+                    height: 720,
+                    renegotiating: true,
+                },
+                yuy2_1080_bytes,
+            ),
+            None
+        );
+
+        // Once renegotiation completes and dimensions match, copying is allowed.
+        assert_eq!(
+            should_copy_pw_frame(
+                &frame_720,
+                PwStreamFrameSpec {
+                    format: SPA_VIDEO_FORMAT_YUY2,
+                    width: 1280,
+                    height: 720,
+                    renegotiating: false,
+                },
+                yuy2_720_bytes,
+            ),
+            Some((1280 * 2, yuy2_720_bytes))
+        );
+
+        // Dimension mismatch or undersized buffer must still be rejected.
+        assert_eq!(
+            should_copy_pw_frame(
+                &frame_720,
+                PwStreamFrameSpec {
+                    format: SPA_VIDEO_FORMAT_YUY2,
+                    width: 1920,
+                    height: 1080,
+                    renegotiating: false,
+                },
+                yuy2_1080_bytes,
+            ),
+            None
+        );
+        assert_eq!(
+            should_copy_pw_frame(
+                &frame_720,
+                PwStreamFrameSpec {
+                    format: SPA_VIDEO_FORMAT_YUY2,
+                    width: 1280,
+                    height: 720,
+                    renegotiating: false,
+                },
+                yuy2_720_bytes - 1,
+            ),
+            None
+        );
+
+        // Verify `pw_buffer_has_capacity` inspects `SpaBuffer`/`SpaData` plane 0 bounds.
+        let mut backing = vec![0u8; 64];
+        let mut chunk = SpaChunk {
+            offset: 0,
+            size: 0,
+            stride: 0,
+            flags: 0,
+        };
+        let mut data_plane = SpaData {
+            type_: SPA_DATA_MEM_PTR,
+            flags: 0,
+            fd: -1,
+            mapoffset: 0,
+            maxsize: 64,
+            data: backing.as_mut_ptr().cast::<c_void>(),
+            chunk: &raw mut chunk,
+        };
+        let mut spa_buf = SpaBuffer {
+            n_metas: 0,
+            n_datas: 1,
+            metas: ptr::null_mut(),
+            datas: &raw mut data_plane,
+        };
+        let mut pw_buf = PwBuffer {
+            buffer: &raw mut spa_buf,
+            user_data: ptr::null_mut(),
+            size: 0,
+            requested: 0,
+            time: 0,
+        };
+        // SAFETY: `pw_buf`, `spa_buf`, `data_plane`, and `chunk` are stack-allocated and live here.
+        unsafe {
+            assert!(pw_buffer_has_capacity(&raw mut pw_buf, 64));
+            assert!(!pw_buffer_has_capacity(&raw mut pw_buf, 65));
         }
     }
 }
