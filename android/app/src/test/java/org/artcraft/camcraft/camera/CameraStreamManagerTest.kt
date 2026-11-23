@@ -1806,4 +1806,70 @@ class CameraStreamManagerTest {
         assertFalse(unconfirmedAdjustedSlot.hasPendingResolutionAdjustmentUnreported())
         assertFalse(unconfirmedAdjustedSlot.negotiatedDimensionsCommitted)
     }
+
+    @Test
+    fun provideSurfaceTerminalRejectionReportsPipelineFailureEvenAfterAdjustmentClaimed() {
+        val adjustedSlot = ActiveEncoderSlot(
+            sessionId = 12L,
+            generation = 5L,
+            encoder = null,
+            width = 1280,
+            height = 720,
+            fps = 60,
+            cameraId = "0",
+            surfaceTracker = EncoderSurfaceRetirementTracker(),
+            cameraConfigId = 8L,
+            geometryRequestSeq = 4L,
+            pendingResolutionAdjustment = true,
+            fallbackWidth = 1920,
+            fallbackHeight = 1080,
+            resolutionAdjusted = true,
+        )
+
+        // First frame already claimed negotiated-size adjustment outcome and committed dims.
+        assertTrue(adjustedSlot.markResolutionAdjustmentReported())
+        adjustedSlot.negotiatedDimensionsCommitted = true
+        assertFalse(adjustedSlot.markResolutionAdjustmentReported())
+
+        // Normal surface return and superseded request cancellation stay on retirement-accounting path only.
+        assertFalse(
+            CameraStreamManager.isSurfaceResultRejection(
+                SurfaceRequest.Result.RESULT_SURFACE_USED_SUCCESSFULLY,
+                isCurrentRequest = true,
+            ),
+        )
+        assertFalse(
+            CameraStreamManager.isSurfaceResultRejection(
+                SurfaceRequest.Result.RESULT_REQUEST_CANCELLED,
+                isCurrentRequest = false,
+            ),
+        )
+        assertFalse(adjustedSlot.isTerminalFailureReported)
+        assertFalse(adjustedSlot.isRetiring)
+
+        // Terminal rejection of current request routes through reportSlotPipelineFailure even after adjustment claim.
+        assertTrue(
+            CameraStreamManager.isSurfaceResultRejection(
+                SurfaceRequest.Result.RESULT_INVALID_SURFACE,
+                isCurrentRequest = true,
+            ),
+        )
+        assertTrue(
+            CameraStreamManager.shouldReportCurrentSlotPipelineFailure(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 12L,
+                snapshotSessionId = 12L,
+                activeSlotMatchesSnapshot = true,
+                snapshotRetiring = adjustedSlot.isRetiring,
+                slotGeometryRequestSeq = adjustedSlot.geometryRequestSeq,
+                latestGeometryRequestSeq = 4L,
+            ),
+        )
+        assertTrue(adjustedSlot.markTerminalFailureReported())
+        assertTrue(adjustedSlot.isTerminalFailureReported)
+        assertTrue(adjustedSlot.isRetiring)
+        assertTrue(adjustedSlot.negotiatedDimensionsCommitted)
+        assertFalse(adjustedSlot.markTerminalFailureReported())
+    }
 }

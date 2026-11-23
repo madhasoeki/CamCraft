@@ -33,6 +33,7 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.io.OutputStream
 import java.lang.ref.WeakReference
+import java.net.BindException
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
@@ -164,7 +165,9 @@ class CamCraftStreamService : Service() {
 
     private val activeTcpSockets = mutableSetOf<Socket>()
 
-    private val usbAttemptTracker = UsbSessionAttemptTracker<ParcelFileDescriptor> { pfd ->
+    private val usbAttemptTracker = UsbSessionAttemptTracker<ParcelFileDescriptor>(
+        pendingCloseTracker = pendingUsbCloseTracker,
+    ) { pfd ->
         try {
             pfd.close()
         } catch (e: IOException) {
@@ -197,7 +200,6 @@ class CamCraftStreamService : Service() {
     private val isStopping = AtomicBoolean(false)
     private val lifecycleLock = Any()
     private var serverBindError: String? = null
-    private var pendingStopCleanup: CompletableDeferred<Unit>? = null
 
     private var cameraStreamManager: CameraStreamManager? = null
     private var mdnsAdvertiser: MdnsAdvertiser? = null
@@ -315,13 +317,13 @@ class CamCraftStreamService : Service() {
         when (intent?.action) {
             ACTION_STOP -> {
                 Log.i(TAG, "Stop command received, shutting down CamCraft service")
-                val (capturedTransports, cleanupDone) = synchronized(lifecycleLock) {
+                val capturedTransports = synchronized(lifecycleLock) {
                     val stopTargets = stopServerLocked()
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
                     stopTargets
                 }
-                dispatchCapturedStopTransports(capturedTransports, cleanupDone)
+                dispatchCapturedStopTransports(capturedTransports)
             }
             ACTION_START_USB_ACCESSORY -> {
                 Log.i(TAG, "USB accessory start command received")
@@ -354,8 +356,7 @@ class CamCraftStreamService : Service() {
             ?: _serviceState.value.localIpAddress
         val audioToRelease: AudioStreamEngine?
         val cameraToRelease: CameraStreamManager?
-        var stopTargets: Pair<CapturedStopTransports, CompletableDeferred<Unit>?> =
-            CapturedStopTransports(null, emptyList(), null) to null
+        var stopTargets = CapturedStopTransports(null, emptyList(), null)
         synchronized(lifecycleLock) {
             isStopping.set(true)
             if (isUsbReceiverRegistered) {
@@ -398,7 +399,7 @@ class CamCraftStreamService : Service() {
             cameraStreamManager = null
             pendingPreviewView = null
         }
-        dispatchCapturedStopTransports(stopTargets.first, stopTargets.second)
+        dispatchCapturedStopTransports(stopTargets)
         audioToRelease?.release()
         cameraToRelease?.release()
         serviceScope.cancel()
@@ -431,27 +432,23 @@ class CamCraftStreamService : Service() {
         synchronized(lifecycleLock) {
             if (serverJob?.isActive == true) return
             isStopping.set(false)
-            val priorStopCleanup = pendingStopCleanup
 
             serverJob = serviceScope.launch {
                 val currentJob = coroutineContext[Job]
                 var socket: ServerSocket? = null
                 try {
-                    if (priorStopCleanup != null) {
-                        withTimeoutOrNull(1_000L) {
-                            priorStopCleanup.await()
-                        }
-                    }
-                    val canBind = synchronized(lifecycleLock) {
-                        !isStopping.get() && isActive && serverJob === currentJob
-                    }
-                    if (!canBind) {
-                        return@launch
-                    }
-
                     val port = CcftProtocolConstants.DEFAULT_PORT
-                    val boundSocket = ServerSocket(port).apply {
-                        reuseAddress = true
+                    val boundSocket = bindServerSocketWithRetiringListenerRetry(
+                        listenerCloseTracker = pendingListenerCloseTracker,
+                        isCancelledOrStopped = {
+                            synchronized(lifecycleLock) {
+                                isStopping.get() || !isActive || serverJob !== currentJob
+                            }
+                        },
+                    ) {
+                        ServerSocket(port).apply {
+                            reuseAddress = true
+                        }
                     }
                     socket = boundSocket
                     val publishedSocket = synchronized(lifecycleLock) {
@@ -572,16 +569,25 @@ class CamCraftStreamService : Service() {
                         }
                     }
                 } finally {
+                    val ownedSocket = socket
+                    var listenerCompletion: CompletableDeferred<Unit>? = null
                     val socketToClose = synchronized(lifecycleLock) {
-                        if (socket != null && serverSocket === socket) {
+                        if (ownedSocket != null && serverSocket === ownedSocket) {
                             serverSocket = null
                         }
-                        socket
+                        if (ownedSocket != null && !ownedSocket.isClosed) {
+                            listenerCompletion = pendingListenerCloseTracker.register()
+                        }
+                        ownedSocket
                     }
-                    if (socketToClose != null) {
-                        try {
-                            socketToClose.close()
-                        } catch (_: IOException) {}
+                    try {
+                        if (socketToClose != null) {
+                            try {
+                                socketToClose.close()
+                            } catch (_: IOException) {}
+                        }
+                    } finally {
+                        listenerCompletion?.complete(Unit)
                     }
                 }
             }
@@ -858,6 +864,9 @@ class CamCraftStreamService : Service() {
                     if (previousUsbJob != null && previousUsbJob.isActive) {
                         previousUsbJob.join()
                     }
+                    awaitPendingUsbDescriptorRetirement(
+                        usbCloseTracker = pendingUsbCloseTracker,
+                    )
                     if (isStopping.get() ||
                         !currentCoroutineContext().isActive ||
                         !usbAttemptTracker.isAttemptPendingOrActive(attempt)
@@ -1560,13 +1569,13 @@ class CamCraftStreamService : Service() {
     }
 
     private fun stopServer() {
-        val (capturedTransports, cleanupDone) = synchronized(lifecycleLock) {
+        val capturedTransports = synchronized(lifecycleLock) {
             stopServerLocked()
         }
-        dispatchCapturedStopTransports(capturedTransports, cleanupDone)
+        dispatchCapturedStopTransports(capturedTransports)
     }
 
-    private fun stopServerLocked(): Pair<CapturedStopTransports, CompletableDeferred<Unit>?> {
+    private fun stopServerLocked(): CapturedStopTransports {
         isStopping.set(true)
         mdnsAdvertiser?.unregister()
         val sessionToClose = activeSession
@@ -1577,24 +1586,25 @@ class CamCraftStreamService : Service() {
         activeTcpSockets.clear()
         val listenerToClose = serverSocket
         serverSocket = null
+        val listenerCompletion = if (listenerToClose != null) {
+            pendingListenerCloseTracker.register()
+        } else {
+            null
+        }
         usbJob?.cancel()
         usbJob = null
         serverJob?.cancel()
         serverJob = null
-        val captured = CapturedStopTransports(
+        return CapturedStopTransports(
             session = sessionToClose,
             tcpSockets = socketsToClose,
             serverSocket = listenerToClose,
-            usbCloseAction = detachedUsb?.let { descriptor ->
-                { usbAttemptTracker.closeDetachedDescriptor(descriptor) }
+            usbCloseAction = detachedUsb?.let { detached ->
+                { usbAttemptTracker.closeDetachedDescriptor(detached) }
             },
+            listenerCompletion = listenerCompletion,
+            usbCompletion = detachedUsb?.completion,
         )
-        val cleanupDone = if (captured.hasTargets()) {
-            CompletableDeferred<Unit>().also { pendingStopCleanup = it }
-        } else {
-            null
-        }
-        return captured to cleanupDone
     }
 
     private fun createNotificationChannel() {
@@ -1639,6 +1649,9 @@ class CamCraftStreamService : Service() {
         internal const val CONTROL_ACK_QUEUE_CAPACITY = 64
         internal const val WRITE_STALL_TIMEOUT_MS = 2_500L
         private const val WRITE_WATCHDOG_POLL_MS = 500L
+        internal const val USB_RETIRE_WAIT_TIMEOUT_MS = 2_000L
+        internal const val LISTENER_RETIRE_WAIT_TIMEOUT_MS = 1_000L
+        internal const val MAX_LISTENER_BIND_RETRIES = 3
 
         const val ACTION_START = "org.artcraft.camcraft.action.START"
         const val ACTION_START_USB_ACCESSORY = "org.artcraft.camcraft.action.START_USB_ACCESSORY"
@@ -1647,6 +1660,8 @@ class CamCraftStreamService : Service() {
 
         private val nextSessionId = AtomicLong(1L)
         private val stateOwnershipLock = Any()
+        private val pendingListenerCloseTracker = PendingCloseTracker()
+        private val pendingUsbCloseTracker = PendingCloseTracker()
 
         @Volatile
         private var activeStateOwnerSessionId: Long = 0L
@@ -1813,6 +1828,8 @@ class CamCraftStreamService : Service() {
             val tcpSockets: List<Closeable>,
             val serverSocket: Closeable?,
             val usbCloseAction: (() -> Unit)? = null,
+            val listenerCompletion: CompletableDeferred<Unit>? = null,
+            val usbCompletion: CompletableDeferred<Unit>? = null,
         ) {
             fun hasTargets(): Boolean =
                 session != null ||
@@ -1821,16 +1838,31 @@ class CamCraftStreamService : Service() {
                     usbCloseAction != null
 
             fun closeAll() {
-                session?.close()
-                usbCloseAction?.invoke()
-                for (socket in tcpSockets) {
-                    try {
-                        socket.close()
-                    } catch (_: IOException) {}
-                }
                 try {
-                    serverSocket?.close()
-                } catch (_: IOException) {}
+                    try {
+                        try {
+                            serverSocket?.close()
+                        } catch (_: IOException) {}
+                    } finally {
+                        listenerCompletion?.complete(Unit)
+                    }
+                    try {
+                        usbCloseAction?.invoke()
+                    } finally {
+                        usbCompletion?.complete(Unit)
+                    }
+                    try {
+                        session?.close()
+                    } catch (_: Throwable) {}
+                    for (socket in tcpSockets) {
+                        try {
+                            socket.close()
+                        } catch (_: IOException) {}
+                    }
+                } finally {
+                    listenerCompletion?.complete(Unit)
+                    usbCompletion?.complete(Unit)
+                }
             }
         }
 
@@ -1842,6 +1874,8 @@ class CamCraftStreamService : Service() {
             },
         ) {
             if (!captured.hasTargets()) {
+                captured.listenerCompletion?.complete(Unit)
+                captured.usbCompletion?.complete(Unit)
                 completion?.complete(Unit)
                 return
             }
@@ -1849,7 +1883,76 @@ class CamCraftStreamService : Service() {
                 try {
                     captured.closeAll()
                 } finally {
+                    captured.listenerCompletion?.complete(Unit)
+                    captured.usbCompletion?.complete(Unit)
                     completion?.complete(Unit)
+                }
+            }
+        }
+
+        internal suspend fun awaitPendingUsbDescriptorRetirement(
+            usbCloseTracker: PendingCloseTracker,
+            timeoutMs: Long = USB_RETIRE_WAIT_TIMEOUT_MS,
+        ): Boolean {
+            val (initialPending, _) = usbCloseTracker.snapshot()
+            if (initialPending.isEmpty()) {
+                return true
+            }
+            return withTimeoutOrNull(timeoutMs) {
+                while (true) {
+                    val (pending, _) = usbCloseTracker.snapshot()
+                    if (pending.isEmpty()) {
+                        break
+                    }
+                    for (deferred in pending) {
+                        deferred.await()
+                    }
+                }
+                true
+            } ?: false
+        }
+
+        internal suspend fun <S : Closeable> bindServerSocketWithRetiringListenerRetry(
+            listenerCloseTracker: PendingCloseTracker,
+            isCancelledOrStopped: () -> Boolean,
+            maxRetryAttempts: Int = MAX_LISTENER_BIND_RETRIES,
+            retryWaitTimeoutMs: Long = LISTENER_RETIRE_WAIT_TIMEOUT_MS,
+            bindSocket: () -> S,
+        ): S {
+            var attempt = 0
+            while (true) {
+                val (pendingBeforeBind, _) = listenerCloseTracker.snapshot()
+                if (pendingBeforeBind.isNotEmpty()) {
+                    withTimeoutOrNull(retryWaitTimeoutMs) {
+                        for (deferred in pendingBeforeBind) {
+                            deferred.await()
+                        }
+                    }
+                }
+                if (isCancelledOrStopped()) {
+                    throw CancellationException("Server start cancelled while waiting for retiring listener")
+                }
+                val completionsAtBind = listenerCloseTracker.currentCompletionsCount()
+                try {
+                    return bindSocket()
+                } catch (e: BindException) {
+                    val (pendingAfterBind, completionsAfterBind) = listenerCloseTracker.snapshot()
+                    val retiringListenerActiveOrJustClosed =
+                        pendingAfterBind.isNotEmpty() || completionsAfterBind > completionsAtBind
+                    if (!retiringListenerActiveOrJustClosed || attempt >= maxRetryAttempts) {
+                        throw e
+                    }
+                    attempt++
+                    if (pendingAfterBind.isNotEmpty()) {
+                        withTimeoutOrNull(retryWaitTimeoutMs) {
+                            for (deferred in pendingAfterBind) {
+                                deferred.await()
+                            }
+                        }
+                    }
+                    if (isCancelledOrStopped()) {
+                        throw CancellationException("Server start cancelled while retrying listener bind")
+                    }
                 }
             }
         }
@@ -2550,10 +2653,49 @@ internal class UsbSessionAttempt<T : Any>(
 }
 
 /**
+ * Tracks in-flight asynchronous transport closures across Service instances so replacement
+ * listener binds and USB accessory starts can wait for OS descriptor/socket release.
+ */
+internal class PendingCloseTracker {
+    private val lock = Any()
+    private val inFlight = mutableSetOf<CompletableDeferred<Unit>>()
+    private var completionsCount: Long = 0L
+
+    fun register(): CompletableDeferred<Unit> {
+        val deferred = CompletableDeferred<Unit>()
+        synchronized(lock) {
+            inFlight.add(deferred)
+        }
+        deferred.invokeOnCompletion {
+            synchronized(lock) {
+                if (inFlight.remove(deferred)) {
+                    completionsCount++
+                }
+            }
+        }
+        return deferred
+    }
+
+    fun snapshot(): Pair<List<CompletableDeferred<Unit>>, Long> = synchronized(lock) {
+        inFlight.toList() to completionsCount
+    }
+
+    fun currentCompletionsCount(): Long = synchronized(lock) {
+        completionsCount
+    }
+}
+
+internal data class DetachedUsbDescriptor<T : Any>(
+    val descriptor: T,
+    val completion: CompletableDeferred<Unit>?,
+)
+
+/**
  * Tracks per-attempt USB AOA transport ownership and close state so a detached or
  * deferred-overflow teardown of an old attempt cannot poison or close a replacement attempt.
  */
 internal class UsbSessionAttemptTracker<T : Any>(
+    private val pendingCloseTracker: PendingCloseTracker? = null,
     private val closeDescriptor: (T) -> Unit,
 ) {
     private val lock = Any()
@@ -2579,16 +2721,27 @@ internal class UsbSessionAttemptTracker<T : Any>(
     }
 
     fun attachDescriptor(attempt: UsbSessionAttempt<T>, descriptor: T): Boolean {
+        var completionToSignal: CompletableDeferred<Unit>? = null
+        val shouldCloseUnattached: Boolean
         val accepted = synchronized(lock) {
             if (attempt.isClosing || activeAttempt !== attempt) {
+                shouldCloseUnattached = attempt.markDescriptorClosed()
+                if (shouldCloseUnattached) {
+                    completionToSignal = pendingCloseTracker?.register()
+                }
                 false
             } else {
+                shouldCloseUnattached = false
                 attempt.descriptor = descriptor
                 true
             }
         }
-        if (!accepted && attempt.markDescriptorClosed()) {
-            closeDescriptor(descriptor)
+        if (!accepted && shouldCloseUnattached) {
+            try {
+                closeDescriptor(descriptor)
+            } finally {
+                completionToSignal?.complete(Unit)
+            }
         }
         return accepted
     }
@@ -2598,6 +2751,7 @@ internal class UsbSessionAttemptTracker<T : Any>(
     }
 
     fun closeAttempt(attempt: UsbSessionAttempt<T>) {
+        var completionToSignal: CompletableDeferred<Unit>? = null
         val descriptorToClose = synchronized(lock) {
             attempt.markClosing()
             if (activeAttempt === attempt) {
@@ -2605,34 +2759,44 @@ internal class UsbSessionAttemptTracker<T : Any>(
             }
             val desc = attempt.descriptor
             if (desc != null && attempt.markDescriptorClosed()) {
+                completionToSignal = pendingCloseTracker?.register()
                 desc
             } else {
                 null
             }
         }
         if (descriptorToClose != null) {
-            closeDescriptor(descriptorToClose)
+            try {
+                closeDescriptor(descriptorToClose)
+            } finally {
+                completionToSignal?.complete(Unit)
+            }
         }
     }
 
-    fun detachActiveAttemptForClose(): T? = synchronized(lock) {
+    fun detachActiveAttemptForClose(): DetachedUsbDescriptor<T>? = synchronized(lock) {
         val current = activeAttempt ?: return null
         current.markClosing()
         activeAttempt = null
         val desc = current.descriptor
         if (desc != null && current.markDescriptorClosed()) {
-            desc
+            val completion = pendingCloseTracker?.register()
+            DetachedUsbDescriptor(desc, completion)
         } else {
             null
         }
     }
 
-    fun closeDetachedDescriptor(descriptor: T) {
-        closeDescriptor(descriptor)
+    fun closeDetachedDescriptor(detached: DetachedUsbDescriptor<T>) {
+        try {
+            closeDescriptor(detached.descriptor)
+        } finally {
+            detached.completion?.complete(Unit)
+        }
     }
 
     fun closeActiveAttempt() {
-        detachActiveAttemptForClose()?.let(closeDescriptor)
+        detachActiveAttemptForClose()?.let(::closeDetachedDescriptor)
     }
 }
 

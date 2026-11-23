@@ -1560,45 +1560,6 @@ class CameraStreamManager(
         }
     }
 
-    private fun handleResolutionAdjustmentFailureIfPending(
-        snapshot: BindSnapshot,
-        reason: String,
-    ) {
-        reportSlotAdjustmentFailureIfPending(snapshot.slot, reason)
-    }
-
-    private fun reportSlotAdjustmentFailureIfPending(
-        slot: ActiveEncoderSlot,
-        reason: String,
-    ) {
-        val shouldNotifyFailed = synchronized(surfaceLock) {
-            val ownsLatestGeometry = shouldApplyNegotiatedDimensionsToRequest(
-                slotGeometryRequestSeq = slot.geometryRequestSeq,
-                latestGeometryRequestSeq = requestedGeometrySeq,
-            )
-            val publishFailure = ownsLatestGeometry &&
-                shouldPublishResolutionAdjustment(
-                    isReleased = isReleased.get(),
-                    isStreaming = isStreaming,
-                    activeSessionId = activeSessionId,
-                    snapshotSessionId = slot.sessionId,
-                    activeSlotMatchesSnapshot = activeSlot === slot,
-                    snapshotRetiring = slot.isRetiring,
-                    pendingResolutionAdjustment = slot.pendingResolutionAdjustment,
-                ) &&
-                slot.markResolutionAdjustmentReported() &&
-                slot.markTerminalFailureReported()
-            if (publishFailure) {
-                pipelineHealthyOrStarting = false
-                resolutionAdjustmentInFlight = false
-            }
-            publishFailure
-        }
-        if (shouldNotifyFailed) {
-            cleanupAndNotifySlotFailure(slot, reason)
-        }
-    }
-
     private fun handlePipelineBindFailure(
         snapshot: BindSnapshot,
         reason: String,
@@ -1847,22 +1808,24 @@ class CameraStreamManager(
                                     finalizeSlotRetirement(snapshot.slot)
                                 }
                                 if (isSurfaceResultRejection(result.resultCode, isCurrentRequest = isCurrentRequest)) {
-                                    handleResolutionAdjustmentFailureIfPending(
-                                        snapshot = snapshot,
+                                    reportSlotPipelineFailure(
+                                        slot = snapshot.slot,
                                         reason = "Encoder surface rejected by CameraX (resultCode=${result.resultCode}) for ${snapshot.width}x${snapshot.height}",
                                     )
                                 }
                             }
                         } catch (e: Throwable) {
                             Log.w(TAG, "provideSurface failed unexpectedly: ${e.message}")
-                            snapshot.slot.clearCurrentSurfaceRequestIfMatches(request)
+                            val isCurrentRequest = snapshot.slot.clearCurrentSurfaceRequestIfMatches(request)
                             if (snapshot.slot.surfaceTracker.onSurfaceReturned()) {
                                 finalizeSlotRetirement(snapshot.slot)
                             }
-                            handleResolutionAdjustmentFailureIfPending(
-                                snapshot = snapshot,
-                                reason = "Encoder surface acceptance failed for ${snapshot.width}x${snapshot.height}: ${e.message}",
-                            )
+                            if (isCurrentRequest) {
+                                reportSlotPipelineFailure(
+                                    slot = snapshot.slot,
+                                    reason = "Encoder surface acceptance failed for ${snapshot.width}x${snapshot.height}: ${e.message}",
+                                )
+                            }
                         }
                     }
                     SurfaceResolutionDecision.RECONFIGURE_ENCODER -> {
