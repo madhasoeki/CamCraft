@@ -1441,4 +1441,122 @@ class CameraStreamManagerTest {
             ),
         )
     }
+
+    @Test
+    fun bindFailureHelperHandlesAllCurrentSlotsIncludingLensSwitchAndDeduplicates() {
+        // Ordinary start / lens switch (pendingResolutionAdjustment = false) and resolution
+        // adjustments alike must report failure when the slot is still current.
+        assertTrue(
+            CameraStreamManager.shouldReportCurrentSlotPipelineFailure(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 3L,
+                snapshotSessionId = 3L,
+                activeSlotMatchesSnapshot = true,
+                snapshotRetiring = false,
+                slotGeometryRequestSeq = 2L,
+                latestGeometryRequestSeq = 2L,
+            ),
+        )
+        assertFalse(
+            CameraStreamManager.shouldReportCurrentSlotPipelineFailure(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 3L,
+                snapshotSessionId = 3L,
+                activeSlotMatchesSnapshot = false,
+                snapshotRetiring = false,
+                slotGeometryRequestSeq = 2L,
+                latestGeometryRequestSeq = 2L,
+            ),
+        )
+        assertFalse(
+            CameraStreamManager.shouldReportCurrentSlotPipelineFailure(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 3L,
+                snapshotSessionId = 3L,
+                activeSlotMatchesSnapshot = true,
+                snapshotRetiring = true,
+                slotGeometryRequestSeq = 2L,
+                latestGeometryRequestSeq = 2L,
+            ),
+        )
+        assertFalse(
+            CameraStreamManager.shouldReportCurrentSlotPipelineFailure(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 3L,
+                snapshotSessionId = 3L,
+                activeSlotMatchesSnapshot = true,
+                snapshotRetiring = false,
+                slotGeometryRequestSeq = 1L,
+                latestGeometryRequestSeq = 2L,
+            ),
+        )
+
+        val ordinarySlot = ActiveEncoderSlot(
+            sessionId = 3L,
+            generation = 2L,
+            encoder = null,
+            width = 1920,
+            height = 1080,
+            fps = 60,
+            cameraId = "1",
+            surfaceTracker = EncoderSurfaceRetirementTracker(),
+            pendingResolutionAdjustment = false,
+        )
+        assertTrue(ordinarySlot.markTerminalFailureReported())
+        assertFalse(ordinarySlot.markTerminalFailureReported())
+
+        val adjustmentSlot = ActiveEncoderSlot(
+            sessionId = 3L,
+            generation = 3L,
+            encoder = null,
+            width = 1280,
+            height = 720,
+            fps = 60,
+            cameraId = "1",
+            surfaceTracker = EncoderSurfaceRetirementTracker(),
+            pendingResolutionAdjustment = true,
+        )
+        assertTrue(adjustmentSlot.markTerminalFailureReported())
+        assertFalse(adjustmentSlot.hasPendingResolutionAdjustmentUnreported())
+        assertFalse(adjustmentSlot.markResolutionAdjustmentReported())
+        assertFalse(adjustmentSlot.markTerminalFailureReported())
+    }
+
+    @Test
+    fun startEncoderHandlingDrainThreadOomRoutesOnlyStartupOomToTerminalFailure() {
+        var normalStarted = false
+        CameraStreamManager.startEncoderHandlingDrainThreadOom {
+            normalStarted = true
+        }
+        assertTrue(normalStarted)
+
+        val oom = OutOfMemoryError("pthread_create failed")
+        val wrapped = try {
+            CameraStreamManager.startEncoderHandlingDrainThreadOom {
+                throw oom
+            }
+            null
+        } catch (ex: EncoderDrainThreadStartupException) {
+            ex
+        }
+        assertNotNull(wrapped)
+        assertSame(oom, wrapped!!.cause)
+        assertFalse(CameraStreamManager.isRetryableEncoderSetupFailure(wrapped))
+        assertTrue(CameraStreamManager.isRetryableEncoderSetupFailure(IllegalStateException("codec busy")))
+
+        val unrelatedAssertion = AssertionError("unrelated fatal error")
+        val propagatedAssertion = try {
+            CameraStreamManager.startEncoderHandlingDrainThreadOom {
+                throw unrelatedAssertion
+            }
+            null
+        } catch (err: AssertionError) {
+            err
+        }
+        assertSame(unrelatedAssertion, propagatedAssertion)
+    }
 }

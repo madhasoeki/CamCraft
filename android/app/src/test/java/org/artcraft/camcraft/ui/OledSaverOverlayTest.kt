@@ -67,6 +67,17 @@ class OledSaverOverlayTest {
         )
         assertEquals("ERROR • Port in use", OledSaverMotion.formatStatusLine(error))
         assertEquals("Double-tap anywhere to wake", OledSaverMotion.formatDetailLine(error))
+
+        val activeVideoError = StreamServiceState(
+            status = StreamConnectionStatus.ERROR,
+            clientAddress = "USB Direct",
+            hasActiveSession = true,
+            isVideoPipelineHealthy = false,
+            activeState = defaultActiveCameraState().copy(audioEnabled = true, audioMuted = false),
+            errorMessage = "Bind failed",
+        )
+        assertEquals("ERROR • Bind failed", OledSaverMotion.formatStatusLine(activeVideoError))
+        assertEquals("Mic ON • Double-tap anywhere to wake", OledSaverMotion.formatDetailLine(activeVideoError))
     }
 
     @Test

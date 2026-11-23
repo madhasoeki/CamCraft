@@ -1,5 +1,6 @@
 package org.artcraft.camcraft.network
 
+import java.io.BufferedOutputStream
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.IOException
@@ -13,10 +14,18 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeout
 import org.artcraft.camcraft.camera.CameraStreamManager
 import org.artcraft.camcraft.protocol.CameraInfo
 import org.artcraft.camcraft.protocol.CcftFlags
@@ -1260,10 +1269,14 @@ class CamCraftStreamServiceTest {
             StreamServiceState(
                 status = StreamConnectionStatus.CONNECTED,
                 clientAddress = "USB Direct",
+                hasActiveSession = true,
                 activeState = defaultActiveCameraState(),
                 currentFps = 59.8f,
             ),
         )
+        val coordinator = ControlStateAckCoordinator(stateFlow) { }
+        val session = ClientSessionHandle(10L, ByteArrayOutputStream(), Any(), {})
+        coordinator.setActiveSession(session)
         val notifications = mutableListOf<String>()
 
         assertTrue(
@@ -1277,6 +1290,10 @@ class CamCraftStreamServiceTest {
             ),
         )
         assertEquals(StreamConnectionStatus.ERROR, stateFlow.value.status)
+        assertTrue(stateFlow.value.hasActiveSession)
+        assertFalse(stateFlow.value.isVideoPipelineHealthy)
+        assertTrue(stateFlow.value.isServerActive)
+        assertTrue(stateFlow.value.isMicControlAvailable)
         assertEquals(0f, stateFlow.value.currentFps, 0.001f)
         assertEquals("Replacement pipeline failed", stateFlow.value.errorMessage)
         assertEquals("Video unavailable (USB Direct) • Replacement pipeline failed", notifications.single())
@@ -1285,6 +1302,8 @@ class CamCraftStreamServiceTest {
         assertTrue(
             CamCraftStreamService.restoreConnectedStatusIfRecovering(
                 lock = lock,
+                coordinator = coordinator,
+                expectedSessionId = 10L,
                 isStopping = { stopping.get() },
                 isSessionActive = { sessionActive.get() },
                 serviceState = stateFlow,
@@ -1292,6 +1311,8 @@ class CamCraftStreamServiceTest {
             ),
         )
         assertEquals(StreamConnectionStatus.CONNECTED, stateFlow.value.status)
+        assertTrue(stateFlow.value.hasActiveSession)
+        assertTrue(stateFlow.value.isVideoPipelineHealthy)
         assertNull(stateFlow.value.errorMessage)
         assertEquals("Connected (USB Direct) • 1920x1080 @ 60 FPS", notifications.last())
     }
@@ -1466,10 +1487,17 @@ class CamCraftStreamServiceTest {
             StreamServiceState(
                 status = StreamConnectionStatus.ERROR,
                 clientAddress = "USB Direct",
+                hasActiveSession = true,
+                isVideoPipelineHealthy = false,
                 activeState = defaultActiveCameraState(),
                 errorMessage = "Bind failed",
             ),
         )
+        val coordinator = ControlStateAckCoordinator(stateFlow) { }
+        val active = ClientSessionHandle(70L, ByteArrayOutputStream(), Any(), {})
+        coordinator.setActiveSession(active)
+        val staleConfigId = coordinator.runIfSessionActive(active, advanceCameraConfig = true) { _, _, id -> id }!!
+        val currentConfigId = coordinator.runIfSessionActive(active, advanceCameraConfig = true) { _, _, id -> id }!!
         val notifications = mutableListOf<String>()
 
         // Submitting an async rebind calls publishConnectedNotificationFromSnapshot -> never clears ERROR.
@@ -1490,9 +1518,11 @@ class CamCraftStreamServiceTest {
         assertFalse(
             CamCraftStreamService.restoreConnectedStatusIfRecovering(
                 lock = lock,
+                coordinator = coordinator,
+                expectedSessionId = 70L,
+                expectedCameraConfigId = staleConfigId,
                 isStopping = { false },
                 isSessionActive = { true },
-                isCurrentPipeline = { false },
                 serviceState = stateFlow,
                 onUpdateNotification = { notifications.add(it) },
             ),
@@ -1504,19 +1534,22 @@ class CamCraftStreamServiceTest {
         assertTrue(
             CamCraftStreamService.restoreConnectedStatusIfRecovering(
                 lock = lock,
+                coordinator = coordinator,
+                expectedSessionId = 70L,
+                expectedCameraConfigId = currentConfigId,
                 isStopping = { false },
                 isSessionActive = { true },
-                isCurrentPipeline = { true },
                 serviceState = stateFlow,
                 onUpdateNotification = { notifications.add(it) },
             ),
         )
         assertEquals(StreamConnectionStatus.CONNECTED, stateFlow.value.status)
+        assertTrue(stateFlow.value.hasActiveSession)
+        assertTrue(stateFlow.value.isVideoPipelineHealthy)
         assertNull(stateFlow.value.errorMessage)
         assertEquals(listOf("Connected (USB Direct) • 1920x1080 @ 60 FPS"), notifications)
 
         // Session ID verification rejects superseded or closed sessions while matching current.
-        val active = ClientSessionHandle(70L, ByteArrayOutputStream(), Any(), {})
         assertTrue(CamCraftStreamService.isActiveSessionMatching(false, active, 70L))
         assertFalse(CamCraftStreamService.isActiveSessionMatching(false, active, 69L))
         assertFalse(CamCraftStreamService.isActiveSessionMatching(true, active, 70L))
@@ -1566,5 +1599,441 @@ class CamCraftStreamServiceTest {
         ) { cur -> cur.copy(bitrateKbps = 10_000) }
         assertEquals(retryConfigId, coordinator.currentCameraConfigId())
         assertEquals(10_000, stateFlow.value.bitrateKbps)
+    }
+
+    @Test
+    fun commitEncoderResolutionAdjustedOrdersDimensionCommitUnderCoordinatorOrderLock() {
+        val stateFlow = MutableStateFlow(
+            StreamServiceState(
+                status = StreamConnectionStatus.CONNECTED,
+                clientAddress = "192.168.1.10",
+                hasActiveSession = true,
+                activeState = defaultActiveCameraState(),
+            ),
+        )
+        val coordinator = ControlStateAckCoordinator(stateFlow) { }
+        val session = ClientSessionHandle(81L, ByteArrayOutputStream(), Any(), {})
+        coordinator.setActiveSession(session)
+        val initialConfigId = coordinator.runIfSessionActive(session, advanceCameraConfig = true) { _, _, id -> id }!!
+
+        var requestedWidth = 1920
+        var requestedHeight = 1080
+        var adjustmentInFlight = true
+        val pipelineHealthy = true
+
+        // Commit negotiated 1280x720 atomically with serviceState under coordinator orderLock.
+        val committed = CamCraftStreamService.commitEncoderResolutionAdjusted(
+            coordinator = coordinator,
+            expectedSessionId = 81L,
+            expectedCameraConfigId = initialConfigId,
+            expectedCameraId = "0",
+            width = 1280,
+            height = 720,
+            isStopping = { false },
+            commitNegotiatedDimensions = {
+                // Before activeState publishes 1280x720, ConfigureStream cannot observe negotiated dims separately.
+                assertEquals(1920, stateFlow.value.activeState.width)
+                requestedWidth = 1280
+                requestedHeight = 720
+                adjustmentInFlight = false
+                true
+            },
+        )
+        assertNotNull(committed)
+        assertEquals(1280, stateFlow.value.activeState.width)
+        assertEquals(720, stateFlow.value.activeState.height)
+        assertEquals(initialConfigId, coordinator.currentCameraConfigId())
+        val ack = session.ackChannel.tryReceive().getOrNull()!!
+        val ackState = ack.activeState!!
+        assertEquals(1280, ackState.width)
+        assertEquals(720, ackState.height)
+
+        // Subsequent bitrate-only ConfigureStream preserves initialConfigId and does not restart.
+        val bitrateOnlyCmd = ControlCmd.ConfigureStream(
+            cameraId = "0",
+            width = 1280,
+            height = 720,
+            fps = 60,
+            bitrateKbps = 8_000,
+        )
+        coordinator.updateIfSessionOwned(
+            expectedSessionId = 81L,
+            shouldAdvanceCameraConfig = { previous, next ->
+                CamCraftStreamService.isCameraGeometryChanged(previous, next) ||
+                    CameraStreamManager.shouldAdvanceCameraConfigForRebind(
+                        isReleased = false,
+                        isStreaming = true,
+                        activeSessionId = 81L,
+                        requestSessionId = 81L,
+                        pipelineHealthyOrStarting = pipelineHealthy,
+                        resolutionAdjustmentInFlight = adjustmentInFlight,
+                        requestedCameraId = "0",
+                        requestedWidth = requestedWidth,
+                        requestedHeight = requestedHeight,
+                        requestedFps = 60,
+                        newCameraId = next.cameraId,
+                        newWidth = next.width,
+                        newHeight = next.height,
+                        newFps = next.fps,
+                    )
+            },
+        ) { cur ->
+            CamCraftStreamService.applyConfigureStreamPatch(cur, bitrateOnlyCmd, null)
+        }
+        assertEquals(initialConfigId, coordinator.currentCameraConfigId())
+        assertEquals(8_000, stateFlow.value.bitrateKbps)
+
+        // Changing fps (or camera/width/height) advances configId; old configId resolution commits are rejected.
+        val fpsChangeCmd = ControlCmd.ConfigureStream(
+            cameraId = "0",
+            width = 1280,
+            height = 720,
+            fps = 30,
+            bitrateKbps = 8_000,
+        )
+        coordinator.updateIfSessionOwned(
+            expectedSessionId = 81L,
+            shouldAdvanceCameraConfig = { previous, next ->
+                CamCraftStreamService.isCameraGeometryChanged(previous, next) ||
+                    CameraStreamManager.shouldAdvanceCameraConfigForRebind(
+                        isReleased = false,
+                        isStreaming = true,
+                        activeSessionId = 81L,
+                        requestSessionId = 81L,
+                        pipelineHealthyOrStarting = pipelineHealthy,
+                        resolutionAdjustmentInFlight = adjustmentInFlight,
+                        requestedCameraId = "0",
+                        requestedWidth = requestedWidth,
+                        requestedHeight = requestedHeight,
+                        requestedFps = 60,
+                        newCameraId = next.cameraId,
+                        newWidth = next.width,
+                        newHeight = next.height,
+                        newFps = next.fps,
+                    )
+            },
+        ) { cur ->
+            CamCraftStreamService.applyConfigureStreamPatch(cur, fpsChangeCmd, null)
+        }
+        assertTrue(coordinator.currentCameraConfigId() > initialConfigId)
+
+        var staleCallbackInvoked = false
+        assertNull(
+            CamCraftStreamService.commitEncoderResolutionAdjusted(
+                coordinator = coordinator,
+                expectedSessionId = 81L,
+                expectedCameraConfigId = initialConfigId,
+                expectedCameraId = "0",
+                width = 640,
+                height = 480,
+                isStopping = { false },
+                commitNegotiatedDimensions = {
+                    staleCallbackInvoked = true
+                    true
+                },
+            ),
+        )
+        assertFalse(staleCallbackInvoked)
+        assertEquals(1280, stateFlow.value.activeState.width)
+    }
+
+    @Test
+    fun stalledInitialHelloWriteIsAbortedByWatchdogAndAdmitsReplacementSession() = runBlocking {
+        val writerEntered = CountDownLatch(1)
+        val releaseStuckWriter = CountDownLatch(1)
+        val cleanupExecutor = Executors.newSingleThreadExecutor { r ->
+            Thread(r, "test-deferred-output-close").apply { isDaemon = true }
+        }
+        val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        val sessionMutex = Mutex()
+        val transport1Closes = AtomicInteger(0)
+
+        // Underlying sink ignores closeTransport() and remains wedged holding session1.outputLock and
+        // BufferedOutputStream's synchronized monitor until releaseStuckWriter is released in finally.
+        val stuckUnderlying = object : OutputStream() {
+            override fun write(b: Int) {
+                writerEntered.countDown()
+                try {
+                    releaseStuckWriter.await()
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+            }
+
+            override fun write(b: ByteArray, off: Int, len: Int) {
+                writerEntered.countDown()
+                try {
+                    releaseStuckWriter.await()
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+            }
+        }
+        val buffered1 = BufferedOutputStream(stuckUnderlying, 16)
+        val clock1 = AtomicLong(1_000L)
+        val session1 = ClientSessionHandle(
+            sessionId = 90L,
+            output = buffered1,
+            outputLock = Any(),
+            closeTransport = { transport1Closes.incrementAndGet() },
+            nanoTimeProvider = { clock1.get() },
+        )
+        val replacementBytes = ByteArrayOutputStream()
+        val session2 = ClientSessionHandle(
+            sessionId = 91L,
+            output = replacementBytes,
+            outputLock = Any(),
+            closeTransport = {},
+        )
+
+        try {
+            val activeOwner = AtomicReference<ClientSessionHandle?>(session1)
+            val session1Done = async(Dispatchers.IO) {
+                sessionMutex.withLock {
+                    var helloWriteCompleted = false
+                    try {
+                        CamCraftStreamService.writeInitialHelloCancellable(
+                            scope = scope,
+                            session = session1,
+                        ) {
+                            buffered1.write(ByteArray(32) { 0x41 })
+                            buffered1.flush()
+                        }
+                        helloWriteCompleted = true
+                        false
+                    } catch (_: IOException) {
+                        true
+                    } finally {
+                        if (activeOwner.get() === session1) {
+                            activeOwner.set(null)
+                        }
+                        session1.close()
+                        CamCraftStreamService.closeTransportBeforeStreams(
+                            closeTransport = session1.closeTransport,
+                            inputStream = null,
+                            outputStream = buffered1,
+                            deferOutputClose = !helloWriteCompleted || session1.hasInFlightWrite,
+                            dispatchDeferredClose = { task -> cleanupExecutor.execute(task) },
+                        )
+                    }
+                }
+            }
+
+            assertTrue(writerEntered.await(2, TimeUnit.SECONDS))
+            clock1.set(1_000L + 3_000_000_000L)
+
+            // Watchdog invalidates and closes stalled session1 without acquiring session1.outputLock.
+            assertTrue(
+                CamCraftStreamService.checkAndCloseStalledSessionWrite(
+                    session = session1,
+                    nowNs = clock1.get(),
+                    timeoutNs = 2_500_000_000L,
+                    beforeClose = {
+                        if (activeOwner.get() === session1) {
+                            activeOwner.set(null)
+                        }
+                    },
+                ),
+            )
+            assertTrue(withTimeout(2_000L) { session1Done.await() })
+            assertEquals(2, transport1Closes.get())
+            assertNull(activeOwner.get())
+
+            // Even while session1's blocked writer thread has NOT returned, replacement session2
+            // acquires sessionMutex and completes its own CONTROL_HELLO write cleanly.
+            val replacementSucceeded = withTimeout(2_000L) {
+                sessionMutex.withLock {
+                    activeOwner.set(session2)
+                    CamCraftStreamService.writeInitialHelloCancellable(
+                        scope = scope,
+                        session = session2,
+                    ) {
+                        replacementBytes.write(byteArrayOf(0x43, 0x43, 0x46, 0x54))
+                        replacementBytes.flush()
+                    }
+                    true
+                }
+            }
+            assertTrue(replacementSucceeded)
+            assertEquals(4, replacementBytes.size())
+            assertTrue(session2 === activeOwner.get())
+        } finally {
+            releaseStuckWriter.countDown()
+            session1.close()
+            session2.close()
+            scope.cancel()
+            cleanupExecutor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun streamServiceStateSeparatesSessionLivenessFromVideoPipelineHealth() {
+        val stopped = StreamServiceState(status = StreamConnectionStatus.STOPPED)
+        assertFalse(stopped.isServerActive)
+        assertFalse(stopped.isMicControlAvailable)
+
+        val listening = StreamServiceState(
+            status = StreamConnectionStatus.LISTENING,
+            localIpAddress = "192.168.1.25",
+            hasActiveSession = false,
+        )
+        assertTrue(listening.isServerActive)
+        assertTrue(listening.isMicControlAvailable)
+
+        val bindError = StreamServiceState(
+            status = StreamConnectionStatus.ERROR,
+            clientAddress = null,
+            hasActiveSession = false,
+            errorMessage = "Address already in use",
+        )
+        assertFalse(bindError.isServerActive)
+        assertFalse(bindError.isMicControlAvailable)
+
+        val stateFlow = MutableStateFlow(
+            StreamServiceState(
+                status = StreamConnectionStatus.CONNECTED,
+                clientAddress = "192.168.1.99",
+                hasActiveSession = true,
+                isVideoPipelineHealthy = true,
+                activeState = defaultActiveCameraState(),
+            ),
+        )
+        val lock = Any()
+        val coordinator = ControlStateAckCoordinator(stateFlow) { }
+        val session = ClientSessionHandle(95L, ByteArrayOutputStream(), Any(), {})
+        coordinator.setActiveSession(session)
+        val configId = coordinator.runIfSessionActive(session, advanceCameraConfig = true) { _, _, id -> id }!!
+
+        assertTrue(
+            CamCraftStreamService.applyVideoPipelineFailureIfCurrentConfig(
+                lock = lock,
+                coordinator = coordinator,
+                expectedSessionId = 95L,
+                expectedCameraConfigId = configId,
+                expectedCameraId = "0",
+                isStopping = { false },
+                isSessionActive = { true },
+                reason = "Bind failed",
+                serviceState = stateFlow,
+                onUpdateNotification = {},
+            ),
+        )
+        assertEquals(StreamConnectionStatus.ERROR, stateFlow.value.status)
+        assertTrue(stateFlow.value.hasActiveSession)
+        assertFalse(stateFlow.value.isVideoPipelineHealthy)
+        assertTrue(stateFlow.value.isServerActive)
+        assertTrue(stateFlow.value.isMicControlAvailable)
+
+        val bindFailurePostSession = MutableStateFlow(stateFlow.value)
+        assertTrue(
+            CamCraftStreamService.applyPostSessionStateWithOwnership(
+                ownershipLock = Any(),
+                isOwned = { true },
+                clearSessionOwnership = {},
+                outcome = CamCraftStreamService.Companion.PostSessionStatus.ERROR,
+                listenPort = 9876,
+                refreshedIp = null,
+                serverBindError = "Port bind failed",
+                serviceState = bindFailurePostSession,
+            ),
+        )
+        assertEquals(StreamConnectionStatus.ERROR, bindFailurePostSession.value.status)
+        assertFalse(bindFailurePostSession.value.hasActiveSession)
+        assertTrue(bindFailurePostSession.value.isVideoPipelineHealthy)
+        assertFalse(bindFailurePostSession.value.isServerActive)
+        assertFalse(bindFailurePostSession.value.isMicControlAvailable)
+    }
+
+    @Test
+    fun restoreConnectedStatusIfRecoveringIsAtomicWithOrderLockAgainstConfigCommits() {
+        val lifecycleLock = Any()
+        val stateFlow = MutableStateFlow(
+            StreamServiceState(
+                status = StreamConnectionStatus.ERROR,
+                clientAddress = "USB Direct",
+                hasActiveSession = true,
+                isVideoPipelineHealthy = false,
+                activeState = defaultActiveCameraState(),
+                errorMessage = "Bind failed",
+            ),
+        )
+        val coordinator = ControlStateAckCoordinator(stateFlow) { }
+        val session = ClientSessionHandle(99L, ByteArrayOutputStream(), Any(), {})
+        coordinator.setActiveSession(session)
+        val config1 = coordinator.runIfSessionActive(session, advanceCameraConfig = true) { _, _, id -> id }!!
+
+        // 1. Commit path never acquires lifecycleLock (orderLock commits immediately even while lifecycleLock is held).
+        val commitWhileLifecycleHeld = AtomicBoolean(false)
+        val workerExecutor = Executors.newSingleThreadExecutor { r ->
+            Thread(r, "test-config-commit").apply { isDaemon = true }
+        }
+        try {
+            synchronized(lifecycleLock) {
+                val f = workerExecutor.submit {
+                    coordinator.updateIfSessionOwned(
+                        expectedSessionId = 99L,
+                        shouldAdvanceCameraConfig = { _, _ -> false },
+                    ) { cur -> cur.copy(bitrateKbps = 9_000) }
+                    commitWhileLifecycleHeld.set(true)
+                }
+                f.get(2, TimeUnit.SECONDS)
+                assertTrue(commitWhileLifecycleHeld.get())
+            }
+            assertEquals(config1, coordinator.currentCameraConfigId())
+
+            // 2. Concurrent config commit attempted between check and write in restoreConnectedStatusIfRecovering
+            //    is excluded by orderLock until the ERROR-clearing write completes.
+            val hookEntered = CountDownLatch(1)
+            val commitStarted = CountDownLatch(1)
+            val commitFinished = CountDownLatch(1)
+            val commitFutureRef = AtomicReference<java.util.concurrent.Future<Long>?>()
+            val errorClearedBeforeCommit = AtomicBoolean(false)
+            val notifications = mutableListOf<String>()
+
+            assertTrue(
+                CamCraftStreamService.restoreConnectedStatusIfRecovering(
+                    lock = lifecycleLock,
+                    coordinator = coordinator,
+                    expectedSessionId = 99L,
+                    expectedCameraConfigId = config1,
+                    isStopping = { false },
+                    isSessionActive = { true },
+                    serviceState = stateFlow,
+                    onUpdateNotification = { notifications.add(it) },
+                    onAfterConfigCheckBeforeWriteForTest = {
+                        hookEntered.countDown()
+                        val future = workerExecutor.submit<Long> {
+                            commitStarted.countDown()
+                            coordinator.updateIfSessionOwned(
+                                expectedSessionId = 99L,
+                                shouldAdvanceCameraConfig = { _, _ -> true },
+                            ) { cur ->
+                                cur.copy(cameraId = "1")
+                            }
+                            errorClearedBeforeCommit.set(
+                                stateFlow.value.status == StreamConnectionStatus.CONNECTED &&
+                                    stateFlow.value.errorMessage == null,
+                            )
+                            commitFinished.countDown()
+                            coordinator.currentCameraConfigId()
+                        }
+                        commitFutureRef.set(future)
+                        assertTrue(commitStarted.await(2, TimeUnit.SECONDS))
+                        // orderLock prevents concurrent config commit from interleaving between check and write.
+                        assertFalse(commitFinished.await(75, TimeUnit.MILLISECONDS))
+                    },
+                ),
+            )
+            assertTrue(hookEntered.await(1, TimeUnit.SECONDS))
+            val config2 = commitFutureRef.get()!!.get(2, TimeUnit.SECONDS)
+            assertTrue(errorClearedBeforeCommit.get())
+            assertTrue(config2 > config1)
+            assertEquals("1", stateFlow.value.activeState.cameraId)
+            assertEquals(StreamConnectionStatus.CONNECTED, stateFlow.value.status)
+            assertNull(stateFlow.value.errorMessage)
+            assertEquals(1, notifications.size)
+        } finally {
+            workerExecutor.shutdownNow()
+        }
     }
 }
