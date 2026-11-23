@@ -1585,4 +1585,225 @@ class CameraStreamManagerTest {
         }
         assertSame(unrelatedAssertion, propagatedAssertion)
     }
+
+    @Test
+    fun shouldApplyAutoFocusOnMainSkipsSupersededTapAndAllowsUnsupersededCommand() {
+        assertTrue(
+            CameraStreamManager.shouldApplyAutoFocusOnMain(
+                isReleased = false,
+                token = 4L,
+                latestAutoFocusToken = 4L,
+            ),
+        )
+        // Newer tap-to-focus advances latestAutoFocusToken, so queued Main runnable must skip.
+        assertFalse(
+            CameraStreamManager.shouldApplyAutoFocusOnMain(
+                isReleased = false,
+                token = 4L,
+                latestAutoFocusToken = 5L,
+            ),
+        )
+        assertFalse(
+            CameraStreamManager.shouldApplyAutoFocusOnMain(
+                isReleased = true,
+                token = 5L,
+                latestAutoFocusToken = 5L,
+            ),
+        )
+        assertFalse(
+            CameraStreamManager.shouldApplyAutoFocusOnMain(
+                isReleased = false,
+                token = 0L,
+                latestAutoFocusToken = 0L,
+            ),
+        )
+    }
+
+    @Test
+    fun isVideoPacketEligibleForWriteValidatesEncoderGenerationEvenWithSameSession() {
+        // Active/starting slot accepts VIDEO_CONFIG before first frame and subsequent frames.
+        assertTrue(
+            CameraStreamManager.isVideoPacketEligibleForWrite(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 10L,
+                packetSessionId = 10L,
+                currentGeneration = 3L,
+                packetGeneration = 3L,
+                currentSlotSessionId = 10L,
+                currentSlotGeneration = 3L,
+                currentSlotRetiring = false,
+            ),
+        )
+
+        // Retired encoder from earlier generation within the SAME session is rejected.
+        assertFalse(
+            CameraStreamManager.isVideoPacketEligibleForWrite(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 10L,
+                packetSessionId = 10L,
+                currentGeneration = 4L,
+                packetGeneration = 3L,
+                currentSlotSessionId = 10L,
+                currentSlotGeneration = 4L,
+                currentSlotRetiring = false,
+            ),
+        )
+
+        // Retiring slot or cleared slot rejects packets even if pipelineGeneration hasn't bumped yet.
+        assertFalse(
+            CameraStreamManager.isVideoPacketEligibleForWrite(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 10L,
+                packetSessionId = 10L,
+                currentGeneration = 3L,
+                packetGeneration = 3L,
+                currentSlotSessionId = 10L,
+                currentSlotGeneration = 3L,
+                currentSlotRetiring = true,
+            ),
+        )
+        assertFalse(
+            CameraStreamManager.isVideoPacketEligibleForWrite(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 10L,
+                packetSessionId = 10L,
+                currentGeneration = 3L,
+                packetGeneration = 3L,
+                currentSlotSessionId = null,
+                currentSlotGeneration = null,
+                currentSlotRetiring = true,
+            ),
+        )
+
+        // Session mismatch or stopped/released manager is rejected.
+        assertFalse(
+            CameraStreamManager.isVideoPacketEligibleForWrite(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 11L,
+                packetSessionId = 10L,
+                currentGeneration = 3L,
+                packetGeneration = 3L,
+                currentSlotSessionId = 11L,
+                currentSlotGeneration = 3L,
+                currentSlotRetiring = false,
+            ),
+        )
+        assertFalse(
+            CameraStreamManager.isVideoPacketEligibleForWrite(
+                isReleased = false,
+                isStreaming = false,
+                activeSessionId = 10L,
+                packetSessionId = 10L,
+                currentGeneration = 3L,
+                packetGeneration = 3L,
+                currentSlotSessionId = 10L,
+                currentSlotGeneration = 3L,
+                currentSlotRetiring = false,
+            ),
+        )
+    }
+
+    @Test
+    fun adjustedSlotRejectStaleReportsTerminalFailureEvenAfterNegotiatedResolutionReported() {
+        val adjustedSlot = ActiveEncoderSlot(
+            sessionId = 7L,
+            generation = 2L,
+            encoder = null,
+            width = 1280,
+            height = 720,
+            fps = 60,
+            cameraId = "0",
+            surfaceTracker = EncoderSurfaceRetirementTracker(),
+            cameraConfigId = 4L,
+            geometryRequestSeq = 2L,
+            pendingResolutionAdjustment = true,
+            fallbackWidth = 1920,
+            fallbackHeight = 1080,
+            resolutionAdjusted = true,
+        )
+
+        // First frame committed negotiated dimensions, claiming markResolutionAdjustmentReported().
+        assertTrue(adjustedSlot.markResolutionAdjustmentReported())
+        adjustedSlot.negotiatedDimensionsCommitted = true
+        assertFalse(adjustedSlot.markResolutionAdjustmentReported())
+
+        // Later mismatched replacement request still rejects without rebinding, AND triggers failure path.
+        assertEquals(
+            CameraStreamManager.SurfaceResolutionDecision.REJECT_STALE,
+            CameraStreamManager.evaluateSurfaceRequestResolution(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 7L,
+                snapshotSessionId = 7L,
+                activeSlotMatchesSnapshot = true,
+                snapshotRetiring = adjustedSlot.isRetiring,
+                surfaceValid = true,
+                snapshotWidth = adjustedSlot.width,
+                snapshotHeight = adjustedSlot.height,
+                requestWidth = 640,
+                requestHeight = 480,
+                resolutionAlreadyAdjusted = adjustedSlot.resolutionAdjusted,
+            ),
+        )
+        assertTrue(
+            CameraStreamManager.shouldReportResolutionNegotiationFailure(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 7L,
+                snapshotSessionId = 7L,
+                activeSlotMatchesSnapshot = true,
+                snapshotRetiring = adjustedSlot.isRetiring,
+                surfaceValid = true,
+                pendingResolutionAdjustment = adjustedSlot.pendingResolutionAdjustment,
+                snapshotWidth = adjustedSlot.width,
+                snapshotHeight = adjustedSlot.height,
+                requestWidth = 640,
+                requestHeight = 480,
+            ),
+        )
+        assertTrue(
+            CameraStreamManager.shouldReportCurrentSlotPipelineFailure(
+                isReleased = false,
+                isStreaming = true,
+                activeSessionId = 7L,
+                snapshotSessionId = 7L,
+                activeSlotMatchesSnapshot = true,
+                snapshotRetiring = adjustedSlot.isRetiring,
+                slotGeometryRequestSeq = adjustedSlot.geometryRequestSeq,
+                latestGeometryRequestSeq = 2L,
+            ),
+        )
+        assertTrue(adjustedSlot.markTerminalFailureReported())
+        assertTrue(adjustedSlot.isRetiring)
+        assertTrue(adjustedSlot.isTerminalFailureReported)
+        assertTrue(adjustedSlot.negotiatedDimensionsCommitted)
+        assertFalse(adjustedSlot.markTerminalFailureReported())
+
+        // If adjustment outcome was NOT yet reported when REJECT_STALE fires, terminal failure also claims it.
+        val unconfirmedAdjustedSlot = ActiveEncoderSlot(
+            sessionId = 7L,
+            generation = 3L,
+            encoder = null,
+            width = 1280,
+            height = 720,
+            fps = 60,
+            cameraId = "0",
+            surfaceTracker = EncoderSurfaceRetirementTracker(),
+            cameraConfigId = 4L,
+            geometryRequestSeq = 3L,
+            pendingResolutionAdjustment = true,
+            fallbackWidth = 1920,
+            fallbackHeight = 1080,
+            resolutionAdjusted = true,
+        )
+        assertTrue(unconfirmedAdjustedSlot.markTerminalFailureReported())
+        assertTrue(unconfirmedAdjustedSlot.isResolutionAdjustmentReported())
+        assertFalse(unconfirmedAdjustedSlot.hasPendingResolutionAdjustmentUnreported())
+        assertFalse(unconfirmedAdjustedSlot.negotiatedDimensionsCommitted)
+    }
 }

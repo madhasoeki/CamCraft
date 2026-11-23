@@ -3,6 +3,8 @@ package org.artcraft.camcraft.network
 import java.io.BufferedOutputStream
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.Closeable
+import java.io.DataInputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
@@ -15,6 +17,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -30,9 +33,11 @@ import kotlinx.coroutines.withTimeout
 import org.artcraft.camcraft.camera.CameraStreamManager
 import org.artcraft.camcraft.protocol.CameraInfo
 import org.artcraft.camcraft.protocol.CcftFlags
+import org.artcraft.camcraft.protocol.CcftPacket
 import org.artcraft.camcraft.protocol.CcftProtocolConstants
 import org.artcraft.camcraft.protocol.ControlAck
 import org.artcraft.camcraft.protocol.ControlCmd
+import org.artcraft.camcraft.protocol.PacketType
 import org.artcraft.camcraft.protocol.ResolutionOption
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -125,39 +130,160 @@ class CamCraftStreamServiceTest {
 
     @Test
     fun staleStreamWriteErrorDoesNotCloseNewActiveSession() {
-        val oldStream = ByteArrayOutputStream()
-        val newStream = ByteArrayOutputStream()
-        val newCloserInvocations = AtomicInteger(0)
-        val newSocketCloses = AtomicInteger(0)
-        val newCloser: () -> Unit = { newCloserInvocations.incrementAndGet() }
-        val newSocket = java.io.Closeable { newSocketCloses.incrementAndGet() }
+        val stateFlow = MutableStateFlow(StreamServiceState())
+        val coordinator = ControlStateAckCoordinator(stateFlow) {}
+        val activeSessionRef = AtomicReference<ClientSessionHandle?>(null)
+        val lifecycleLock = Any()
 
-        var activeStreamRef: java.io.OutputStream? = newStream
-        val (staleCloser, staleSocket) = CamCraftStreamService.takeTeardownTargetsForFailedStream(
-            activeStream = activeStreamRef,
-            failedStream = oldStream,
-            activeCloser = newCloser,
-            activeSocket = newSocket,
-            clearActiveStream = { activeStreamRef = null },
-        )
-        assertNull(staleCloser)
-        assertNull(staleSocket)
-        assertEquals(0, newCloserInvocations.get())
-        assertEquals(0, newSocketCloses.get())
-        assertEquals(newStream, activeStreamRef)
+        val writeEntered = CountDownLatch(1)
+        val releaseFailure = CountDownLatch(1)
+        val sessionACloses = AtomicInteger(0)
+        val sessionBCloses = AtomicInteger(0)
 
-        val (matchedCloser, matchedSocket) = CamCraftStreamService.takeTeardownTargetsForFailedStream(
-            activeStream = activeStreamRef,
-            failedStream = newStream,
-            activeCloser = newCloser,
-            activeSocket = newSocket,
-            clearActiveStream = { activeStreamRef = null },
+        val failingOutputA = object : OutputStream() {
+            override fun write(b: Int) {
+                writeEntered.countDown()
+                releaseFailure.await(2, TimeUnit.SECONDS)
+                throw IOException("session A broken pipe")
+            }
+
+            override fun write(b: ByteArray, off: Int, len: Int) {
+                writeEntered.countDown()
+                releaseFailure.await(2, TimeUnit.SECONDS)
+                throw IOException("session A broken pipe")
+            }
+        }
+        val outputB = ByteArrayOutputStream()
+
+        val sessionA = ClientSessionHandle(
+            sessionId = 1L,
+            output = failingOutputA,
+            outputLock = Any(),
+            closeTransport = { sessionACloses.incrementAndGet() },
         )
-        matchedCloser?.invoke()
-        matchedSocket?.close()
-        assertNull(activeStreamRef)
-        assertEquals(1, newCloserInvocations.get())
-        assertEquals(1, newSocketCloses.get())
+        val sessionB = ClientSessionHandle(
+            sessionId = 2L,
+            output = outputB,
+            outputLock = Any(),
+            closeTransport = { sessionBCloses.incrementAndGet() },
+        )
+
+        synchronized(lifecycleLock) {
+            activeSessionRef.set(sessionA)
+            coordinator.setActiveSession(sessionA)
+        }
+
+        val worker = Executors.newSingleThreadExecutor { r ->
+            Thread(r, "test-stale-stream-write").apply { isDaemon = true }
+        }
+        try {
+            val writeResultFuture = worker.submit<Boolean> {
+                CamCraftStreamService.sendStreamPacketForSession(
+                    activeSessionProvider = { activeSessionRef.get() },
+                    clearActiveSessionIfCurrent = { failed ->
+                        synchronized(lifecycleLock) {
+                            if (activeSessionRef.get() === failed) {
+                                activeSessionRef.set(null)
+                            }
+                            coordinator.clearActiveSessionIfCurrent(failed)
+                        }
+                    },
+                    sessionId = 1L,
+                    packetType = PacketType.VIDEO_FRAME,
+                    flags = CcftFlags.KEYFRAME,
+                    ptsUs = 1_000L,
+                    payload = byteArrayOf(0, 0, 0, 1, 0x65),
+                    offset = 0,
+                    length = 5,
+                    tagLabel = "video",
+                )
+            }
+
+            assertTrue(writeEntered.await(2, TimeUnit.SECONDS))
+
+            // Switch ownership to session B while session A's write is in flight.
+            synchronized(lifecycleLock) {
+                activeSessionRef.set(sessionB)
+                coordinator.setActiveSession(sessionB)
+            }
+
+            // Unblock A's write so it fails with IOException after ownership changed to B.
+            releaseFailure.countDown()
+            assertFalse(writeResultFuture.get(2, TimeUnit.SECONDS))
+
+            assertTrue(sessionA.isClosed)
+            assertEquals(1, sessionACloses.get())
+            assertFalse(sessionB.isClosed)
+            assertEquals(0, sessionBCloses.get())
+            assertTrue(activeSessionRef.get() === sessionB)
+            assertTrue(coordinator.currentOwnedSession() === sessionB)
+
+            // Session B continues writing packets normally.
+            assertTrue(
+                CamCraftStreamService.sendStreamPacketForSession(
+                    activeSessionProvider = { activeSessionRef.get() },
+                    clearActiveSessionIfCurrent = { failed ->
+                        synchronized(lifecycleLock) {
+                            if (activeSessionRef.get() === failed) {
+                                activeSessionRef.set(null)
+                            }
+                            coordinator.clearActiveSessionIfCurrent(failed)
+                        }
+                    },
+                    sessionId = 2L,
+                    packetType = PacketType.VIDEO_FRAME,
+                    flags = CcftFlags.NONE,
+                    ptsUs = 2_000L,
+                    payload = byteArrayOf(1, 2, 3),
+                    offset = 0,
+                    length = 3,
+                    tagLabel = "video",
+                ),
+            )
+            assertTrue(outputB.size() > CcftProtocolConstants.HEADER_SIZE_BYTES)
+
+            // When current owner session B fails with IOException, B closes and ownership clears.
+            val failingSessionB = ClientSessionHandle(
+                sessionId = 2L,
+                output = object : OutputStream() {
+                    override fun write(b: Int) = throw IOException("session B broken pipe")
+                    override fun write(b: ByteArray, off: Int, len: Int) = throw IOException("session B broken pipe")
+                },
+                outputLock = Any(),
+                closeTransport = { sessionBCloses.incrementAndGet() },
+            )
+            synchronized(lifecycleLock) {
+                activeSessionRef.set(failingSessionB)
+                coordinator.setActiveSession(failingSessionB)
+            }
+            assertFalse(
+                CamCraftStreamService.sendStreamPacketForSession(
+                    activeSessionProvider = { activeSessionRef.get() },
+                    clearActiveSessionIfCurrent = { failed ->
+                        synchronized(lifecycleLock) {
+                            if (activeSessionRef.get() === failed) {
+                                activeSessionRef.set(null)
+                            }
+                            coordinator.clearActiveSessionIfCurrent(failed)
+                        }
+                    },
+                    sessionId = 2L,
+                    packetType = PacketType.VIDEO_FRAME,
+                    flags = CcftFlags.NONE,
+                    ptsUs = 3_000L,
+                    payload = byteArrayOf(4, 5),
+                    offset = 0,
+                    length = 2,
+                    tagLabel = "video",
+                ),
+            )
+            assertTrue(failingSessionB.isClosed)
+            assertEquals(1, sessionBCloses.get())
+            assertNull(activeSessionRef.get())
+            assertNull(coordinator.currentOwnedSession())
+        } finally {
+            worker.shutdownNow()
+        }
     }
 
     @Test
@@ -2066,6 +2192,520 @@ class CamCraftStreamServiceTest {
             assertEquals(1, notifications.size)
         } finally {
             workerExecutor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun sendStreamPacketValidatesEncoderGenerationUnderOutputLockBeforeConfigAndFrame() {
+        val output = ByteArrayOutputStream()
+        val sessionCloses = AtomicInteger(0)
+        val session = ClientSessionHandle(
+            sessionId = 42L,
+            output = output,
+            outputLock = Any(),
+            closeTransport = { sessionCloses.incrementAndGet() },
+        )
+        val currentGeneration = AtomicLong(2L)
+        val configPayload = byteArrayOf(0, 0, 0, 1, 0x67, 0x42)
+        val framePayload = byteArrayOf(0, 0, 0, 1, 0x65, 0x88.toByte())
+
+        // Retired encoder (generation=1) in the SAME session is rejected under outputLock without closing session.
+        val retiredCheckHeldLock = AtomicBoolean(false)
+        assertFalse(
+            CamCraftStreamService.sendStreamPacketForSession(
+                activeSessionProvider = { session },
+                clearActiveSessionIfCurrent = {},
+                sessionId = 42L,
+                packetType = PacketType.VIDEO_CONFIG,
+                flags = CcftFlags.NONE,
+                ptsUs = 100L,
+                payload = configPayload,
+                offset = 0,
+                length = configPayload.size,
+                tagLabel = "video",
+                canWriteLocked = {
+                    retiredCheckHeldLock.set(Thread.holdsLock(session.outputLock))
+                    currentGeneration.get() == 1L
+                },
+            ),
+        )
+        assertTrue(retiredCheckHeldLock.get())
+        assertFalse(
+            CamCraftStreamService.sendStreamPacketForSession(
+                activeSessionProvider = { session },
+                clearActiveSessionIfCurrent = {},
+                sessionId = 42L,
+                packetType = PacketType.VIDEO_FRAME,
+                flags = CcftFlags.KEYFRAME,
+                ptsUs = 200L,
+                payload = framePayload,
+                offset = 0,
+                length = framePayload.size,
+                tagLabel = "video",
+                canWriteLocked = { currentGeneration.get() == 1L },
+            ),
+        )
+        assertEquals(0, output.size())
+        assertFalse(session.isClosed)
+        assertEquals(0, sessionCloses.get())
+
+        // Current encoder (generation=2) writes VIDEO_CONFIG before first VIDEO_FRAME, then VIDEO_FRAME.
+        val configCheckHeldLock = AtomicBoolean(false)
+        assertTrue(
+            CamCraftStreamService.sendStreamPacketForSession(
+                activeSessionProvider = { session },
+                clearActiveSessionIfCurrent = {},
+                sessionId = 42L,
+                packetType = PacketType.VIDEO_CONFIG,
+                flags = CcftFlags.NONE,
+                ptsUs = 300L,
+                payload = configPayload,
+                offset = 0,
+                length = configPayload.size,
+                tagLabel = "video",
+                canWriteLocked = {
+                    configCheckHeldLock.set(Thread.holdsLock(session.outputLock))
+                    currentGeneration.get() == 2L
+                },
+            ),
+        )
+        assertTrue(configCheckHeldLock.get())
+        assertTrue(
+            CamCraftStreamService.sendStreamPacketForSession(
+                activeSessionProvider = { session },
+                clearActiveSessionIfCurrent = {},
+                sessionId = 42L,
+                packetType = PacketType.VIDEO_FRAME,
+                flags = CcftFlags.KEYFRAME,
+                ptsUs = 400L,
+                payload = framePayload,
+                offset = 0,
+                length = framePayload.size,
+                tagLabel = "video",
+                canWriteLocked = { currentGeneration.get() == 2L },
+            ),
+        )
+
+        val parsedInput = DataInputStream(ByteArrayInputStream(output.toByteArray()))
+        val firstPacket = CcftPacket.readPacket(parsedInput)
+        val secondPacket = CcftPacket.readPacket(parsedInput)
+        assertEquals(PacketType.VIDEO_CONFIG, firstPacket.header.packetType)
+        assertEquals(PacketType.VIDEO_FRAME, secondPacket.header.packetType)
+    }
+
+    @Test
+    fun postSessionListeningReconcilesMdnsAndNotificationForValidAndBlankIp() {
+        val registered = mutableListOf<Pair<Int, String>>()
+        val unregisterCount = AtomicInteger(0)
+
+        CamCraftStreamService.reconcileMdnsForListening(
+            refreshedIp = " 192.168.1.50 ",
+            listenPort = 9876,
+            onRegisterMdns = { port, ip -> registered.add(port to ip) },
+            onUnregisterMdns = { unregisterCount.incrementAndGet() },
+        )
+        assertEquals(listOf(9876 to "192.168.1.50"), registered)
+        assertEquals(0, unregisterCount.get())
+        assertEquals(
+            "Wi-Fi 192.168.1.50:9876 • Waiting for PC...",
+            CamCraftStreamService.buildListeningNotificationText("192.168.1.50", 9876),
+        )
+
+        CamCraftStreamService.reconcileMdnsForListening(
+            refreshedIp = "   ",
+            listenPort = 9876,
+            onRegisterMdns = { port, ip -> registered.add(port to ip) },
+            onUnregisterMdns = { unregisterCount.incrementAndGet() },
+        )
+        CamCraftStreamService.reconcileMdnsForListening(
+            refreshedIp = null,
+            listenPort = 9876,
+            onRegisterMdns = { port, ip -> registered.add(port to ip) },
+            onUnregisterMdns = { unregisterCount.incrementAndGet() },
+        )
+        assertEquals(1, registered.size)
+        assertEquals(2, unregisterCount.get())
+        assertEquals(
+            "Port 9876 • Waiting for PC...",
+            CamCraftStreamService.buildListeningNotificationText(null, 9876),
+        )
+    }
+
+    @Test
+    fun requestKeyframeIoExceptionClosesOnlyAffectedSessionWithoutFailureAck() {
+        val stateFlow = MutableStateFlow(StreamServiceState())
+        val coordinator = ControlStateAckCoordinator(stateFlow) {}
+        val activeSessionRef = AtomicReference<ClientSessionHandle?>(null)
+        val sessionACloses = AtomicInteger(0)
+        val sessionBCloses = AtomicInteger(0)
+
+        val sessionA = ClientSessionHandle(
+            sessionId = 10L,
+            output = object : OutputStream() {
+                override fun write(b: Int) = throw IOException("broken pipe during VIDEO_CONFIG")
+                override fun write(b: ByteArray, off: Int, len: Int) = throw IOException("broken pipe during VIDEO_CONFIG")
+            },
+            outputLock = Any(),
+            closeTransport = { sessionACloses.incrementAndGet() },
+        )
+        val sessionB = ClientSessionHandle(
+            sessionId = 11L,
+            output = ByteArrayOutputStream(),
+            outputLock = Any(),
+            closeTransport = { sessionBCloses.incrementAndGet() },
+        )
+        activeSessionRef.set(sessionA)
+        coordinator.setActiveSession(sessionA)
+
+        var keyframeRequested = false
+        var successAckEnqueued = false
+        val continueReading = CamCraftStreamService.handleRequestKeyframeCommand(
+            session = sessionA,
+            cachedConfigProvider = { byteArrayOf(0, 0, 0, 1, 0x67) },
+            clearActiveSessionIfCurrent = { failed ->
+                if (activeSessionRef.get() === failed) {
+                    activeSessionRef.set(null)
+                }
+                coordinator.clearActiveSessionIfCurrent(failed)
+            },
+            requestKeyFrame = { keyframeRequested = true },
+            enqueueSuccessAck = { successAckEnqueued = true },
+        )
+
+        assertFalse(continueReading)
+        assertTrue(sessionA.isClosed)
+        assertEquals(1, sessionACloses.get())
+        assertNull(activeSessionRef.get())
+        assertNull(coordinator.currentOwnedSession())
+        assertNull(sessionA.ackChannel.tryReceive().getOrNull())
+        assertFalse(keyframeRequested)
+        assertFalse(successAckEnqueued)
+
+        // When a newer session B is already active, failing session A's teardown leaves B untouched.
+        val staleSessionA = ClientSessionHandle(
+            sessionId = 10L,
+            output = object : OutputStream() {
+                override fun write(b: Int) = throw IOException("broken pipe")
+                override fun write(b: ByteArray, off: Int, len: Int) = throw IOException("broken pipe")
+            },
+            outputLock = Any(),
+            closeTransport = { sessionACloses.incrementAndGet() },
+        )
+        activeSessionRef.set(sessionB)
+        coordinator.setActiveSession(sessionB)
+        assertFalse(
+            CamCraftStreamService.handleRequestKeyframeCommand(
+                session = staleSessionA,
+                cachedConfigProvider = { byteArrayOf(0, 0, 0, 1, 0x67) },
+                clearActiveSessionIfCurrent = { failed ->
+                    if (activeSessionRef.get() === failed) {
+                        activeSessionRef.set(null)
+                    }
+                    coordinator.clearActiveSessionIfCurrent(failed)
+                },
+                requestKeyFrame = { keyframeRequested = true },
+                enqueueSuccessAck = { successAckEnqueued = true },
+            ),
+        )
+        assertTrue(staleSessionA.isClosed)
+        assertFalse(sessionB.isClosed)
+        assertEquals(0, sessionBCloses.get())
+        assertTrue(activeSessionRef.get() === sessionB)
+        assertTrue(coordinator.currentOwnedSession() === sessionB)
+
+        // Successful resend sends VIDEO_CONFIG, triggers keyframe, and enqueues success ACK.
+        val okBytes = sessionB.output as ByteArrayOutputStream
+        assertTrue(
+            CamCraftStreamService.handleRequestKeyframeCommand(
+                session = sessionB,
+                cachedConfigProvider = { byteArrayOf(0, 0, 0, 1, 0x67, 0x64) },
+                clearActiveSessionIfCurrent = {},
+                requestKeyFrame = { keyframeRequested = true },
+                enqueueSuccessAck = {
+                    coordinator.enqueueAckIfSessionOwned(expectedSessionId = sessionB.sessionId) { cur ->
+                        ControlAck.success(cur)
+                    }
+                },
+            ),
+        )
+        assertTrue(keyframeRequested)
+        val sentPacket = CcftPacket.readPacket(DataInputStream(ByteArrayInputStream(okBytes.toByteArray())))
+        assertEquals(PacketType.VIDEO_CONFIG, sentPacket.header.packetType)
+        val ack = sessionB.ackChannel.tryReceive().getOrNull()
+        assertNotNull(ack)
+        assertTrue(ack!!.ok)
+    }
+
+    @Test
+    fun helloSnapshotAndAckOwnershipAreAtomicAndGateAckWriterUntilHelloFlushes() = runBlocking {
+        val stateFlow = MutableStateFlow(StreamServiceState())
+        val coordinator = ControlStateAckCoordinator(stateFlow) {}
+        val wireStream = ByteArrayOutputStream()
+        val helloFlushStarted = CountDownLatch(1)
+        val allowHelloFlush = CountDownLatch(1)
+        val gatedOutput = object : OutputStream() {
+            override fun write(b: Int) {
+                wireStream.write(b)
+            }
+
+            override fun write(b: ByteArray, off: Int, len: Int) {
+                wireStream.write(b, off, len)
+            }
+
+            override fun flush() {
+                helloFlushStarted.countDown()
+                allowHelloFlush.await(2, TimeUnit.SECONDS)
+                wireStream.flush()
+            }
+        }
+        val session = ClientSessionHandle(
+            sessionId = 77L,
+            output = gatedOutput,
+            outputLock = Any(),
+            closeTransport = {},
+        )
+
+        // Pre-snapshot mutation happens before HELLO snapshot and ownership attachment.
+        coordinator.updateAndEnqueue { cur ->
+            cur.copy(torchOn = true, zoomRatio = 2.0f)
+        }
+        assertNull(session.ackChannel.tryReceive().getOrNull())
+
+        val capturedState = coordinator.attachSessionAndCaptureState(session)
+        assertNotNull(capturedState)
+        assertTrue(capturedState!!.torchOn)
+        assertEquals(2.0f, capturedState.zoomRatio, 0.001f)
+        assertNull(session.ackChannel.tryReceive().getOrNull())
+
+        // Closed session cannot acquire ownership.
+        val closedSession = ClientSessionHandle(
+            sessionId = 78L,
+            output = ByteArrayOutputStream(),
+            outputLock = Any(),
+            closeTransport = {},
+        ).apply { close() }
+        assertNull(coordinator.attachSessionAndCaptureState(closedSession))
+        assertTrue(coordinator.currentOwnedSession() === session)
+
+        // Flush CONTROL_HELLO using the captured snapshot while a concurrent mutation arrives mid-flush.
+        val hello = CamCraftStreamService.createDeviceHello(capturedState, cameras = emptyList())
+        val helloPacket = CcftPacket.controlHello(1_000L, hello)
+        val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        try {
+            val helloDeferred = async(Dispatchers.IO) {
+                CamCraftStreamService.writeInitialHelloCancellable(
+                    scope = scope,
+                    session = session,
+                ) {
+                    helloPacket.encodeTo(session.output, flush = true)
+                }
+            }
+            assertTrue(helloFlushStarted.await(2, TimeUnit.SECONDS))
+
+            // Post-snapshot update during HELLO flush must queue into session.ackChannel, not mutate HELLO.
+            coordinator.updateAndEnqueue { cur ->
+                cur.copy(audioMuted = true)
+            }
+            allowHelloFlush.countDown()
+            val helloJob = withTimeout(2_000L) { helloDeferred.await() }
+            helloJob.join()
+
+            // Only after HELLO finishes flushing do queued post-snapshot ACKs drain onto the wire.
+            val ackWriter = launch(Dispatchers.IO) {
+                while (true) {
+                    val ack = session.ackChannel.tryReceive().getOrNull() ?: break
+                    val ackPacket = CcftPacket.controlAck(2_000L, ack)
+                    synchronized(session.outputLock) {
+                        session.withTrackedWrite {
+                            ackPacket.encodeTo(session.output, flush = true)
+                        }
+                    }
+                }
+            }
+            ackWriter.join()
+
+            val reader = DataInputStream(ByteArrayInputStream(wireStream.toByteArray()))
+            val packet1 = CcftPacket.readPacket(reader)
+            val packet2 = CcftPacket.readPacket(reader)
+            assertEquals(PacketType.CONTROL_HELLO, packet1.header.packetType)
+            assertEquals(PacketType.CONTROL_ACK, packet2.header.packetType)
+
+            val decodedHello = packet1.decodeJson<org.artcraft.camcraft.protocol.ControlHello>()
+            assertTrue(decodedHello.activeState.torchOn)
+            assertEquals(2.0f, decodedHello.activeState.zoomRatio, 0.001f)
+            assertFalse(decodedHello.activeState.audioMuted)
+
+            val decodedAck = packet2.decodeJson<ControlAck>()
+            val ackState = decodedAck.activeState
+            assertNotNull(ackState)
+            assertTrue(ackState!!.audioMuted)
+            assertTrue(ackState.torchOn)
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun unknownCameraFailureAckUsesCoordinatorLockAndLatestStateWithoutMutatingConfig() {
+        val initial = defaultActiveCameraState().copy(cameraId = "0", zoomRatio = 1.5f)
+        val stateFlow = MutableStateFlow(StreamServiceState(activeState = initial))
+        val coordinator = ControlStateAckCoordinator(stateFlow) {}
+        val session = ClientSessionHandle(
+            sessionId = 55L,
+            output = ByteArrayOutputStream(),
+            outputLock = Any(),
+            closeTransport = {},
+        )
+        coordinator.setActiveSession(session)
+        coordinator.updateIfSessionOwned(
+            expectedSessionId = 55L,
+            advanceCameraConfigOnGeometryChange = false,
+            ackBuilder = { null },
+        ) { cur ->
+            cur.copy(torchOn = true)
+        }
+        val configIdBefore = coordinator.currentCameraConfigId()
+        val cameras = listOf(
+            CameraInfo.create(
+                id = "0",
+                facing = "back",
+                label = "Rear",
+                resolutions = listOf(ResolutionOption(1920, 1080, 60)),
+                maxZoom = 8.0f,
+                minEv = -4.0f,
+                maxEv = 4.0f,
+                hasFlash = true,
+            ),
+        )
+
+        assertTrue(
+            CamCraftStreamService.enqueueUnknownCameraFailureAck(
+                coordinator = coordinator,
+                expectedSessionId = 55L,
+                cameras = cameras,
+                cameraId = "99",
+            ),
+        )
+        assertEquals(configIdBefore, coordinator.currentCameraConfigId())
+        assertEquals("0", stateFlow.value.activeState.cameraId)
+        assertTrue(stateFlow.value.activeState.torchOn)
+
+        val ack = session.ackChannel.tryReceive().getOrNull()
+        assertNotNull(ack)
+        assertFalse(ack!!.ok)
+        assertTrue(ack.error!!.contains("99"))
+        val ackState = ack.activeState
+        assertNotNull(ackState)
+        assertTrue(ackState!!.torchOn)
+        assertEquals(1.5f, ackState.zoomRatio, 0.001f)
+
+        // Rejected when session no longer owns the coordinator.
+        coordinator.clearActiveSessionIfCurrent(session)
+        assertFalse(
+            CamCraftStreamService.enqueueUnknownCameraFailureAck(
+                coordinator = coordinator,
+                expectedSessionId = 55L,
+                cameras = cameras,
+                cameraId = "99",
+            ),
+        )
+    }
+
+    @Test
+    fun stopTransportsCaptureAndAsyncCloseNeverClosesReplacementStartTransports() = runBlocking {
+        val oldSessionCloses = AtomicInteger(0)
+        val oldTcpCloses = AtomicInteger(0)
+        val oldListenerCloses = AtomicInteger(0)
+        val oldUsbCloses = AtomicInteger(0)
+        val newSessionCloses = AtomicInteger(0)
+        val newTcpCloses = AtomicInteger(0)
+        val newListenerCloses = AtomicInteger(0)
+        val newUsbCloses = AtomicInteger(0)
+
+        val usbTracker = UsbSessionAttemptTracker<Closeable> { it.close() }
+        val oldUsbAttempt = usbTracker.beginAttempt()
+        val oldUsbDescriptor = Closeable { oldUsbCloses.incrementAndGet() }
+        assertTrue(usbTracker.attachDescriptor(oldUsbAttempt, oldUsbDescriptor))
+
+        val oldSession = ClientSessionHandle(
+            sessionId = 1L,
+            output = ByteArrayOutputStream(),
+            outputLock = Any(),
+            closeTransport = { oldSessionCloses.incrementAndGet() },
+        )
+        val oldTcp = Closeable { oldTcpCloses.incrementAndGet() }
+        val oldListener = Closeable { oldListenerCloses.incrementAndGet() }
+
+        val detachedUsb = usbTracker.detachActiveAttemptForClose()
+        val captured = CamCraftStreamService.Companion.CapturedStopTransports(
+            session = oldSession,
+            tcpSockets = listOf(oldTcp),
+            serverSocket = oldListener,
+            usbCloseAction = detachedUsb?.let { desc ->
+                { usbTracker.closeDetachedDescriptor(desc) }
+            },
+        )
+
+        // Capturing under lifecycleLock has not performed blocking close() calls synchronously yet.
+        assertFalse(oldSession.isClosed)
+        assertEquals(0, oldSessionCloses.get())
+        assertEquals(0, oldTcpCloses.get())
+        assertEquals(0, oldListenerCloses.get())
+        assertEquals(0, oldUsbCloses.get())
+
+        val dispatchEntered = CountDownLatch(1)
+        val allowDispatch = CountDownLatch(1)
+        val cleanupDone = CompletableDeferred<Unit>()
+        val ioExecutor = Executors.newSingleThreadExecutor { r ->
+            Thread(r, "test-stop-io").apply { isDaemon = true }
+        }
+        try {
+            CamCraftStreamService.dispatchCapturedStopTransports(
+                captured = captured,
+                completion = cleanupDone,
+                dispatchIo = { task ->
+                    ioExecutor.execute {
+                        dispatchEntered.countDown()
+                        allowDispatch.await(2, TimeUnit.SECONDS)
+                        task()
+                    }
+                },
+            )
+            assertTrue(dispatchEntered.await(2, TimeUnit.SECONDS))
+
+            // Simulate a later Start creating brand new transports while async stop cleanup is running.
+            val newUsbAttempt = usbTracker.beginAttempt()
+            val newUsbDescriptor = Closeable { newUsbCloses.incrementAndGet() }
+            assertTrue(usbTracker.attachDescriptor(newUsbAttempt, newUsbDescriptor))
+            val newSession = ClientSessionHandle(
+                sessionId = 2L,
+                output = ByteArrayOutputStream(),
+                outputLock = Any(),
+                closeTransport = { newSessionCloses.incrementAndGet() },
+            )
+            val newTcp = Closeable { newTcpCloses.incrementAndGet() }
+            val newListener = Closeable { newListenerCloses.incrementAndGet() }
+
+            allowDispatch.countDown()
+            withTimeout(2_000L) { cleanupDone.await() }
+
+            assertTrue(oldSession.isClosed)
+            assertEquals(1, oldSessionCloses.get())
+            assertEquals(1, oldTcpCloses.get())
+            assertEquals(1, oldListenerCloses.get())
+            assertEquals(1, oldUsbCloses.get())
+
+            assertFalse(newSession.isClosed)
+            assertEquals(0, newSessionCloses.get())
+            assertEquals(0, newTcpCloses.get())
+            assertEquals(0, newListenerCloses.get())
+            assertEquals(0, newUsbCloses.get())
+            assertTrue(usbTracker.isAttemptCurrent(newUsbAttempt, newUsbDescriptor))
+            newTcp.close()
+            newListener.close()
+            newSession.close()
+        } finally {
+            ioExecutor.shutdownNow()
         }
     }
 }

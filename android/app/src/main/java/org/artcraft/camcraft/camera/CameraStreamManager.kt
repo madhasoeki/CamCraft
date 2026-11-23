@@ -159,6 +159,7 @@ internal class ActiveEncoderSlot(
     val fallbackHeight: Int = height,
     @Volatile var isRetiring: Boolean = false,
     @Volatile var resolutionAdjusted: Boolean = false,
+    @Volatile var negotiatedDimensionsCommitted: Boolean = false,
 ) {
     private val releaseLock = Any()
     private val resolutionAdjustmentOutcomeReported = AtomicBoolean(false)
@@ -322,6 +323,7 @@ class CameraStreamManager(
     private val onVideoPacketSlice: (
         sessionId: Long,
         cameraConfigId: Long,
+        encoderGeneration: Long,
         packetType: PacketType,
         flags: Int,
         ptsUs: Long,
@@ -351,7 +353,7 @@ class CameraStreamManager(
         ) -> Unit,
     ) : this(
         context = context,
-        onVideoPacketSlice = { _, _, packetType, flags, ptsUs, payload, offset, length ->
+        onVideoPacketSlice = { _, _, _, packetType, flags, ptsUs, payload, offset, length ->
             onVideoPacketSlice(packetType, flags, ptsUs, payload, offset, length)
         },
         onResolutionAdjusted = null,
@@ -362,7 +364,7 @@ class CameraStreamManager(
         onVideoPacket: (packetType: PacketType, flags: Int, ptsUs: Long, payload: ByteArray) -> Unit,
     ) : this(
         context = context,
-        onVideoPacketSlice = { _, _, packetType, flags, ptsUs, payload, offset, length ->
+        onVideoPacketSlice = { _, _, _, packetType, flags, ptsUs, payload, offset, length ->
             val standalone = if (offset == 0 && length == payload.size) {
                 payload
             } else {
@@ -394,6 +396,7 @@ class CameraStreamManager(
     @Volatile
     private var activeCamera: Camera? = null
     private var activeSlot: ActiveEncoderSlot? = null
+    private var startingSlot: ActiveEncoderSlot? = null
     private var lastDetachedSlot: ActiveEncoderSlot? = null
     private val deferredRetireSlots = mutableSetOf<ActiveEncoderSlot>()
 
@@ -470,6 +473,24 @@ class CameraStreamManager(
             }
         } ?: return null
         return encoder.cachedConfig
+    }
+
+    internal fun isVideoPipelineCurrent(
+        sessionId: Long,
+        encoderGeneration: Long,
+    ): Boolean = synchronized(surfaceLock) {
+        val currentSlot = activeSlot ?: startingSlot
+        isVideoPacketEligibleForWrite(
+            isReleased = isReleased.get(),
+            isStreaming = isStreaming,
+            activeSessionId = activeSessionId,
+            packetSessionId = sessionId,
+            currentGeneration = pipelineGeneration.get(),
+            packetGeneration = encoderGeneration,
+            currentSlotSessionId = currentSlot?.sessionId,
+            currentSlotGeneration = currentSlot?.generation,
+            currentSlotRetiring = currentSlot?.isRetiring ?: true,
+        )
     }
 
     init {
@@ -561,6 +582,7 @@ class CameraStreamManager(
             pipelineHealthyOrStarting = true
             resolutionAdjustmentInFlight = false
             activeSlot?.isRetiring = true
+            startingSlot?.isRetiring = true
             generation = pipelineGeneration.incrementAndGet()
             zoomToken = if (zoomRatio != null) {
                 val token = ++nextControlToken
@@ -690,6 +712,7 @@ class CameraStreamManager(
             pipelineHealthyOrStarting = false
             resolutionAdjustmentInFlight = false
             activeSlot?.isRetiring = true
+            startingSlot?.isRetiring = true
             pipelineGeneration.incrementAndGet()
         }
 
@@ -1275,12 +1298,17 @@ class CameraStreamManager(
                 bitrateKbps = bitrateKbps,
                 onVideoPacketSlice = { packetType, flags, ptsUs, payload, offset, length ->
                     val capturedSlot = slotHolder.get() ?: return@H264SurfaceEncoder
-                    if (isReleased.get() || activeSessionId != sessionId || capturedSlot.isRetiring) {
+                    if (isReleased.get() ||
+                        activeSessionId != sessionId ||
+                        capturedSlot.isRetiring ||
+                        pipelineGeneration.get() != capturedSlot.generation
+                    ) {
                         return@H264SurfaceEncoder
                     }
                     onVideoPacketSlice(
                         sessionId,
                         capturedSlot.cameraConfigId,
+                        capturedSlot.generation,
                         packetType,
                         flags,
                         ptsUs,
@@ -1312,7 +1340,12 @@ class CameraStreamManager(
             slotHolder.set(newSlot)
 
             val canStart = synchronized(surfaceLock) {
-                isCurrentSessionGenerationLocked(sessionId, generation)
+                if (isCurrentSessionGenerationLocked(sessionId, generation)) {
+                    startingSlot = newSlot
+                    true
+                } else {
+                    false
+                }
             }
             if (!canStart) {
                 newSlot.isRetiring = true
@@ -1320,19 +1353,30 @@ class CameraStreamManager(
                 return
             }
 
-            startEncoderHandlingDrainThreadOom {
-                newEncoder.start()
-            }
-            val published = synchronized(surfaceLock) {
-                if (isCurrentSessionGenerationLocked(sessionId, generation)) {
-                    activeSlot = newSlot
-                    if (shouldApplyNegotiatedDimensionsToRequest(geometryRequestSeq, requestedGeometrySeq)) {
-                        pipelineHealthyOrStarting = true
+            val published = try {
+                startEncoderHandlingDrainThreadOom {
+                    newEncoder.start()
+                }
+                synchronized(surfaceLock) {
+                    if (startingSlot === newSlot) {
+                        startingSlot = null
                     }
-                    true
-                } else {
-                    newSlot.isRetiring = true
-                    false
+                    if (isCurrentSessionGenerationLocked(sessionId, generation)) {
+                        activeSlot = newSlot
+                        if (shouldApplyNegotiatedDimensionsToRequest(geometryRequestSeq, requestedGeometrySeq)) {
+                            pipelineHealthyOrStarting = true
+                        }
+                        true
+                    } else {
+                        newSlot.isRetiring = true
+                        false
+                    }
+                }
+            } finally {
+                synchronized(surfaceLock) {
+                    if (startingSlot === newSlot) {
+                        startingSlot = null
+                    }
                 }
             }
             if (!published) {
@@ -1484,6 +1528,7 @@ class CameraStreamManager(
         val eligible = isNegotiatedDimensionsCommitEligibleLocked(slot) &&
             slot.markResolutionAdjustmentReported()
         if (eligible) {
+            slot.negotiatedDimensionsCommitted = true
             requestedWidth = slot.width
             requestedHeight = slot.height
             resolutionAdjustmentInFlight = false
@@ -1596,6 +1641,7 @@ class CameraStreamManager(
                 val slotStillAttached = activeSlot === slot
                 val restoreDims = slotStillAttached &&
                     slot.pendingResolutionAdjustment &&
+                    !slot.negotiatedDimensionsCommitted &&
                     !isReleased.get() &&
                     isStreaming &&
                     activeSessionId == slot.sessionId &&
@@ -1843,8 +1889,8 @@ class CameraStreamManager(
                     SurfaceResolutionDecision.REJECT_STALE -> {
                         request.willNotProvideSurface()
                         if (reportUnacceptedNegotiation) {
-                            handleResolutionAdjustmentFailureIfPending(
-                                snapshot = snapshot,
+                            reportSlotPipelineFailure(
+                                slot = snapshot.slot,
                                 reason = "CameraX selected unaccepted replacement resolution ${selectedWidth}x$selectedHeight for ${snapshot.width}x${snapshot.height}",
                             )
                         }
@@ -2297,7 +2343,16 @@ class CameraStreamManager(
             if (!apply) return@executeOnEncoderExecutor
             targetAutoFocus = autofocus
             runOnMain {
-                if (!isReleased.get()) applyAutoFocusToActiveCamera(targetAutoFocus)
+                val applyOnMain = synchronized(surfaceLock) {
+                    shouldApplyAutoFocusOnMain(
+                        isReleased = isReleased.get(),
+                        token = token,
+                        latestAutoFocusToken = latestAutoFocusToken,
+                    )
+                }
+                if (applyOnMain) {
+                    applyAutoFocusToActiveCamera(autofocus)
+                }
             }
         }
     }
@@ -2360,6 +2415,7 @@ class CameraStreamManager(
             pipelineHealthyOrStarting = false
             resolutionAdjustmentInFlight = false
             activeSlot?.isRetiring = true
+            startingSlot?.isRetiring = true
             lastDetachedSlot = null
             pipelineGeneration.incrementAndGet()
         }
@@ -2866,6 +2922,32 @@ class CameraStreamManager(
             token: Long,
             latestToken: Long,
         ): Boolean = token > 0L && token == latestToken
+
+        internal fun shouldApplyAutoFocusOnMain(
+            isReleased: Boolean,
+            token: Long,
+            latestAutoFocusToken: Long,
+        ): Boolean = !isReleased && shouldApplyControlToken(token, latestAutoFocusToken)
+
+        internal fun isVideoPacketEligibleForWrite(
+            isReleased: Boolean,
+            isStreaming: Boolean,
+            activeSessionId: Long,
+            packetSessionId: Long,
+            currentGeneration: Long,
+            packetGeneration: Long,
+            currentSlotSessionId: Long?,
+            currentSlotGeneration: Long?,
+            currentSlotRetiring: Boolean,
+        ): Boolean = !isReleased &&
+            isStreaming &&
+            packetSessionId != 0L &&
+            activeSessionId == packetSessionId &&
+            packetGeneration != 0L &&
+            currentGeneration == packetGeneration &&
+            currentSlotSessionId == packetSessionId &&
+            currentSlotGeneration == packetGeneration &&
+            !currentSlotRetiring
 
         internal fun shouldAdvanceCameraConfigForRebind(
             isReleased: Boolean,

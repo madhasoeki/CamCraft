@@ -197,6 +197,7 @@ class CamCraftStreamService : Service() {
     private val isStopping = AtomicBoolean(false)
     private val lifecycleLock = Any()
     private var serverBindError: String? = null
+    private var pendingStopCleanup: CompletableDeferred<Unit>? = null
 
     private var cameraStreamManager: CameraStreamManager? = null
     private var mdnsAdvertiser: MdnsAdvertiser? = null
@@ -274,10 +275,11 @@ class CamCraftStreamService : Service() {
             _serviceState.update { it.copy(cameras = cameras) }
             val manager = CameraStreamManager(
                 context = appContext,
-                onVideoPacketSlice = { sessionId, cameraConfigId, packetType, flags, ptsUs, payload, offset, length ->
+                onVideoPacketSlice = { sessionId, cameraConfigId, encoderGeneration, packetType, flags, ptsUs, payload, offset, length ->
                     handleVideoPacketFromEncoder(
                         sessionId = sessionId,
                         cameraConfigId = cameraConfigId,
+                        encoderGeneration = encoderGeneration,
                         packetType = packetType,
                         flags = flags,
                         ptsUs = ptsUs,
@@ -313,11 +315,13 @@ class CamCraftStreamService : Service() {
         when (intent?.action) {
             ACTION_STOP -> {
                 Log.i(TAG, "Stop command received, shutting down CamCraft service")
-                synchronized(lifecycleLock) {
-                    stopServerLocked()
+                val (capturedTransports, cleanupDone) = synchronized(lifecycleLock) {
+                    val stopTargets = stopServerLocked()
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
+                    stopTargets
                 }
+                dispatchCapturedStopTransports(capturedTransports, cleanupDone)
             }
             ACTION_START_USB_ACCESSORY -> {
                 Log.i(TAG, "USB accessory start command received")
@@ -350,6 +354,8 @@ class CamCraftStreamService : Service() {
             ?: _serviceState.value.localIpAddress
         val audioToRelease: AudioStreamEngine?
         val cameraToRelease: CameraStreamManager?
+        var stopTargets: Pair<CapturedStopTransports, CompletableDeferred<Unit>?> =
+            CapturedStopTransports(null, emptyList(), null) to null
         synchronized(lifecycleLock) {
             isStopping.set(true)
             if (isUsbReceiverRegistered) {
@@ -368,8 +374,7 @@ class CamCraftStreamService : Service() {
                     wifiNetworkMonitor = null
                 },
                 stopServerAndTransport = {
-                    stopServerLocked()
-                    closeActiveUsbTransport()
+                    stopTargets = stopServerLocked()
                     activeTransformFlags = CcftFlags.NONE
                 },
                 resetServiceState = {
@@ -393,6 +398,7 @@ class CamCraftStreamService : Service() {
             cameraStreamManager = null
             pendingPreviewView = null
         }
+        dispatchCapturedStopTransports(stopTargets.first, stopTargets.second)
         audioToRelease?.release()
         cameraToRelease?.release()
         serviceScope.cancel()
@@ -425,20 +431,51 @@ class CamCraftStreamService : Service() {
         synchronized(lifecycleLock) {
             if (serverJob?.isActive == true) return
             isStopping.set(false)
+            val priorStopCleanup = pendingStopCleanup
 
             serverJob = serviceScope.launch {
+                val currentJob = coroutineContext[Job]
                 var socket: ServerSocket? = null
                 try {
+                    if (priorStopCleanup != null) {
+                        withTimeoutOrNull(1_000L) {
+                            priorStopCleanup.await()
+                        }
+                    }
+                    val canBind = synchronized(lifecycleLock) {
+                        !isStopping.get() && isActive && serverJob === currentJob
+                    }
+                    if (!canBind) {
+                        return@launch
+                    }
+
                     val port = CcftProtocolConstants.DEFAULT_PORT
-                    socket = ServerSocket(port).apply {
+                    val boundSocket = ServerSocket(port).apply {
                         reuseAddress = true
                     }
-                    serverSocket = socket
+                    socket = boundSocket
+                    val publishedSocket = synchronized(lifecycleLock) {
+                        if (isStopping.get() || !isActive || serverJob !== currentJob) {
+                            false
+                        } else {
+                            serverSocket = boundSocket
+                            true
+                        }
+                    }
+                    if (!publishedSocket) {
+                        return@launch
+                    }
 
                     val currentIp = LocalIpResolver.resolveLocalIpv4Address(this@CamCraftStreamService)
                     var becameListening = false
+                    var abortServer = false
                     synchronized(lifecycleLock) {
-                        if (isStopping.get()) {
+                        if (isStopping.get() ||
+                            !isActive ||
+                            serverJob !== currentJob ||
+                            serverSocket !== boundSocket
+                        ) {
+                            abortServer = true
                             return@synchronized
                         }
                         serverBindError = null
@@ -481,20 +518,26 @@ class CamCraftStreamService : Service() {
                             }
                         }
                     }
+                    if (abortServer) {
+                        return@launch
+                    }
                     Log.i(TAG, "CamCraft TCP Server listening on port $port (Wi-Fi IP: $currentIp)")
 
-                    while (isActive && !socket.isClosed) {
+                    while (isActive && !boundSocket.isClosed) {
                         try {
-                            val clientSocket = socket.accept()
+                            val clientSocket = boundSocket.accept()
                             handleClientConnection(clientSocket)
                         } catch (e: SocketException) {
-                            if (!socket.isClosed) {
+                            if (!boundSocket.isClosed) {
                                 Log.e(TAG, "Socket exception during accept", e)
                             }
                             break
                         }
                     }
                 } catch (e: Exception) {
+                    if (e is CancellationException) {
+                        throw e
+                    }
                     if (isStopping.get()) {
                         Log.i(TAG, "Server stopped")
                         return@launch
@@ -502,7 +545,7 @@ class CamCraftStreamService : Service() {
                     Log.e(TAG, "Fatal server socket exception", e)
                     val errMsg = e.message ?: "Server error"
                     synchronized(lifecycleLock) {
-                        if (isStopping.get()) return@synchronized
+                        if (isStopping.get() || serverJob !== currentJob) return@synchronized
                         mdnsAdvertiser?.unregister()
                         serverBindError = errMsg
                         if (activeSession == null) {
@@ -529,13 +572,16 @@ class CamCraftStreamService : Service() {
                         }
                     }
                 } finally {
-                    if (socket != null) {
-                        try {
-                            socket.close()
-                        } catch (_: IOException) {}
-                        if (serverSocket === socket) {
+                    val socketToClose = synchronized(lifecycleLock) {
+                        if (socket != null && serverSocket === socket) {
                             serverSocket = null
                         }
+                        socket
+                    }
+                    if (socketToClose != null) {
+                        try {
+                            socketToClose.close()
+                        } catch (_: IOException) {}
                     }
                 }
             }
@@ -551,40 +597,32 @@ class CamCraftStreamService : Service() {
         offset: Int,
         length: Int,
         tagLabel: String,
-    ): Boolean {
-        val session = resolveActiveSessionForPacket(activeSession, sessionId) ?: return false
-        return try {
-            synchronized(session.outputLock) {
-                session.withTrackedWrite {
-                    CcftPacket.writePacket(
-                        output = session.output,
-                        type = packetType,
-                        flags = flags,
-                        ptsUs = ptsUs,
-                        payload = payload,
-                        offset = offset,
-                        length = length,
-                        flush = true,
-                    )
-                }
-            }
-            true
-        } catch (e: IOException) {
-            Log.w(TAG, "Failed writing $tagLabel packet to client (session=$sessionId): ${e.message}")
+        canWriteLocked: () -> Boolean = { true },
+    ): Boolean = sendStreamPacketForSession(
+        activeSessionProvider = { activeSession },
+        clearActiveSessionIfCurrent = { failedSession ->
             synchronized(lifecycleLock) {
-                if (activeSession === session) {
+                if (activeSession === failedSession) {
                     activeSession = null
                 }
-                controlCoordinator.clearActiveSessionIfCurrent(session)
+                controlCoordinator.clearActiveSessionIfCurrent(failedSession)
             }
-            session.close()
-            false
-        }
-    }
+        },
+        sessionId = sessionId,
+        packetType = packetType,
+        flags = flags,
+        ptsUs = ptsUs,
+        payload = payload,
+        offset = offset,
+        length = length,
+        tagLabel = tagLabel,
+        canWriteLocked = canWriteLocked,
+    )
 
     private fun handleVideoPacketFromEncoder(
         sessionId: Long,
         cameraConfigId: Long,
+        encoderGeneration: Long,
         packetType: PacketType,
         flags: Int,
         ptsUs: Long,
@@ -597,7 +635,23 @@ class CamCraftStreamService : Service() {
         } else {
             flags
         }
-        if (sendStreamPacket(sessionId, packetType, outboundFlags, ptsUs, payload, offset, length, "video")) {
+        val sent = sendStreamPacket(
+            sessionId = sessionId,
+            packetType = packetType,
+            flags = outboundFlags,
+            ptsUs = ptsUs,
+            payload = payload,
+            offset = offset,
+            length = length,
+            tagLabel = "video",
+            canWriteLocked = {
+                cameraStreamManager?.isVideoPipelineCurrent(
+                    sessionId = sessionId,
+                    encoderGeneration = encoderGeneration,
+                ) == true
+            },
+        )
+        if (sent) {
             onFrameSent(sessionId, cameraConfigId, packetType)
         }
     }
@@ -862,10 +916,6 @@ class CamCraftStreamService : Service() {
         }
     }
 
-    private fun closeActiveUsbTransport() {
-        usbAttemptTracker.closeActiveAttempt()
-    }
-
     private suspend fun handleClientSession(
         clientLabel: String,
         inputStream: DataInputStream,
@@ -894,16 +944,20 @@ class CamCraftStreamService : Service() {
                         Dispatchers.IO.asExecutor().execute(closeTask)
                     },
                 )
+                val capturedSessionId = sessionHandle.sessionId
+                val appContext = applicationContext ?: this
+                val helloCameras = CameraEnumerator.enumerateCameras(appContext)
+                val sessionAudioEngine = AudioStreamEngine(appContext) { packetType, ptsUs, payload, length ->
+                    handleAudioPacketFromEngine(capturedSessionId, packetType, ptsUs, payload, length)
+                }
 
-                val initialActiveState = _serviceState.value.activeState
-                activeTransformFlags = computeTransformFlags(
-                    mirrorHorizontal = initialActiveState.mirrorHorizontal,
-                    rotationDeg = initialActiveState.rotationDeg,
-                )
-
+                var initialHelloState: ActiveCameraState? = null
                 val isCoroutineActive = currentCoroutineContext().isActive
                 val admitted = synchronized(lifecycleLock) {
-                    val canAdmit = !isStopping.get() && isCoroutineActive && isTransportStillCurrent()
+                    val canAdmit = !isStopping.get() &&
+                        isCoroutineActive &&
+                        !sessionHandle.isClosed &&
+                        isTransportStillCurrent()
                     if (!canAdmit) {
                         false
                     } else {
@@ -926,22 +980,37 @@ class CamCraftStreamService : Service() {
                             }
                         }
                         if (published) {
-                            controlCoordinator.setActiveSession(sessionHandle)
-                            publishConnectedNotificationFromCurrentState(expectedSessionId = sessionId)
+                            val capturedState = controlCoordinator.attachSessionAndCaptureState(sessionHandle)
+                            if (capturedState != null) {
+                                initialHelloState = capturedState
+                                activeTransformFlags = computeTransformFlags(
+                                    mirrorHorizontal = capturedState.mirrorHorizontal,
+                                    rotationDeg = capturedState.rotationDeg,
+                                )
+                                publishConnectedNotificationFromCurrentState(expectedSessionId = sessionId)
+                                true
+                            } else {
+                                synchronized(stateOwnershipLock) {
+                                    if (activeSession === sessionHandle) {
+                                        activeSession = null
+                                    }
+                                    if (activeStateOwnerSessionId == sessionId) {
+                                        activeStateOwnerSessionId = 0L
+                                    }
+                                }
+                                false
+                            }
+                        } else {
+                            false
                         }
-                        published
                     }
                 }
-                if (!admitted) {
+                val helloActiveState = initialHelloState
+                if (!admitted || helloActiveState == null) {
                     closeTransportBeforeStreams(closeTransport, inputStream, outputStream)
                     return
                 }
 
-                val capturedSessionId = sessionHandle.sessionId
-                val appContext = applicationContext ?: this
-                val sessionAudioEngine = AudioStreamEngine(appContext) { packetType, ptsUs, payload, length ->
-                    handleAudioPacketFromEngine(capturedSessionId, packetType, ptsUs, payload, length)
-                }
                 var ackWriterJob: Job? = null
                 var writeWatchdogJob: Job? = null
                 var helloWriterJob: Job? = null
@@ -979,7 +1048,7 @@ class CamCraftStreamService : Service() {
                     // 2. Send and flush CONTROL_HELLO (0x10) BEFORE starting ackWriterJob so any ACKs
                     //    queued during setup follow HELLO in order, while aborting promptly if the
                     //    watchdog closes the session due to a stalled transport write.
-                    val hello = createDeviceHello(_serviceState.value.activeState, this)
+                    val hello = createDeviceHello(helloActiveState, helloCameras)
                     val helloPacket = CcftPacket.controlHello(System.nanoTime() / 1_000L, hello)
                     helloWriterJob = writeInitialHelloCancellable(
                         scope = serviceScope,
@@ -1165,8 +1234,21 @@ class CamCraftStreamService : Service() {
                         )
                         if (ownedAndUpdated) {
                             when (outcome) {
-                                PostSessionStatus.LISTENING ->
+                                PostSessionStatus.LISTENING -> {
+                                    reconcileMdnsForListening(
+                                        refreshedIp = refreshedIp,
+                                        listenPort = listenPort,
+                                        onRegisterMdns = { port, ip ->
+                                            mdnsAdvertiser?.register(
+                                                deviceName = resolveDeviceName(),
+                                                port = port,
+                                                localIpAddress = ip,
+                                            )
+                                        },
+                                        onUnregisterMdns = { mdnsAdvertiser?.unregister() },
+                                    )
                                     updateNotification(buildListeningNotificationText(refreshedIp, listenPort))
+                                }
                                 PostSessionStatus.ERROR -> {
                                     val err = serverBindError ?: "Server error"
                                     updateNotification("Error: $err")
@@ -1220,7 +1302,9 @@ class CamCraftStreamService : Service() {
                     }
                 }
                 PacketType.CONTROL_CMD -> {
-                    handleControlCommand(packet, sessionHandle, clientLabel)
+                    if (!handleControlCommand(packet, sessionHandle, clientLabel)) {
+                        break
+                    }
                 }
                 PacketType.HEARTBEAT_PONG -> {
                     // Handled if bidirectional ping is ever enabled
@@ -1234,12 +1318,13 @@ class CamCraftStreamService : Service() {
 
     /**
      * Decodes and applies control commands from PC, then replies with CONTROL_ACK (0x12).
+     * Returns `false` if a transport write failure closed the session and the reader loop should stop.
      */
     private fun handleControlCommand(
         packet: CcftPacket,
         sessionHandle: ClientSessionHandle,
         clientLabel: String,
-    ) {
+    ): Boolean {
         try {
             val cmd = packet.decodeJson<ControlCmd>()
             Log.i(TAG, "Received CONTROL_CMD: $cmd")
@@ -1249,16 +1334,15 @@ class CamCraftStreamService : Service() {
                     val cameras = _serviceState.value.cameras.ifEmpty {
                         CameraEnumerator.enumerateCameras(this)
                     }
-                    val (targetCam, unknownAck) = validateConfigureStreamCamera(
-                        cameras = cameras,
-                        cameraId = cmd.cameraId,
-                        currentState = _serviceState.value.activeState,
-                    )
-                    if (unknownAck != null || targetCam == null) {
-                        sessionHandle.enqueueAck(
-                            unknownAck ?: ControlAck.failure("Unknown camera_id '${cmd.cameraId}'"),
+                    val targetCam = cameras.find { it.id == cmd.cameraId }
+                    if (targetCam == null) {
+                        enqueueUnknownCameraFailureAck(
+                            coordinator = controlCoordinator,
+                            expectedSessionId = sessionHandle.sessionId,
+                            cameras = cameras,
+                            cameraId = cmd.cameraId,
                         )
-                        return
+                        return true
                     }
 
                     controlCoordinator.updateIfSessionOwned(
@@ -1291,7 +1375,7 @@ class CamCraftStreamService : Service() {
                         },
                     ) { cur ->
                         applyConfigureStreamPatch(cur, cmd, targetCam)
-                    } ?: return
+                    } ?: return true
                     publishConnectedNotificationFromCurrentState(expectedSessionId = sessionHandle.sessionId)
                 }
                 is ControlCmd.SetCameraParams -> {
@@ -1310,7 +1394,7 @@ class CamCraftStreamService : Service() {
                         },
                     ) { cur ->
                         applyCameraParamsPatch(cur, cmd)
-                    } ?: return
+                    } ?: return true
                 }
                 is ControlCmd.SetAudioState -> {
                     if (cmd.enabled) {
@@ -1339,7 +1423,7 @@ class CamCraftStreamService : Service() {
                                     applyAudioStatePatch(cur, enabled = false, muted = cmd.muted)
                                 },
                             )
-                            return
+                            return true
                         }
                         val updatedAudio = controlCoordinator.updateIfSessionOwned(
                             expectedSessionId = sessionHandle.sessionId,
@@ -1370,28 +1454,30 @@ class CamCraftStreamService : Service() {
                     }
                 }
                 is ControlCmd.RequestKeyframe -> {
-                    synchronized(sessionHandle.outputLock) {
-                        cameraStreamManager?.cachedConfigForSession(sessionHandle.sessionId)?.let { spsPps ->
-                            sessionHandle.withTrackedWrite {
-                                CcftPacket.writePacket(
-                                    output = sessionHandle.output,
-                                    type = PacketType.VIDEO_CONFIG,
-                                    flags = CcftFlags.NONE,
-                                    ptsUs = System.nanoTime() / 1_000L,
-                                    payload = spsPps,
-                                    offset = 0,
-                                    length = spsPps.size,
-                                    flush = true,
-                                )
+                    return handleRequestKeyframeCommand(
+                        session = sessionHandle,
+                        cachedConfigProvider = {
+                            cameraStreamManager?.cachedConfigForSession(sessionHandle.sessionId)
+                        },
+                        clearActiveSessionIfCurrent = { failedSession ->
+                            synchronized(lifecycleLock) {
+                                if (activeSession === failedSession) {
+                                    activeSession = null
+                                }
+                                controlCoordinator.clearActiveSessionIfCurrent(failedSession)
                             }
-                        }
-                    }
-                    cameraStreamManager?.requestKeyFrame(sessionHandle.sessionId)
-                    controlCoordinator.enqueueAckIfSessionOwned(
-                        expectedSessionId = sessionHandle.sessionId,
-                    ) { cur ->
-                        ControlAck.success(cur)
-                    }
+                        },
+                        requestKeyFrame = {
+                            cameraStreamManager?.requestKeyFrame(sessionHandle.sessionId)
+                        },
+                        enqueueSuccessAck = {
+                            controlCoordinator.enqueueAckIfSessionOwned(
+                                expectedSessionId = sessionHandle.sessionId,
+                            ) { cur ->
+                                ControlAck.success(cur)
+                            }
+                        },
+                    )
                 }
             }
         } catch (e: Exception) {
@@ -1400,6 +1486,7 @@ class CamCraftStreamService : Service() {
                 ControlAck.failure(e.message ?: "Unknown control error"),
             )
         }
+        return true
     }
 
     fun switchCameraFromUi() {
@@ -1473,41 +1560,42 @@ class CamCraftStreamService : Service() {
     }
 
     private fun stopServer() {
-        synchronized(lifecycleLock) {
+        val (capturedTransports, cleanupDone) = synchronized(lifecycleLock) {
             stopServerLocked()
         }
+        dispatchCapturedStopTransports(capturedTransports, cleanupDone)
     }
 
-    private fun stopServerLocked() {
+    private fun stopServerLocked(): Pair<CapturedStopTransports, CompletableDeferred<Unit>?> {
         isStopping.set(true)
         mdnsAdvertiser?.unregister()
-        activeSession?.close()
+        val sessionToClose = activeSession
         activeSession = null
         controlCoordinator.setActiveSession(null)
-        closeActiveUsbTransport()
+        val detachedUsb = usbAttemptTracker.detachActiveAttemptForClose()
         val socketsToClose = activeTcpSockets.toList()
         activeTcpSockets.clear()
-        for (socket in socketsToClose) {
-            try {
-                socket.close()
-            } catch (_: IOException) {}
-        }
-        try {
-            serverSocket?.close()
-        } catch (_: IOException) {}
+        val listenerToClose = serverSocket
         serverSocket = null
         usbJob?.cancel()
         usbJob = null
         serverJob?.cancel()
         serverJob = null
-    }
-
-    private fun buildListeningNotificationText(ip: String?, port: Int): String =
-        if (!ip.isNullOrBlank()) {
-            "Wi-Fi $ip:$port • Waiting for PC..."
+        val captured = CapturedStopTransports(
+            session = sessionToClose,
+            tcpSockets = socketsToClose,
+            serverSocket = listenerToClose,
+            usbCloseAction = detachedUsb?.let { descriptor ->
+                { usbAttemptTracker.closeDetachedDescriptor(descriptor) }
+            },
+        )
+        val cleanupDone = if (captured.hasTargets()) {
+            CompletableDeferred<Unit>().also { pendingStopCleanup = it }
         } else {
-            "Port $port • Waiting for PC..."
+            null
         }
+        return captured to cleanupDone
+    }
 
     private fun createNotificationChannel() {
         val channel = NotificationChannel(
@@ -1649,6 +1737,13 @@ class CamCraftStreamService : Service() {
         ): String =
             "Connected ($clientIp) • ${activeState.width}x${activeState.height} @ ${activeState.fps} FPS"
 
+        internal fun buildListeningNotificationText(ip: String?, port: Int): String =
+            if (!ip.isNullOrBlank()) {
+                "Wi-Fi $ip:$port • Waiting for PC..."
+            } else {
+                "Port $port • Waiting for PC..."
+            }
+
         fun switchCamera() {
             activeInstance?.switchCameraFromUi()
         }
@@ -1688,14 +1783,18 @@ class CamCraftStreamService : Service() {
          */
         fun createDeviceHello(activeState: ActiveCameraState, context: Context? = null): ControlHello {
             val cameras = CameraEnumerator.enumerateCameras(context)
-
-            return ControlHello(
-                deviceName = resolveDeviceName(),
-                protocolVersion = CcftProtocolConstants.VERSION.toInt(),
-                cameras = cameras,
-                activeState = activeState,
-            )
+            return createDeviceHello(activeState, cameras)
         }
+
+        internal fun createDeviceHello(
+            activeState: ActiveCameraState,
+            cameras: List<CameraInfo>,
+        ): ControlHello = ControlHello(
+            deviceName = resolveDeviceName(),
+            protocolVersion = CcftProtocolConstants.VERSION.toInt(),
+            cameras = cameras,
+            activeState = activeState,
+        )
 
         internal enum class PostSessionStatus {
             LISTENING,
@@ -1709,18 +1808,175 @@ class CamCraftStreamService : Service() {
             IGNORE,
         }
 
-        internal inline fun <C, S> takeTeardownTargetsForFailedStream(
-            activeStream: OutputStream?,
-            failedStream: OutputStream,
-            activeCloser: C?,
-            activeSocket: S?,
-            clearActiveStream: () -> Unit,
-        ): Pair<C?, S?> {
-            if (activeStream !== failedStream) {
-                return null to null
+        internal data class CapturedStopTransports(
+            val session: ClientSessionHandle?,
+            val tcpSockets: List<Closeable>,
+            val serverSocket: Closeable?,
+            val usbCloseAction: (() -> Unit)? = null,
+        ) {
+            fun hasTargets(): Boolean =
+                session != null ||
+                    tcpSockets.isNotEmpty() ||
+                    serverSocket != null ||
+                    usbCloseAction != null
+
+            fun closeAll() {
+                session?.close()
+                usbCloseAction?.invoke()
+                for (socket in tcpSockets) {
+                    try {
+                        socket.close()
+                    } catch (_: IOException) {}
+                }
+                try {
+                    serverSocket?.close()
+                } catch (_: IOException) {}
             }
-            clearActiveStream()
-            return activeCloser to activeSocket
+        }
+
+        internal fun dispatchCapturedStopTransports(
+            captured: CapturedStopTransports,
+            completion: CompletableDeferred<Unit>? = null,
+            dispatchIo: (() -> Unit) -> Unit = { task ->
+                Dispatchers.IO.asExecutor().execute(task)
+            },
+        ) {
+            if (!captured.hasTargets()) {
+                completion?.complete(Unit)
+                return
+            }
+            dispatchIo {
+                try {
+                    captured.closeAll()
+                } finally {
+                    completion?.complete(Unit)
+                }
+            }
+        }
+
+        internal fun sendStreamPacketForSession(
+            activeSessionProvider: () -> ClientSessionHandle?,
+            clearActiveSessionIfCurrent: (ClientSessionHandle) -> Unit,
+            sessionId: Long,
+            packetType: PacketType,
+            flags: Int,
+            ptsUs: Long,
+            payload: ByteArray,
+            offset: Int,
+            length: Int,
+            tagLabel: String,
+            canWriteLocked: () -> Boolean = { true },
+            onWriteError: (IOException) -> Unit = { e ->
+                logWarnSafe("Failed writing $tagLabel packet to client (session=$sessionId): ${e.message}")
+            },
+        ): Boolean {
+            val session = resolveActiveSessionForPacket(activeSessionProvider(), sessionId) ?: return false
+            return try {
+                synchronized(session.outputLock) {
+                    if (resolveActiveSessionForPacket(activeSessionProvider(), sessionId) !== session ||
+                        session.isClosed ||
+                        !canWriteLocked()
+                    ) {
+                        false
+                    } else {
+                        session.withTrackedWrite {
+                            CcftPacket.writePacket(
+                                output = session.output,
+                                type = packetType,
+                                flags = flags,
+                                ptsUs = ptsUs,
+                                payload = payload,
+                                offset = offset,
+                                length = length,
+                                flush = true,
+                            )
+                        }
+                        true
+                    }
+                }
+            } catch (e: IOException) {
+                onWriteError(e)
+                clearActiveSessionIfCurrent(session)
+                session.close()
+                false
+            }
+        }
+
+        internal fun handleRequestKeyframeCommand(
+            session: ClientSessionHandle,
+            cachedConfigProvider: () -> ByteArray?,
+            clearActiveSessionIfCurrent: (ClientSessionHandle) -> Unit,
+            requestKeyFrame: () -> Unit,
+            enqueueSuccessAck: () -> Unit,
+            ptsUsProvider: () -> Long = { System.nanoTime() / 1_000L },
+            onWriteError: (IOException) -> Unit = { e ->
+                logWarnSafe(
+                    "Failed writing cached VIDEO_CONFIG for RequestKeyframe (session=${session.sessionId}): ${e.message}",
+                )
+            },
+        ): Boolean {
+            try {
+                synchronized(session.outputLock) {
+                    if (session.isClosed) {
+                        return false
+                    }
+                    cachedConfigProvider()?.let { spsPps ->
+                        session.withTrackedWrite {
+                            CcftPacket.writePacket(
+                                output = session.output,
+                                type = PacketType.VIDEO_CONFIG,
+                                flags = CcftFlags.NONE,
+                                ptsUs = ptsUsProvider(),
+                                payload = spsPps,
+                                offset = 0,
+                                length = spsPps.size,
+                                flush = true,
+                            )
+                        }
+                    }
+                }
+            } catch (e: IOException) {
+                onWriteError(e)
+                clearActiveSessionIfCurrent(session)
+                session.close()
+                return false
+            }
+            requestKeyFrame()
+            enqueueSuccessAck()
+            return true
+        }
+
+        internal fun enqueueUnknownCameraFailureAck(
+            coordinator: ControlStateAckCoordinator,
+            expectedSessionId: Long,
+            cameras: List<CameraInfo>,
+            cameraId: String,
+        ): Boolean = coordinator.enqueueAckIfSessionOwned(
+            expectedSessionId = expectedSessionId,
+        ) { cur ->
+            validateConfigureStreamCamera(
+                cameras = cameras,
+                cameraId = cameraId,
+                currentState = cur,
+            ).second ?: ControlAck(
+                ok = false,
+                error = "Unknown camera_id '$cameraId'",
+                activeState = cur,
+            )
+        }
+
+        internal fun reconcileMdnsForListening(
+            refreshedIp: String?,
+            listenPort: Int,
+            onRegisterMdns: (port: Int, ip: String) -> Unit,
+            onUnregisterMdns: () -> Unit,
+        ) {
+            val normalizedIp = refreshedIp?.trim()
+            if (!normalizedIp.isNullOrEmpty()) {
+                onRegisterMdns(listenPort, normalizedIp)
+            } else {
+                onUnregisterMdns()
+            }
         }
 
         internal fun resolveActiveSessionForPacket(
@@ -2359,21 +2615,24 @@ internal class UsbSessionAttemptTracker<T : Any>(
         }
     }
 
+    fun detachActiveAttemptForClose(): T? = synchronized(lock) {
+        val current = activeAttempt ?: return null
+        current.markClosing()
+        activeAttempt = null
+        val desc = current.descriptor
+        if (desc != null && current.markDescriptorClosed()) {
+            desc
+        } else {
+            null
+        }
+    }
+
+    fun closeDetachedDescriptor(descriptor: T) {
+        closeDescriptor(descriptor)
+    }
+
     fun closeActiveAttempt() {
-        val descriptorToClose = synchronized(lock) {
-            val current = activeAttempt ?: return
-            current.markClosing()
-            activeAttempt = null
-            val desc = current.descriptor
-            if (desc != null && current.markDescriptorClosed()) {
-                desc
-            } else {
-                null
-            }
-        }
-        if (descriptorToClose != null) {
-            closeDescriptor(descriptorToClose)
-        }
+        detachActiveAttemptForClose()?.let(closeDescriptor)
     }
 }
 
@@ -2496,6 +2755,15 @@ internal class ControlStateAckCoordinator(
             ownedSession = session
         }
     }
+
+    fun attachSessionAndCaptureState(session: ClientSessionHandle): ActiveCameraState? =
+        synchronized(orderLock) {
+            if (session.isClosed) {
+                return@synchronized null
+            }
+            ownedSession = session
+            serviceState.value.activeState
+        }
 
     fun clearActiveSessionIfCurrent(session: ClientSessionHandle) {
         synchronized(orderLock) {
