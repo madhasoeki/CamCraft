@@ -228,4 +228,55 @@ class H264SurfaceEncoderTest {
         assertEquals(0, successOnlyCalls.get())
         assertEquals(listOf(false), lateResultEvents)
     }
+
+    @Test
+    fun startDrainThreadTransactionallyRollsBackOnFailureAndPreservesOnSuccess() {
+        val rollbackCount = AtomicInteger(0)
+        val createdCount = AtomicInteger(0)
+        var capturedThread: Thread? = null
+
+        // Success path: no rollback runs and thread reference is preserved.
+        H264SurfaceEncoder.startDrainThreadTransactionally(
+            createThread = {
+                createdCount.incrementAndGet()
+                Thread { }
+            },
+            onThreadCreated = { capturedThread = it },
+            startThread = { /* simulated start without spawning extra OS thread */ },
+            onRollback = { rollbackCount.incrementAndGet() },
+        )
+        assertEquals(1, createdCount.get())
+        assertEquals(0, rollbackCount.get())
+        assertTrue(capturedThread != null)
+
+        // Thread creation Error (e.g., OOM) triggers rollback before rethrowing.
+        var threwCreateError = false
+        try {
+            H264SurfaceEncoder.startDrainThreadTransactionally(
+                createThread = { throw OutOfMemoryError("pthread_create failed") },
+                onThreadCreated = { },
+                startThread = { },
+                onRollback = { rollbackCount.incrementAndGet() },
+            )
+        } catch (_: OutOfMemoryError) {
+            threwCreateError = true
+        }
+        assertTrue(threwCreateError)
+        assertEquals(1, rollbackCount.get())
+
+        // Thread.start() failure triggers rollback before rethrowing.
+        var threwStartError = false
+        try {
+            H264SurfaceEncoder.startDrainThreadTransactionally(
+                createThread = { Thread { } },
+                onThreadCreated = { },
+                startThread = { throw OutOfMemoryError("unable to create native thread") },
+                onRollback = { rollbackCount.incrementAndGet() },
+            )
+        } catch (_: OutOfMemoryError) {
+            threwStartError = true
+        }
+        assertTrue(threwStartError)
+        assertEquals(2, rollbackCount.get())
+    }
 }

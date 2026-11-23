@@ -159,8 +159,10 @@ class H264SurfaceEncoder(
      * Starts the encoder and launches the background drain loop.
      */
     fun start() {
+        var shouldReleaseOnFailure = false
+        var startupFailure: Throwable? = null
         val activeCodec = synchronized(lifecycleLock) {
-            if (isRunning.get()) return
+            if (isRunning.get() || releaseCoordinator.isReleaseRequested()) return
             val existing = codec ?: return
             try {
                 existing.start()
@@ -172,22 +174,39 @@ class H264SurfaceEncoder(
             isRunning.set(true)
             releaseCoordinator.markDrainStarted()
 
-            val thread = Thread({
-                drainEncoderLoop(existing)
-            }, "CamCraft-H264-Drain").apply {
-                priority = Thread.MAX_PRIORITY
-                isDaemon = true
-            }
-            drainThread = thread
             try {
-                thread.start()
+                startDrainThreadTransactionally(
+                    createThread = {
+                        Thread({
+                            drainEncoderLoop(existing)
+                        }, "CamCraft-H264-Drain").apply {
+                            priority = Thread.MAX_PRIORITY
+                            isDaemon = true
+                        }
+                    },
+                    onThreadCreated = { thread ->
+                        drainThread = thread
+                    },
+                    startThread = { thread ->
+                        thread.start()
+                    },
+                    onRollback = {
+                        isRunning.set(false)
+                        drainThread = null
+                        releaseCoordinator.markDrainExited()
+                        shouldReleaseOnFailure = releaseCoordinator.requestRelease()
+                    },
+                )
             } catch (e: Throwable) {
-                isRunning.set(false)
-                drainThread = null
-                releaseCoordinator.markDrainExited()
-                throw e
+                startupFailure = e
             }
             existing
+        }
+        startupFailure?.let { failure ->
+            if (shouldReleaseOnFailure) {
+                releaseCodecAndSurfaceLocked()
+            }
+            throw failure
         }
         Log.i(TAG, "H264SurfaceEncoder started ($width x $height @ $fps fps, $bitrateKbps kbps, codec=$activeCodec)")
     }
@@ -470,6 +489,22 @@ class H264SurfaceEncoder(
         private const val TAG = "H264SurfaceEncoder"
         private const val INITIAL_SCRATCH_BUFFER_BYTES = 256 * 1024
         const val ANNEX_B_PREFIX_HEADROOM = 4
+
+        internal inline fun startDrainThreadTransactionally(
+            createThread: () -> Thread,
+            onThreadCreated: (Thread) -> Unit,
+            startThread: (Thread) -> Unit,
+            onRollback: () -> Unit,
+        ) {
+            try {
+                val thread = createThread()
+                onThreadCreated(thread)
+                startThread(thread)
+            } catch (e: Throwable) {
+                onRollback()
+                throw e
+            }
+        }
 
         /**
          * Selects an appropriate H.264 AVC level constant for the configured resolution and FPS.

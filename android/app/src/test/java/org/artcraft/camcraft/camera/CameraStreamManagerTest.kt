@@ -1309,4 +1309,136 @@ class CameraStreamManagerTest {
             ),
         )
     }
+
+    @Test
+    fun onReleaseFinishedObservesBothOutcomesAndPublishesResultBeforeTeardownFinished() {
+        val successSlot = ActiveEncoderSlot(
+            sessionId = 10L,
+            generation = 1L,
+            encoder = null,
+            width = 1920,
+            height = 1080,
+            fps = 60,
+            cameraId = "0",
+            surfaceTracker = EncoderSurfaceRetirementTracker(),
+        )
+        val successEvents = mutableListOf<Boolean>()
+        successSlot.onReleaseFinished { successEvents.add(it) }
+        successSlot.markReleaseFinished(codecReleased = true)
+        assertTrue(successSlot.isTeardownFinished)
+        assertTrue(successSlot.isReleased)
+        assertFalse(successSlot.isReleaseFailed)
+        assertTrue(successSlot.awaitReleased(10L))
+        assertEquals(listOf(true), successEvents)
+
+        val lateSuccessEvents = mutableListOf<Boolean>()
+        successSlot.onReleaseFinished { lateSuccessEvents.add(it) }
+        assertEquals(listOf(true), lateSuccessEvents)
+
+        val failSlot = ActiveEncoderSlot(
+            sessionId = 11L,
+            generation = 1L,
+            encoder = null,
+            width = 1920,
+            height = 1080,
+            fps = 60,
+            cameraId = "0",
+            surfaceTracker = EncoderSurfaceRetirementTracker(),
+        )
+        val failEvents = mutableListOf<Boolean>()
+        failSlot.onReleaseFinished { failEvents.add(it) }
+        failSlot.markReleaseFinished(codecReleased = false)
+        assertTrue(failSlot.isTeardownFinished)
+        assertFalse(failSlot.isReleased)
+        assertTrue(failSlot.isReleaseFailed)
+        assertFalse(failSlot.awaitReleased(10L))
+        assertEquals(listOf(false), failEvents)
+
+        val lateFailEvents = mutableListOf<Boolean>()
+        failSlot.onReleaseFinished { lateFailEvents.add(it) }
+        assertEquals(listOf(false), lateFailEvents)
+    }
+
+    @Test
+    fun terminalSetupFailureNegotiatedDimsControlTokensAndSurfaceRequestIdentity() {
+        // Terminal failure reports for current generation regardless of adjustment, but defers when retry pending.
+        assertTrue(
+            CameraStreamManager.shouldReportTerminalEncoderSetupFailure(
+                hasPendingRetry = false,
+                isCurrentGeneration = true,
+            ),
+        )
+        assertFalse(
+            CameraStreamManager.shouldReportTerminalEncoderSetupFailure(
+                hasPendingRetry = true,
+                isCurrentGeneration = true,
+            ),
+        )
+        assertFalse(
+            CameraStreamManager.shouldReportTerminalEncoderSetupFailure(
+                hasPendingRetry = false,
+                isCurrentGeneration = false,
+            ),
+        )
+
+        // Older active slot cannot overwrite dimensions recorded by a newer accepted geometry request.
+        assertTrue(CameraStreamManager.shouldApplyNegotiatedDimensionsToRequest(2L, 2L))
+        assertFalse(CameraStreamManager.shouldApplyNegotiatedDimensionsToRequest(1L, 2L))
+        assertFalse(CameraStreamManager.shouldApplyNegotiatedDimensionsToRequest(0L, 0L))
+
+        // Stale captured control tokens do not overwrite newer accepted controls.
+        assertTrue(CameraStreamManager.shouldApplyControlToken(3L, 3L))
+        assertFalse(CameraStreamManager.shouldApplyControlToken(2L, 3L))
+        assertFalse(CameraStreamManager.shouldApplyControlToken(0L, 0L))
+
+        // SurfaceRequest identity ignores stale RESULT_REQUEST_CANCELLED while keeping current & other rejections.
+        val slot = ActiveEncoderSlot(
+            sessionId = 12L,
+            generation = 1L,
+            encoder = null,
+            width = 1920,
+            height = 1080,
+            fps = 60,
+            cameraId = "0",
+            surfaceTracker = EncoderSurfaceRetirementTracker(),
+        )
+        val req1 = Any()
+        val req2 = Any()
+        slot.setCurrentSurfaceRequest(req1)
+        slot.setCurrentSurfaceRequest(req2)
+        assertFalse(slot.clearCurrentSurfaceRequestIfMatches(req1))
+        assertTrue(slot.isCurrentSurfaceRequest(req2))
+        assertFalse(
+            CameraStreamManager.isSurfaceResultRejection(
+                SurfaceRequest.Result.RESULT_REQUEST_CANCELLED,
+                isCurrentRequest = false,
+            ),
+        )
+        assertTrue(
+            CameraStreamManager.isSurfaceResultRejection(
+                SurfaceRequest.Result.RESULT_INVALID_SURFACE,
+                isCurrentRequest = false,
+            ),
+        )
+        assertTrue(slot.clearCurrentSurfaceRequestIfMatches(req2))
+        assertTrue(
+            CameraStreamManager.isSurfaceResultRejection(
+                SurfaceRequest.Result.RESULT_REQUEST_CANCELLED,
+                isCurrentRequest = true,
+            ),
+        )
+
+        // Intentional unbind before fallback rebind clears active request so subsequent cancel is ignored.
+        val req3 = Any()
+        slot.setCurrentSurfaceRequest(req3)
+        slot.clearCurrentSurfaceRequest()
+        assertFalse(slot.isCurrentSurfaceRequest(req3))
+        assertFalse(slot.clearCurrentSurfaceRequestIfMatches(req3))
+        assertFalse(
+            CameraStreamManager.isSurfaceResultRejection(
+                SurfaceRequest.Result.RESULT_REQUEST_CANCELLED,
+                isCurrentRequest = false,
+            ),
+        )
+    }
 }

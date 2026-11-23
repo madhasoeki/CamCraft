@@ -1301,8 +1301,13 @@ class CamCraftStreamServiceTest {
         val writerEntered = CountDownLatch(1)
         val releaseWriter = CountDownLatch(1)
         val transportCloses = AtomicInteger(0)
+        val clockNs = AtomicLong(1_000L)
+        val timeoutNs = 2_500_000_000L
         val blockedWriterExecutor = Executors.newSingleThreadExecutor { r ->
             Thread(r, "test-stalled-writer").apply { isDaemon = true }
+        }
+        val watchdogExecutor = Executors.newSingleThreadExecutor { r ->
+            Thread(r, "test-watchdog-check").apply { isDaemon = true }
         }
         val blockingOutput = object : OutputStream() {
             override fun write(b: Int) {
@@ -1323,10 +1328,11 @@ class CamCraftStreamServiceTest {
                 transportCloses.incrementAndGet()
                 releaseWriter.countDown()
             },
+            nanoTimeProvider = { clockNs.get() },
         )
         try {
             // Not writing -> not stalled even if time elapsed.
-            assertFalse(handle.isWriteStalled(nowNs = 10_000_000_000L, timeoutNs = 2_500_000_000L))
+            assertFalse(handle.isWriteStalled(nowNs = 10_000_000_000L, timeoutNs = timeoutNs))
 
             val beforeCloseRuns = AtomicInteger(0)
             val writerFuture = blockedWriterExecutor.submit<Boolean> {
@@ -1343,25 +1349,32 @@ class CamCraftStreamServiceTest {
             }
             assertTrue(writerEntered.await(2, TimeUnit.SECONDS))
 
-            // Simulate elapsed write duration reaching WRITE_STALL_TIMEOUT_MS -> closes transport without
-            // acquiring handle.outputLock, unblocking the stalled writer thread with IOException.
-            handle.markWriteStarted(nowNs = 1_000L)
-            assertFalse(
+            // Just below timeout -> watchdog does NOT close transport (run off test thread with bounded wait).
+            clockNs.set(1_000L + timeoutNs - 1L)
+            val belowTimeoutFuture = watchdogExecutor.submit<Boolean> {
                 CamCraftStreamService.checkAndCloseStalledSessionWrite(
                     session = handle,
-                    nowNs = 2_000_000_000L,
-                    timeoutNs = 2_500_000_000L,
+                    nowNs = clockNs.get(),
+                    timeoutNs = timeoutNs,
                     beforeClose = { beforeCloseRuns.incrementAndGet() },
-                ),
-            )
-            assertTrue(
+                )
+            }
+            assertFalse(belowTimeoutFuture.get(2, TimeUnit.SECONDS))
+            assertFalse(handle.isClosed)
+            assertEquals(0, beforeCloseRuns.get())
+            assertEquals(0, transportCloses.get())
+
+            // Exact timeout boundary -> closes transport without acquiring handle.outputLock, unblocking writer.
+            clockNs.set(1_000L + timeoutNs)
+            val atTimeoutFuture = watchdogExecutor.submit<Boolean> {
                 CamCraftStreamService.checkAndCloseStalledSessionWrite(
                     session = handle,
-                    nowNs = 2_500_002_000L,
-                    timeoutNs = 2_500_000_000L,
+                    nowNs = clockNs.get(),
+                    timeoutNs = timeoutNs,
                     beforeClose = { beforeCloseRuns.incrementAndGet() },
-                ),
-            )
+                )
+            }
+            assertTrue(atTimeoutFuture.get(2, TimeUnit.SECONDS))
             assertTrue(writerFuture.get(2, TimeUnit.SECONDS))
             assertTrue(handle.isClosed)
             assertEquals(1, beforeCloseRuns.get())
@@ -1369,7 +1382,147 @@ class CamCraftStreamServiceTest {
         } finally {
             releaseWriter.countDown()
             blockedWriterExecutor.shutdownNow()
+            watchdogExecutor.shutdownNow()
         }
+    }
+
+    @Test
+    fun applyVideoPipelineFailureIfCurrentConfigOrdersAndRechecksConfigId() {
+        val lock = Any()
+        val stateFlow = MutableStateFlow(
+            StreamServiceState(
+                status = StreamConnectionStatus.CONNECTED,
+                clientAddress = "192.168.1.10",
+                activeState = defaultActiveCameraState(),
+                currentFps = 59.5f,
+            ),
+        )
+        val coordinator = ControlStateAckCoordinator(stateFlow) { }
+        val session = ClientSessionHandle(
+            sessionId = 60L,
+            output = ByteArrayOutputStream(),
+            outputLock = Any(),
+            closeTransport = {},
+        )
+        coordinator.setActiveSession(session)
+
+        val firstConfigId = coordinator.runIfSessionActive(session, advanceCameraConfig = true) { _, _, id -> id }!!
+        coordinator.updateIfSessionOwned(
+            expectedSessionId = 60L,
+            shouldAdvanceCameraConfig = { _, _ -> true },
+        ) { cur -> cur.copy(width = 1280, height = 720) }
+        val currentConfigId = coordinator.currentCameraConfigId()
+        // Drain ACK from ConfigureStream so channel only contains subsequent failure ACK.
+        assertNotNull(session.ackChannel.tryReceive().getOrNull())
+
+        val notifications = mutableListOf<String>()
+        // Superseded configId -> must publish neither failure ACK nor ERROR state.
+        assertFalse(
+            CamCraftStreamService.applyVideoPipelineFailureIfCurrentConfig(
+                lock = lock,
+                coordinator = coordinator,
+                expectedSessionId = 60L,
+                expectedCameraConfigId = firstConfigId,
+                expectedCameraId = "0",
+                isStopping = { false },
+                isSessionActive = { true },
+                reason = "Stale failure",
+                serviceState = stateFlow,
+                onUpdateNotification = { notifications.add(it) },
+            ),
+        )
+        assertEquals(StreamConnectionStatus.CONNECTED, stateFlow.value.status)
+        assertNull(stateFlow.value.errorMessage)
+        assertNull(session.ackChannel.tryReceive().getOrNull())
+        assertTrue(notifications.isEmpty())
+
+        // Current configId -> publishes both failure ACK and ERROR state atomically.
+        assertTrue(
+            CamCraftStreamService.applyVideoPipelineFailureIfCurrentConfig(
+                lock = lock,
+                coordinator = coordinator,
+                expectedSessionId = 60L,
+                expectedCameraConfigId = currentConfigId,
+                expectedCameraId = "0",
+                isStopping = { false },
+                isSessionActive = { true },
+                reason = "Replacement failed",
+                serviceState = stateFlow,
+                onUpdateNotification = { notifications.add(it) },
+            ),
+        )
+        assertEquals(StreamConnectionStatus.ERROR, stateFlow.value.status)
+        assertEquals("Replacement failed", stateFlow.value.errorMessage)
+        val ack = session.ackChannel.tryReceive().getOrNull()!!
+        assertFalse(ack.ok)
+        assertEquals("Replacement failed", ack.error)
+        assertEquals(listOf("Video unavailable (192.168.1.10) • Replacement failed"), notifications)
+    }
+
+    @Test
+    fun asyncRebindNotificationDoesNotClearErrorUntilCurrentPipelineWritesFrame() {
+        val lock = Any()
+        val stateFlow = MutableStateFlow(
+            StreamServiceState(
+                status = StreamConnectionStatus.ERROR,
+                clientAddress = "USB Direct",
+                activeState = defaultActiveCameraState(),
+                errorMessage = "Bind failed",
+            ),
+        )
+        val notifications = mutableListOf<String>()
+
+        // Submitting an async rebind calls publishConnectedNotificationFromSnapshot -> never clears ERROR.
+        assertFalse(
+            CamCraftStreamService.publishConnectedNotificationFromSnapshot(
+                lock = lock,
+                isStopping = { false },
+                isSessionActive = { true },
+                serviceState = stateFlow,
+                onUpdateNotification = { notifications.add(it) },
+            ),
+        )
+        assertEquals(StreamConnectionStatus.ERROR, stateFlow.value.status)
+        assertEquals("Bind failed", stateFlow.value.errorMessage)
+        assertTrue(notifications.isEmpty())
+
+        // Stale pipeline frame write cannot recover ERROR status.
+        assertFalse(
+            CamCraftStreamService.restoreConnectedStatusIfRecovering(
+                lock = lock,
+                isStopping = { false },
+                isSessionActive = { true },
+                isCurrentPipeline = { false },
+                serviceState = stateFlow,
+                onUpdateNotification = { notifications.add(it) },
+            ),
+        )
+        assertEquals(StreamConnectionStatus.ERROR, stateFlow.value.status)
+        assertTrue(notifications.isEmpty())
+
+        // Successful video frame write from current pipeline clears ERROR and restores CONNECTED.
+        assertTrue(
+            CamCraftStreamService.restoreConnectedStatusIfRecovering(
+                lock = lock,
+                isStopping = { false },
+                isSessionActive = { true },
+                isCurrentPipeline = { true },
+                serviceState = stateFlow,
+                onUpdateNotification = { notifications.add(it) },
+            ),
+        )
+        assertEquals(StreamConnectionStatus.CONNECTED, stateFlow.value.status)
+        assertNull(stateFlow.value.errorMessage)
+        assertEquals(listOf("Connected (USB Direct) • 1920x1080 @ 60 FPS"), notifications)
+
+        // Session ID verification rejects superseded or closed sessions while matching current.
+        val active = ClientSessionHandle(70L, ByteArrayOutputStream(), Any(), {})
+        assertTrue(CamCraftStreamService.isActiveSessionMatching(false, active, 70L))
+        assertFalse(CamCraftStreamService.isActiveSessionMatching(false, active, 69L))
+        assertFalse(CamCraftStreamService.isActiveSessionMatching(true, active, 70L))
+        assertFalse(CamCraftStreamService.isActiveSessionMatching(false, null, 70L))
+        active.close()
+        assertFalse(CamCraftStreamService.isActiveSessionMatching(false, active, 70L))
     }
 
     @Test
