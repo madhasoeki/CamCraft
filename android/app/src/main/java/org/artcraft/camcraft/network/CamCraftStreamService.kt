@@ -438,30 +438,30 @@ class CamCraftStreamService : Service() {
                 var socket: ServerSocket? = null
                 try {
                     val port = CcftProtocolConstants.DEFAULT_PORT
-                    val boundSocket = bindServerSocketWithRetiringListenerRetry(
-                        listenerCloseTracker = pendingListenerCloseTracker,
+                    val boundSocket = bindAndPublishListenerSocket(
+                        listenerTracker = pendingListenerCloseTracker,
                         isCancelledOrStopped = {
                             synchronized(lifecycleLock) {
                                 isStopping.get() || !isActive || serverJob !== currentJob
                             }
                         },
-                    ) {
-                        ServerSocket(port).apply {
-                            reuseAddress = true
-                        }
-                    }
-                    socket = boundSocket
-                    val publishedSocket = synchronized(lifecycleLock) {
-                        if (isStopping.get() || !isActive || serverJob !== currentJob) {
-                            false
-                        } else {
-                            serverSocket = boundSocket
-                            true
-                        }
-                    }
-                    if (!publishedSocket) {
-                        return@launch
-                    }
+                        bindSocket = {
+                            ServerSocket(port).apply {
+                                reuseAddress = true
+                            }
+                        },
+                        publishSocket = { candidate ->
+                            synchronized(lifecycleLock) {
+                                if (isStopping.get() || !isActive || serverJob !== currentJob) {
+                                    false
+                                } else {
+                                    serverSocket = candidate
+                                    socket = candidate
+                                    true
+                                }
+                            }
+                        },
+                    ) ?: return@launch
 
                     val currentIp = LocalIpResolver.resolveLocalIpv4Address(this@CamCraftStreamService)
                     var becameListening = false
@@ -864,32 +864,38 @@ class CamCraftStreamService : Service() {
                     if (previousUsbJob != null && previousUsbJob.isActive) {
                         previousUsbJob.join()
                     }
-                    awaitPendingUsbDescriptorRetirement(
+                    val pfd = openUsbAccessoryAfterRetirement(
                         usbCloseTracker = pendingUsbCloseTracker,
-                    )
-                    if (isStopping.get() ||
-                        !currentCoroutineContext().isActive ||
-                        !usbAttemptTracker.isAttemptPendingOrActive(attempt)
-                    ) {
-                        return@launch
-                    }
-
-                    val usbManager = getSystemService(Context.USB_SERVICE) as? UsbManager
-                    if (usbManager == null) {
-                        Log.w(TAG, "UsbManager unavailable; cannot open USB accessory")
-                        return@launch
-                    }
-
-                    val pfd = try {
-                        usbManager.openAccessory(accessory)
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Failed to open USB accessory: ${e.message}", e)
-                        null
-                    }
-                    if (pfd == null) {
-                        Log.w(TAG, "UsbManager.openAccessory returned null for ${accessory.model}")
-                        return@launch
-                    }
+                        attemptTracker = usbAttemptTracker,
+                        attempt = attempt,
+                        isCancelledOrStopped = { isStopping.get() },
+                        onRetirementTimeout = { timeoutAttempt ->
+                            if (timeoutAttempt == 1) {
+                                Log.w(
+                                    TAG,
+                                    "Timed out waiting for previous USB descriptor retirement; keeping USB startup pending for retry",
+                                )
+                            }
+                        },
+                        openAccessory = {
+                            val usbManager = getSystemService(Context.USB_SERVICE) as? UsbManager
+                            if (usbManager == null) {
+                                Log.w(TAG, "UsbManager unavailable; cannot open USB accessory")
+                                null
+                            } else {
+                                try {
+                                    usbManager.openAccessory(accessory).also { opened ->
+                                        if (opened == null) {
+                                            Log.w(TAG, "UsbManager.openAccessory returned null for ${accessory.model}")
+                                        }
+                                    }
+                                } catch (e: Exception) {
+                                    Log.w(TAG, "Failed to open USB accessory: ${e.message}", e)
+                                    null
+                                }
+                            }
+                        },
+                    ) ?: return@launch
 
                     if (!usbAttemptTracker.attachDescriptor(attempt, pfd)) {
                         return@launch
@@ -1893,16 +1899,22 @@ class CamCraftStreamService : Service() {
         internal suspend fun awaitPendingUsbDescriptorRetirement(
             usbCloseTracker: PendingCloseTracker,
             timeoutMs: Long = USB_RETIRE_WAIT_TIMEOUT_MS,
+            onPendingCloseObserved: (() -> Unit)? = null,
         ): Boolean {
             val (initialPending, _) = usbCloseTracker.snapshot()
             if (initialPending.isEmpty()) {
                 return true
             }
+            var notified = false
             return withTimeoutOrNull(timeoutMs) {
                 while (true) {
                     val (pending, _) = usbCloseTracker.snapshot()
                     if (pending.isEmpty()) {
                         break
+                    }
+                    if (!notified) {
+                        notified = true
+                        onPendingCloseObserved?.invoke()
                     }
                     for (deferred in pending) {
                         deferred.await()
@@ -1912,18 +1924,58 @@ class CamCraftStreamService : Service() {
             } ?: false
         }
 
+        internal suspend fun <T : Any> openUsbAccessoryAfterRetirement(
+            usbCloseTracker: PendingCloseTracker,
+            attemptTracker: UsbSessionAttemptTracker<T>,
+            attempt: UsbSessionAttempt<T>,
+            isCancelledOrStopped: () -> Boolean,
+            retireWaitTimeoutMs: Long = USB_RETIRE_WAIT_TIMEOUT_MS,
+            onPendingCloseObserved: (() -> Unit)? = null,
+            onRetirementTimeout: ((Int) -> Unit)? = null,
+            openAccessory: () -> T?,
+        ): T? {
+            var timeoutCount = 0
+            while (true) {
+                if (isCancelledOrStopped() ||
+                    !currentCoroutineContext().isActive ||
+                    !attemptTracker.isAttemptPendingOrActive(attempt)
+                ) {
+                    return null
+                }
+                val retired = awaitPendingUsbDescriptorRetirement(
+                    usbCloseTracker = usbCloseTracker,
+                    timeoutMs = retireWaitTimeoutMs,
+                    onPendingCloseObserved = onPendingCloseObserved,
+                )
+                if (isCancelledOrStopped() ||
+                    !currentCoroutineContext().isActive ||
+                    !attemptTracker.isAttemptPendingOrActive(attempt)
+                ) {
+                    return null
+                }
+                if (retired) {
+                    return openAccessory()
+                }
+                timeoutCount++
+                onRetirementTimeout?.invoke(timeoutCount)
+            }
+        }
+
         internal suspend fun <S : Closeable> bindServerSocketWithRetiringListenerRetry(
             listenerCloseTracker: PendingCloseTracker,
             isCancelledOrStopped: () -> Boolean,
             maxRetryAttempts: Int = MAX_LISTENER_BIND_RETRIES,
             retryWaitTimeoutMs: Long = LISTENER_RETIRE_WAIT_TIMEOUT_MS,
+            ownPendingToken: CompletableDeferred<Unit>? = null,
+            onPreBindWaitEntered: (() -> Unit)? = null,
             bindSocket: () -> S,
         ): S {
             var attempt = 0
             while (true) {
-                val (pendingBeforeBind, _) = listenerCloseTracker.snapshot()
+                val (pendingBeforeBind, _) = listenerCloseTracker.snapshot(exclude = ownPendingToken)
                 if (pendingBeforeBind.isNotEmpty()) {
                     withTimeoutOrNull(retryWaitTimeoutMs) {
+                        onPreBindWaitEntered?.invoke()
                         for (deferred in pendingBeforeBind) {
                             deferred.await()
                         }
@@ -1936,7 +1988,11 @@ class CamCraftStreamService : Service() {
                 try {
                     return bindSocket()
                 } catch (e: BindException) {
-                    val (pendingAfterBind, completionsAfterBind) = listenerCloseTracker.snapshot()
+                    if (isCancelledOrStopped()) {
+                        throw CancellationException("Server start cancelled while retrying listener bind")
+                    }
+                    val (pendingAfterBind, completionsAfterBind) =
+                        listenerCloseTracker.snapshot(exclude = ownPendingToken)
                     val retiringListenerActiveOrJustClosed =
                         pendingAfterBind.isNotEmpty() || completionsAfterBind > completionsAtBind
                     if (!retiringListenerActiveOrJustClosed || attempt >= maxRetryAttempts) {
@@ -1953,6 +2009,52 @@ class CamCraftStreamService : Service() {
                     if (isCancelledOrStopped()) {
                         throw CancellationException("Server start cancelled while retrying listener bind")
                     }
+                }
+            }
+        }
+
+        internal suspend fun <S : Closeable> bindAndPublishListenerSocket(
+            listenerTracker: PendingCloseTracker,
+            isCancelledOrStopped: () -> Boolean,
+            maxRetryAttempts: Int = MAX_LISTENER_BIND_RETRIES,
+            retryWaitTimeoutMs: Long = LISTENER_RETIRE_WAIT_TIMEOUT_MS,
+            onPreBindWaitEntered: (() -> Unit)? = null,
+            bindSocket: () -> S,
+            publishSocket: (S) -> Boolean,
+            closeSocket: (S) -> Unit = { candidate ->
+                try {
+                    candidate.close()
+                } catch (_: IOException) {}
+            },
+        ): S? {
+            if (isCancelledOrStopped()) {
+                return null
+            }
+            val startupToken = listenerTracker.register()
+            var boundSocket: S? = null
+            var published = false
+            try {
+                val candidate = bindServerSocketWithRetiringListenerRetry(
+                    listenerCloseTracker = listenerTracker,
+                    isCancelledOrStopped = isCancelledOrStopped,
+                    maxRetryAttempts = maxRetryAttempts,
+                    retryWaitTimeoutMs = retryWaitTimeoutMs,
+                    ownPendingToken = startupToken,
+                    onPreBindWaitEntered = onPreBindWaitEntered,
+                    bindSocket = {
+                        bindSocket().also { boundSocket = it }
+                    },
+                )
+                published = publishSocket(candidate)
+                return if (published) candidate else null
+            } finally {
+                val unpublishedSocket = if (!published) boundSocket else null
+                try {
+                    if (unpublishedSocket != null) {
+                        closeSocket(unpublishedSocket)
+                    }
+                } finally {
+                    startupToken.complete(Unit)
                 }
             }
         }
@@ -2653,8 +2755,9 @@ internal class UsbSessionAttempt<T : Any>(
 }
 
 /**
- * Tracks in-flight asynchronous transport closures across Service instances so replacement
- * listener binds and USB accessory starts can wait for OS descriptor/socket release.
+ * Tracks in-flight asynchronous transport closures and listener startups prior to publish across
+ * Service instances so replacement listener binds and USB accessory starts can wait for OS
+ * descriptor/socket release.
  */
 internal class PendingCloseTracker {
     private val lock = Any()
@@ -2676,8 +2779,15 @@ internal class PendingCloseTracker {
         return deferred
     }
 
-    fun snapshot(): Pair<List<CompletableDeferred<Unit>>, Long> = synchronized(lock) {
-        inFlight.toList() to completionsCount
+    fun snapshot(
+        exclude: CompletableDeferred<Unit>? = null,
+    ): Pair<List<CompletableDeferred<Unit>>, Long> = synchronized(lock) {
+        val pending = if (exclude == null) {
+            inFlight.toList()
+        } else {
+            inFlight.filter { it !== exclude }
+        }
+        pending to completionsCount
     }
 
     fun currentCompletionsCount(): Long = synchronized(lock) {
