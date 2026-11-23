@@ -6,6 +6,7 @@ import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+import java.lang.management.ManagementFactory
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -2002,25 +2003,56 @@ class CamCraftStreamServiceTest {
                     onUpdateNotification = { notifications.add(it) },
                     onAfterConfigCheckBeforeWriteForTest = {
                         hookEntered.countDown()
+                        val recoveryThreadId = Thread.currentThread().id
+                        val workerThreadRef = AtomicReference<Thread?>()
                         val future = workerExecutor.submit<Long> {
+                            workerThreadRef.set(Thread.currentThread())
                             commitStarted.countDown()
                             coordinator.updateIfSessionOwned(
                                 expectedSessionId = 99L,
                                 shouldAdvanceCameraConfig = { _, _ -> true },
                             ) { cur ->
+                                errorClearedBeforeCommit.set(
+                                    stateFlow.value.status == StreamConnectionStatus.CONNECTED &&
+                                        stateFlow.value.errorMessage == null,
+                                )
                                 cur.copy(cameraId = "1")
                             }
-                            errorClearedBeforeCommit.set(
-                                stateFlow.value.status == StreamConnectionStatus.CONNECTED &&
-                                    stateFlow.value.errorMessage == null,
-                            )
                             commitFinished.countDown()
                             coordinator.currentCameraConfigId()
                         }
                         commitFutureRef.set(future)
                         assertTrue(commitStarted.await(2, TimeUnit.SECONDS))
-                        // orderLock prevents concurrent config commit from interleaving between check and write.
-                        assertFalse(commitFinished.await(75, TimeUnit.MILLISECONDS))
+
+                        val threadBean = ManagementFactory.getThreadMXBean()
+                        val deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+                        var blockedOnOrderLock = false
+                        while (System.nanoTime() < deadlineNs) {
+                            assertFalse(
+                                "Concurrent config commit finished before recovery exited orderLock",
+                                commitFinished.count == 0L,
+                            )
+                            val workerThread = workerThreadRef.get()
+                            val info = workerThread?.let { threadBean.getThreadInfo(it.id, 12) }
+                            if (info != null &&
+                                info.threadState == Thread.State.BLOCKED &&
+                                info.lockOwnerId == recoveryThreadId &&
+                                info.stackTrace.any { frame ->
+                                    frame.className.contains("ControlStateAckCoordinator") &&
+                                        frame.methodName.startsWith("updateIfSessionOwned")
+                                }
+                            ) {
+                                blockedOnOrderLock = true
+                                break
+                            }
+                            Thread.sleep(5)
+                        }
+                        assertTrue(
+                            "Expected config worker thread to block on ControlStateAckCoordinator orderLock monitor",
+                            blockedOnOrderLock,
+                        )
+                        // orderLock prevents concurrent config commit from interleaving before recovery finishes.
+                        assertFalse(commitFinished.await(20, TimeUnit.MILLISECONDS))
                     },
                 ),
             )

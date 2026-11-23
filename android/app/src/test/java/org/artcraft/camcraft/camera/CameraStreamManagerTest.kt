@@ -1506,7 +1506,29 @@ class CameraStreamManagerTest {
             surfaceTracker = EncoderSurfaceRetirementTracker(),
             pendingResolutionAdjustment = false,
         )
+        // Healthy slot permits in-place bitrate updates until terminal failure is claimed.
+        assertTrue(CameraStreamManager.isSlotUsableForRebind(ordinarySlot))
+        val healthyDecision = CameraStreamManager.evaluateRebindDecision(
+            cameraChanged = false,
+            geometryOrFpsChanged = false,
+            bitrateChanged = true,
+            hasEncoder = CameraStreamManager.isSlotUsableForRebind(ordinarySlot),
+        )
+        assertFalse(healthyDecision.needsEncoderRestart)
+        assertTrue(healthyDecision.needsBitrateUpdate)
+
         assertTrue(ordinarySlot.markTerminalFailureReported())
+        assertTrue(ordinarySlot.isTerminalFailureReported)
+        assertTrue(ordinarySlot.isRetiring)
+        assertFalse(CameraStreamManager.isSlotUsableForRebind(ordinarySlot))
+        val failedDecision = CameraStreamManager.evaluateRebindDecision(
+            cameraChanged = false,
+            geometryOrFpsChanged = false,
+            bitrateChanged = true,
+            hasEncoder = CameraStreamManager.isSlotUsableForRebind(ordinarySlot),
+        )
+        assertTrue(failedDecision.needsEncoderRestart)
+        assertFalse(failedDecision.needsBitrateUpdate)
         assertFalse(ordinarySlot.markTerminalFailureReported())
 
         val adjustmentSlot = ActiveEncoderSlot(
@@ -1520,7 +1542,11 @@ class CameraStreamManagerTest {
             surfaceTracker = EncoderSurfaceRetirementTracker(),
             pendingResolutionAdjustment = true,
         )
+        assertTrue(CameraStreamManager.isSlotUsableForRebind(adjustmentSlot))
         assertTrue(adjustmentSlot.markTerminalFailureReported())
+        assertTrue(adjustmentSlot.isTerminalFailureReported)
+        assertTrue(adjustmentSlot.isRetiring)
+        assertFalse(CameraStreamManager.isSlotUsableForRebind(adjustmentSlot))
         assertFalse(adjustmentSlot.hasPendingResolutionAdjustmentUnreported())
         assertFalse(adjustmentSlot.markResolutionAdjustmentReported())
         assertFalse(adjustmentSlot.markTerminalFailureReported())

@@ -183,6 +183,9 @@ internal class ActiveEncoderSlot(
     val isReleaseFailed: Boolean
         get() = releaseFailed
 
+    val isTerminalFailureReported: Boolean
+        get() = terminalFailureReported.get()
+
     fun setCurrentSurfaceRequest(request: Any) {
         currentSurfaceRequestRef.set(request)
     }
@@ -206,10 +209,14 @@ internal class ActiveEncoderSlot(
         pendingResolutionAdjustment && resolutionAdjustmentOutcomeReported.compareAndSet(false, true)
 
     fun markTerminalFailureReported(): Boolean {
+        if (!terminalFailureReported.compareAndSet(false, true)) {
+            return false
+        }
         if (pendingResolutionAdjustment) {
             resolutionAdjustmentOutcomeReported.set(true)
         }
-        return terminalFailureReported.compareAndSet(false, true)
+        isRetiring = true
+        return true
     }
 
     fun awaitReleased(timeoutMs: Long): Boolean {
@@ -711,8 +718,13 @@ class CameraStreamManager(
         }
     }
 
-    private fun cleanupActivePipelineOnEncoderThread(): ActiveEncoderSlot? {
+    private fun cleanupActivePipelineOnEncoderThread(
+        expectedSlot: ActiveEncoderSlot? = null,
+    ): ActiveEncoderSlot? {
         val (slotToRetire, ownedUseCases, retiringSlotToWaitFor) = synchronized(surfaceLock) {
+            if (expectedSlot != null && activeSlot !== expectedSlot) {
+                return null
+            }
             val detached = activeSlot
             activeSlot = null
             if (detached != null) {
@@ -1108,7 +1120,7 @@ class CameraStreamManager(
                 cameraChanged = cameraChanged,
                 geometryOrFpsChanged = geometryOrFpsChanged,
                 bitrateChanged = bitrateChanged,
-                hasEncoder = slotSnapshot != null && !slotSnapshot.isRetiring,
+                hasEncoder = isSlotUsableForRebind(slotSnapshot),
             )
 
             currentCameraId = cameraId
@@ -1580,21 +1592,23 @@ class CameraStreamManager(
         reason: String,
     ) {
         executeOnEncoderExecutor {
-            val stillActive = synchronized(surfaceLock) {
-                !isReleased.get() &&
+            val (shouldRestoreFallbackDims, shouldCleanupSlot) = synchronized(surfaceLock) {
+                val slotStillAttached = activeSlot === slot
+                val restoreDims = slotStillAttached &&
+                    slot.pendingResolutionAdjustment &&
+                    !isReleased.get() &&
                     isStreaming &&
                     activeSessionId == slot.sessionId &&
-                    activeSlot === slot &&
-                    !slot.isRetiring &&
                     slot.generation == pipelineGeneration.get() &&
                     shouldApplyNegotiatedDimensionsToRequest(slot.geometryRequestSeq, requestedGeometrySeq)
+                restoreDims to slotStillAttached
             }
-            if (stillActive) {
-                if (slot.pendingResolutionAdjustment) {
-                    currentWidth = slot.fallbackWidth
-                    currentHeight = slot.fallbackHeight
-                }
-                cleanupActivePipelineOnEncoderThread()
+            if (shouldRestoreFallbackDims) {
+                currentWidth = slot.fallbackWidth
+                currentHeight = slot.fallbackHeight
+            }
+            if (shouldCleanupSlot) {
+                cleanupActivePipelineOnEncoderThread(expectedSlot = slot)
             }
         }
         onResolutionAdjustmentFailed?.invoke(
@@ -2880,6 +2894,9 @@ class CameraStreamManager(
                 requestedHeight != newHeight ||
                 requestedFps != newFps
         }
+
+        internal fun isSlotUsableForRebind(slot: ActiveEncoderSlot?): Boolean =
+            slot != null && !slot.isRetiring && !slot.isTerminalFailureReported
 
         internal fun shouldFallbackFullRebindAfterUiFailure(encoderStillBound: Boolean): Boolean =
             !encoderStillBound
