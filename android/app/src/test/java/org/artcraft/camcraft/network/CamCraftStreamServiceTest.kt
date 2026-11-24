@@ -3062,16 +3062,24 @@ class CamCraftStreamServiceTest {
             )
 
             // 2. TCP stays active while USB waits; once retirement finishes and USB acquires its descriptor,
-            //    attachUsbDescriptorAndPreemptTcp marks USB active and preempts active TCP session & sockets.
+            //    attachUsbDescriptorAndPreemptTcp commits takeover under lifecycleLock and preempts TCP outside the lock.
             val tcpTransportClosed = AtomicBoolean(false)
+            val tcpTransportClosedOutsideLock = AtomicBoolean(false)
             val tcpSocketClosed = AtomicBoolean(false)
-            val tcpSocket = Closeable { tcpSocketClosed.set(true) }
+            val tcpSocketClosedOutsideLock = AtomicBoolean(false)
+            val tcpSocket = Closeable {
+                tcpSocketClosedOutsideLock.set(!Thread.holdsLock(lifecycleLock))
+                tcpSocketClosed.set(true)
+            }
             val activeTcpSockets = mutableSetOf(tcpSocket)
             var activeSession: ClientSessionHandle? = ClientSessionHandle(
                 sessionId = 71L,
                 output = ByteArrayOutputStream(),
                 outputLock = Any(),
-                closeTransport = { tcpTransportClosed.set(true) },
+                closeTransport = {
+                    tcpTransportClosedOutsideLock.set(!Thread.holdsLock(lifecycleLock))
+                    tcpTransportClosed.set(true)
+                },
             )
 
             allowOldClose1.countDown()
@@ -3101,7 +3109,9 @@ class CamCraftStreamServiceTest {
             )
             assertNull(activeSession)
             assertTrue(tcpTransportClosed.get())
+            assertTrue(tcpTransportClosedOutsideLock.get())
             assertTrue(tcpSocketClosed.get())
+            assertTrue(tcpSocketClosedOutsideLock.get())
             assertTrue(activeTcpSockets.isEmpty())
 
             instance2Tracker.closeAttempt(attempt1)
@@ -3114,12 +3124,31 @@ class CamCraftStreamServiceTest {
                 ),
             )
 
-            // 3. Cancelled/stopped attach rejects & closes USB descriptor without preempting TCP.
+            // 3a. Cancelled/stopped attach rejects & closes USB descriptor outside lifecycleLock without preempting TCP.
+            val tcpTransport2Closed = AtomicBoolean(false)
+            val tcpTransport2ClosedOutsideLock = AtomicBoolean(false)
             val tcpSocket2Closed = AtomicBoolean(false)
-            val tcpSocket2 = Closeable { tcpSocket2Closed.set(true) }
+            val tcpSocket2ClosedOutsideLock = AtomicBoolean(false)
+            val tcpSocket2 = Closeable {
+                tcpSocket2ClosedOutsideLock.set(!Thread.holdsLock(lifecycleLock))
+                tcpSocket2Closed.set(true)
+            }
             activeTcpSockets.add(tcpSocket2)
+            var activeTcpSession2: ClientSessionHandle? = ClientSessionHandle(
+                sessionId = 72L,
+                output = ByteArrayOutputStream(),
+                outputLock = Any(),
+                closeTransport = {
+                    tcpTransport2ClosedOutsideLock.set(!Thread.holdsLock(lifecycleLock))
+                    tcpTransport2Closed.set(true)
+                },
+            )
             val attempt2 = instance2Tracker.beginAttempt()
-            val usbDesc2 = Closeable { closedUsbTags.add("usb-2") }
+            val usbDesc2ClosedOutsideLock = AtomicBoolean(false)
+            val usbDesc2 = Closeable {
+                usbDesc2ClosedOutsideLock.set(!Thread.holdsLock(lifecycleLock))
+                closedUsbTags.add("usb-2")
+            }
             val attachedCancelled = CamCraftStreamService.attachUsbDescriptorAndPreemptTcp(
                 lifecycleLock = lifecycleLock,
                 attemptTracker = instance2Tracker,
@@ -3127,13 +3156,75 @@ class CamCraftStreamServiceTest {
                 descriptor = usbDesc2,
                 isCancelledOrStopped = { true },
                 activeTcpSockets = activeTcpSockets,
+                detachActiveTcpSessionLocked = {
+                    activeTcpSession2.also { activeTcpSession2 = null }
+                },
             )
             assertFalse(attachedCancelled)
             assertTrue(closedUsbTags.contains("usb-2"))
+            assertTrue(usbDesc2ClosedOutsideLock.get())
             assertFalse(instance2Tracker.hasActiveDescriptor())
+            assertNotNull(activeTcpSession2)
+            assertFalse(activeTcpSession2!!.isClosed)
+            assertFalse(tcpTransport2Closed.get())
             assertFalse(tcpSocket2Closed.get())
             assertTrue(activeTcpSockets.contains(tcpSocket2))
             assertTrue(sharedUsbCloseTracker.snapshot().first.isEmpty())
+
+            // 3b. Revoking USB attempt while takeover waits on lifecycleLock never publishes the descriptor,
+            //     closes the USB descriptor outside the lock once resumed, and leaves TCP session & socket open.
+            val attempt2b = instance2Tracker.beginAttempt()
+            val usbDesc2bClosedOutsideLock = AtomicBoolean(false)
+            val usbDesc2b = Closeable {
+                usbDesc2bClosedOutsideLock.set(!Thread.holdsLock(lifecycleLock))
+                closedUsbTags.add("usb-2b")
+            }
+            val handoffThreadRef = AtomicReference<Thread?>(null)
+            val handoffStarted = CountDownLatch(1)
+            val attachFuture = synchronized(lifecycleLock) {
+                val future = ioExecutor.submit<Boolean> {
+                    handoffThreadRef.set(Thread.currentThread())
+                    handoffStarted.countDown()
+                    CamCraftStreamService.attachUsbDescriptorAndPreemptTcp(
+                        lifecycleLock = lifecycleLock,
+                        attemptTracker = instance2Tracker,
+                        attempt = attempt2b,
+                        descriptor = usbDesc2b,
+                        isCancelledOrStopped = { false },
+                        activeTcpSockets = activeTcpSockets,
+                        detachActiveTcpSessionLocked = {
+                            activeTcpSession2.also { activeTcpSession2 = null }
+                        },
+                    )
+                }
+                assertTrue(handoffStarted.await(2, TimeUnit.SECONDS))
+                val handoffThread = handoffThreadRef.get()!!
+                val waitDeadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+                while (handoffThread.state != Thread.State.BLOCKED && System.nanoTime() < waitDeadlineNs) {
+                    Thread.sleep(5)
+                }
+                assertEquals(Thread.State.BLOCKED, handoffThread.state)
+                assertFalse(instance2Tracker.hasActiveDescriptor())
+                assertFalse(
+                    CamCraftStreamService.isUsbBlockingTcpAdmission(
+                        usbJobActive = true,
+                        attemptTracker = instance2Tracker,
+                    ),
+                )
+
+                instance2Tracker.closeAttempt(attempt2b)
+                future
+            }
+            assertFalse(attachFuture.get(2, TimeUnit.SECONDS))
+            assertTrue(closedUsbTags.contains("usb-2b"))
+            assertTrue(usbDesc2bClosedOutsideLock.get())
+            assertFalse(instance2Tracker.hasActiveDescriptor())
+            assertTrue(sharedUsbCloseTracker.snapshot().first.isEmpty())
+            assertNotNull(activeTcpSession2)
+            assertFalse(activeTcpSession2!!.isClosed)
+            assertFalse(tcpTransport2Closed.get())
+            assertFalse(tcpSocket2Closed.get())
+            assertTrue(activeTcpSockets.contains(tcpSocket2))
 
             // 4. Cancelling a USB retry waiting on retirement lets pending close I/O complete so a
             //    replacement USB attempt can open and preempt TCP once retirement finishes.
@@ -3215,9 +3306,16 @@ class CamCraftStreamServiceTest {
                     descriptor = usbDesc4!!,
                     isCancelledOrStopped = { false },
                     activeTcpSockets = activeTcpSockets,
+                    detachActiveTcpSessionLocked = {
+                        activeTcpSession2.also { activeTcpSession2 = null }
+                    },
                 ),
             )
+            assertNull(activeTcpSession2)
+            assertTrue(tcpTransport2Closed.get())
+            assertTrue(tcpTransport2ClosedOutsideLock.get())
             assertTrue(tcpSocket2Closed.get())
+            assertTrue(tcpSocket2ClosedOutsideLock.get())
             assertTrue(activeTcpSockets.isEmpty())
             assertTrue(instance2Tracker.hasActiveDescriptor())
             instance2Tracker.closeAttempt(attempt4)

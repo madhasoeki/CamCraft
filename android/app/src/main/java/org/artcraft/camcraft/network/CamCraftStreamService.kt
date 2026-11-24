@@ -1988,28 +1988,28 @@ class CamCraftStreamService : Service() {
                 } catch (_: IOException) {}
             },
         ): Boolean {
-            if (isCancelledOrStopped()) {
-                attemptTracker.closeAttempt(attempt)
-                attemptTracker.attachDescriptor(attempt, descriptor)
-                return false
-            }
-            if (!attemptTracker.attachDescriptor(attempt, descriptor)) {
-                return false
-            }
             var sessionToPreempt: ClientSessionHandle? = null
             var socketsToPreempt: List<S> = emptyList()
-            val stillCurrent = synchronized(lifecycleLock) {
-                if (isCancelledOrStopped() || !attemptTracker.isAttemptCurrent(attempt, descriptor)) {
+            var rejectedUsbToClose: DetachedUsbDescriptor<T>? = null
+            val committed = synchronized(lifecycleLock) {
+                if (isCancelledOrStopped()) {
+                    rejectedUsbToClose = attemptTracker.rejectUnattachedDescriptorForClose(attempt, descriptor)
                     false
                 } else {
-                    sessionToPreempt = detachActiveTcpSessionLocked()
-                    socketsToPreempt = activeTcpSockets.toList()
-                    activeTcpSockets.clear()
-                    true
+                    val (attached, rejected) = attemptTracker.attachDescriptorOrDetachRejected(attempt, descriptor)
+                    if (!attached) {
+                        rejectedUsbToClose = rejected
+                        false
+                    } else {
+                        sessionToPreempt = detachActiveTcpSessionLocked()
+                        socketsToPreempt = activeTcpSockets.toList()
+                        activeTcpSockets.clear()
+                        true
+                    }
                 }
             }
-            if (!stillCurrent) {
-                attemptTracker.closeAttempt(attempt)
+            if (!committed) {
+                rejectedUsbToClose?.let(attemptTracker::closeDetachedDescriptor)
                 return false
             }
             try {
@@ -2895,28 +2895,42 @@ internal class UsbSessionAttemptTracker<T : Any>(
         !attempt.isClosing && activeAttempt === attempt
     }
 
-    fun attachDescriptor(attempt: UsbSessionAttempt<T>, descriptor: T): Boolean {
-        var completionToSignal: CompletableDeferred<Unit>? = null
-        val shouldCloseUnattached: Boolean
-        val accepted = synchronized(lock) {
-            if (attempt.isClosing || activeAttempt !== attempt) {
-                shouldCloseUnattached = attempt.markDescriptorClosed()
-                if (shouldCloseUnattached) {
-                    completionToSignal = pendingCloseTracker?.register()
-                }
-                false
+    fun attachDescriptorOrDetachRejected(
+        attempt: UsbSessionAttempt<T>,
+        descriptor: T,
+    ): Pair<Boolean, DetachedUsbDescriptor<T>?> = synchronized(lock) {
+        if (attempt.isClosing || activeAttempt !== attempt) {
+            val detached = if (attempt.markDescriptorClosed()) {
+                DetachedUsbDescriptor(descriptor, pendingCloseTracker?.register())
             } else {
-                shouldCloseUnattached = false
-                attempt.descriptor = descriptor
-                true
+                null
             }
+            false to detached
+        } else {
+            attempt.descriptor = descriptor
+            true to null
         }
-        if (!accepted && shouldCloseUnattached) {
-            try {
-                closeDescriptor(descriptor)
-            } finally {
-                completionToSignal?.complete(Unit)
-            }
+    }
+
+    fun rejectUnattachedDescriptorForClose(
+        attempt: UsbSessionAttempt<T>,
+        descriptor: T,
+    ): DetachedUsbDescriptor<T>? = synchronized(lock) {
+        attempt.markClosing()
+        if (activeAttempt === attempt) {
+            activeAttempt = null
+        }
+        if (attempt.markDescriptorClosed()) {
+            DetachedUsbDescriptor(descriptor, pendingCloseTracker?.register())
+        } else {
+            null
+        }
+    }
+
+    fun attachDescriptor(attempt: UsbSessionAttempt<T>, descriptor: T): Boolean {
+        val (accepted, rejectedToClose) = attachDescriptorOrDetachRejected(attempt, descriptor)
+        if (!accepted && rejectedToClose != null) {
+            closeDetachedDescriptor(rejectedToClose)
         }
         return accepted
     }
