@@ -771,7 +771,7 @@ class CamCraftStreamService : Service() {
 
     private suspend fun handleClientConnection(clientSocket: Socket) {
         synchronized(lifecycleLock) {
-            if (isStopping.get() || (usbJob?.isActive == true && usbAttemptTracker.hasActiveNonClosingAttempt())) {
+            if (isStopping.get() || isUsbBlockingTcpAdmission(usbJob?.isActive == true, usbAttemptTracker)) {
                 Log.i(TAG, "Ignoring incoming TCP connection (stopping or USB AOA active)")
                 try {
                     clientSocket.close()
@@ -811,7 +811,7 @@ class CamCraftStreamService : Service() {
                 outputStream = outputStream,
                 closeTransport = closeTransport,
                 isTransportStillCurrent = {
-                    val usbActive = usbJob?.isActive == true && usbAttemptTracker.hasActiveNonClosingAttempt()
+                    val usbActive = isUsbBlockingTcpAdmission(usbJob?.isActive == true, usbAttemptTracker)
                     !usbActive && activeTcpSockets.contains(clientSocket) && !clientSocket.isClosed
                 },
             )
@@ -847,14 +847,6 @@ class CamCraftStreamService : Service() {
             }
             previousUsbJob = existing
             attempt = usbAttemptTracker.beginAttempt(accessoryTag = accessory)
-
-            // Preempt all active or pending Wi-Fi client sockets so USB Direct takes ownership immediately.
-            val socketsToPreempt = activeTcpSockets.toList()
-            for (socket in socketsToPreempt) {
-                try {
-                    socket.close()
-                } catch (_: IOException) {}
-            }
 
             usbJob = serviceScope.launch {
                 var inputStream: DataInputStream? = null
@@ -897,7 +889,23 @@ class CamCraftStreamService : Service() {
                         },
                     ) ?: return@launch
 
-                    if (!usbAttemptTracker.attachDescriptor(attempt, pfd)) {
+                    if (!attachUsbDescriptorAndPreemptTcp(
+                            lifecycleLock = lifecycleLock,
+                            attemptTracker = usbAttemptTracker,
+                            attempt = attempt,
+                            descriptor = pfd,
+                            isCancelledOrStopped = { isStopping.get() || !isActive },
+                            activeTcpSockets = activeTcpSockets,
+                            detachActiveTcpSessionLocked = {
+                                val current = activeSession
+                                if (current != null) {
+                                    activeSession = null
+                                    controlCoordinator.clearActiveSessionIfCurrent(current)
+                                }
+                                current
+                            },
+                        )
+                    ) {
                         return@launch
                     }
 
@@ -1961,6 +1969,58 @@ class CamCraftStreamService : Service() {
             }
         }
 
+        internal fun <T : Any> isUsbBlockingTcpAdmission(
+            usbJobActive: Boolean,
+            attemptTracker: UsbSessionAttemptTracker<T>,
+        ): Boolean = usbJobActive && attemptTracker.hasActiveDescriptor()
+
+        internal fun <T : Any, S : Closeable> attachUsbDescriptorAndPreemptTcp(
+            lifecycleLock: Any,
+            attemptTracker: UsbSessionAttemptTracker<T>,
+            attempt: UsbSessionAttempt<T>,
+            descriptor: T,
+            isCancelledOrStopped: () -> Boolean,
+            activeTcpSockets: MutableSet<S>,
+            detachActiveTcpSessionLocked: () -> ClientSessionHandle? = { null },
+            closeSocket: (S) -> Unit = { socket ->
+                try {
+                    socket.close()
+                } catch (_: IOException) {}
+            },
+        ): Boolean {
+            if (isCancelledOrStopped()) {
+                attemptTracker.closeAttempt(attempt)
+                attemptTracker.attachDescriptor(attempt, descriptor)
+                return false
+            }
+            if (!attemptTracker.attachDescriptor(attempt, descriptor)) {
+                return false
+            }
+            var sessionToPreempt: ClientSessionHandle? = null
+            var socketsToPreempt: List<S> = emptyList()
+            val stillCurrent = synchronized(lifecycleLock) {
+                if (isCancelledOrStopped() || !attemptTracker.isAttemptCurrent(attempt, descriptor)) {
+                    false
+                } else {
+                    sessionToPreempt = detachActiveTcpSessionLocked()
+                    socketsToPreempt = activeTcpSockets.toList()
+                    activeTcpSockets.clear()
+                    true
+                }
+            }
+            if (!stillCurrent) {
+                attemptTracker.closeAttempt(attempt)
+                return false
+            }
+            try {
+                sessionToPreempt?.close()
+            } catch (_: Throwable) {}
+            for (socket in socketsToPreempt) {
+                closeSocket(socket)
+            }
+            return true
+        }
+
         internal suspend fun <S : Closeable> bindServerSocketWithRetiringListenerRetry(
             listenerCloseTracker: PendingCloseTracker,
             isCancelledOrStopped: () -> Boolean,
@@ -2824,6 +2884,11 @@ internal class UsbSessionAttemptTracker<T : Any>(
     fun hasActiveNonClosingAttempt(): Boolean = synchronized(lock) {
         val current = activeAttempt
         current != null && !current.isClosing
+    }
+
+    fun hasActiveDescriptor(): Boolean = synchronized(lock) {
+        val current = activeAttempt
+        current != null && !current.isClosing && current.descriptor != null
     }
 
     fun isAttemptPendingOrActive(attempt: UsbSessionAttempt<T>): Boolean = synchronized(lock) {

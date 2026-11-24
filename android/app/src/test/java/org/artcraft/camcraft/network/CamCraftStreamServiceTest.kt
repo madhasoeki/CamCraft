@@ -2993,6 +2993,243 @@ class CamCraftStreamServiceTest {
     }
 
     @Test
+    fun usbWaitingForRetirementAllowsTcpUntilDescriptorAcquiredThenPreemptsTcp() = runBlocking {
+        val sharedUsbCloseTracker = PendingCloseTracker()
+        val lifecycleLock = Any()
+        val allowOldClose1 = CountDownLatch(1)
+        val allowOldClose3 = CountDownLatch(1)
+        val workerFailure = AtomicReference<Throwable?>(null)
+        val closedUsbTags = Collections.synchronizedList(mutableListOf<String>())
+
+        val instance1Tracker = UsbSessionAttemptTracker<Closeable>(
+            pendingCloseTracker = sharedUsbCloseTracker,
+        ) { descriptor ->
+            descriptor.close()
+        }
+        val instance2Tracker = UsbSessionAttemptTracker<Closeable>(
+            pendingCloseTracker = sharedUsbCloseTracker,
+        ) { descriptor ->
+            descriptor.close()
+        }
+
+        val ioExecutor = Executors.newSingleThreadExecutor { r ->
+            Thread(r, "test-usb-tcp-preempt").apply { isDaemon = true }
+        }
+        try {
+            // 1. While USB waits across retirement timeouts, TCP remains admitted (no active descriptor yet).
+            val oldCloseEntered1 = CountDownLatch(1)
+            val oldAttempt1 = instance1Tracker.beginAttempt()
+            val oldDescriptor1 = Closeable {
+                oldCloseEntered1.countDown()
+                val released = allowOldClose1.await(5, TimeUnit.SECONDS)
+                if (!released) {
+                    throw AssertionError("Timed out waiting for allowOldClose1 gate")
+                }
+            }
+            assertTrue(instance1Tracker.attachDescriptor(oldAttempt1, oldDescriptor1))
+            val detached1 = instance1Tracker.detachActiveAttemptForClose()!!
+            val closeFuture1 = ioExecutor.submit {
+                try {
+                    instance1Tracker.closeDetachedDescriptor(detached1)
+                } catch (t: Throwable) {
+                    workerFailure.compareAndSet(null, t)
+                }
+            }
+            assertTrue(oldCloseEntered1.await(2, TimeUnit.SECONDS))
+
+            val attempt1 = instance2Tracker.beginAttempt()
+            val timeoutObserved1 = CountDownLatch(1)
+            val openJob1 = async(Dispatchers.IO) {
+                CamCraftStreamService.openUsbAccessoryAfterRetirement(
+                    usbCloseTracker = sharedUsbCloseTracker,
+                    attemptTracker = instance2Tracker,
+                    attempt = attempt1,
+                    isCancelledOrStopped = { false },
+                    retireWaitTimeoutMs = 40L,
+                    onRetirementTimeout = { timeoutObserved1.countDown() },
+                ) {
+                    Closeable { closedUsbTags.add("usb-1") }
+                }
+            }
+            assertTrue(timeoutObserved1.await(2, TimeUnit.SECONDS))
+            assertTrue(instance2Tracker.hasActiveNonClosingAttempt())
+            assertFalse(instance2Tracker.hasActiveDescriptor())
+            assertFalse(
+                CamCraftStreamService.isUsbBlockingTcpAdmission(
+                    usbJobActive = true,
+                    attemptTracker = instance2Tracker,
+                ),
+            )
+
+            // 2. TCP stays active while USB waits; once retirement finishes and USB acquires its descriptor,
+            //    attachUsbDescriptorAndPreemptTcp marks USB active and preempts active TCP session & sockets.
+            val tcpTransportClosed = AtomicBoolean(false)
+            val tcpSocketClosed = AtomicBoolean(false)
+            val tcpSocket = Closeable { tcpSocketClosed.set(true) }
+            val activeTcpSockets = mutableSetOf(tcpSocket)
+            var activeSession: ClientSessionHandle? = ClientSessionHandle(
+                sessionId = 71L,
+                output = ByteArrayOutputStream(),
+                outputLock = Any(),
+                closeTransport = { tcpTransportClosed.set(true) },
+            )
+
+            allowOldClose1.countDown()
+            val usbDesc1 = withTimeout(2_000L) { openJob1.await() }
+            assertNotNull(usbDesc1)
+            closeFuture1.get(2, TimeUnit.SECONDS)
+            workerFailure.get()?.let { throw it }
+
+            val attached = CamCraftStreamService.attachUsbDescriptorAndPreemptTcp(
+                lifecycleLock = lifecycleLock,
+                attemptTracker = instance2Tracker,
+                attempt = attempt1,
+                descriptor = usbDesc1!!,
+                isCancelledOrStopped = { false },
+                activeTcpSockets = activeTcpSockets,
+                detachActiveTcpSessionLocked = {
+                    activeSession.also { activeSession = null }
+                },
+            )
+            assertTrue(attached)
+            assertTrue(instance2Tracker.hasActiveDescriptor())
+            assertTrue(
+                CamCraftStreamService.isUsbBlockingTcpAdmission(
+                    usbJobActive = true,
+                    attemptTracker = instance2Tracker,
+                ),
+            )
+            assertNull(activeSession)
+            assertTrue(tcpTransportClosed.get())
+            assertTrue(tcpSocketClosed.get())
+            assertTrue(activeTcpSockets.isEmpty())
+
+            instance2Tracker.closeAttempt(attempt1)
+            assertTrue(closedUsbTags.contains("usb-1"))
+            assertFalse(instance2Tracker.hasActiveDescriptor())
+            assertFalse(
+                CamCraftStreamService.isUsbBlockingTcpAdmission(
+                    usbJobActive = true,
+                    attemptTracker = instance2Tracker,
+                ),
+            )
+
+            // 3. Cancelled/stopped attach rejects & closes USB descriptor without preempting TCP.
+            val tcpSocket2Closed = AtomicBoolean(false)
+            val tcpSocket2 = Closeable { tcpSocket2Closed.set(true) }
+            activeTcpSockets.add(tcpSocket2)
+            val attempt2 = instance2Tracker.beginAttempt()
+            val usbDesc2 = Closeable { closedUsbTags.add("usb-2") }
+            val attachedCancelled = CamCraftStreamService.attachUsbDescriptorAndPreemptTcp(
+                lifecycleLock = lifecycleLock,
+                attemptTracker = instance2Tracker,
+                attempt = attempt2,
+                descriptor = usbDesc2,
+                isCancelledOrStopped = { true },
+                activeTcpSockets = activeTcpSockets,
+            )
+            assertFalse(attachedCancelled)
+            assertTrue(closedUsbTags.contains("usb-2"))
+            assertFalse(instance2Tracker.hasActiveDescriptor())
+            assertFalse(tcpSocket2Closed.get())
+            assertTrue(activeTcpSockets.contains(tcpSocket2))
+            assertTrue(sharedUsbCloseTracker.snapshot().first.isEmpty())
+
+            // 4. Cancelling a USB retry waiting on retirement lets pending close I/O complete so a
+            //    replacement USB attempt can open and preempt TCP once retirement finishes.
+            val oldCloseEntered3 = CountDownLatch(1)
+            val oldCloseCount3 = AtomicInteger(0)
+            val oldAttempt3 = instance1Tracker.beginAttempt()
+            val oldDescriptor3 = Closeable {
+                oldCloseEntered3.countDown()
+                val released = allowOldClose3.await(5, TimeUnit.SECONDS)
+                if (!released) {
+                    throw AssertionError("Timed out waiting for allowOldClose3 gate")
+                }
+                oldCloseCount3.incrementAndGet()
+            }
+            assertTrue(instance1Tracker.attachDescriptor(oldAttempt3, oldDescriptor3))
+            val detached3 = instance1Tracker.detachActiveAttemptForClose()!!
+            val closeFuture3 = ioExecutor.submit {
+                try {
+                    instance1Tracker.closeDetachedDescriptor(detached3)
+                } catch (t: Throwable) {
+                    workerFailure.compareAndSet(null, t)
+                }
+            }
+            assertTrue(oldCloseEntered3.await(2, TimeUnit.SECONDS))
+
+            val attempt3 = instance2Tracker.beginAttempt()
+            val timeoutObserved3 = CountDownLatch(1)
+            val waitingJob3 = async(Dispatchers.IO) {
+                CamCraftStreamService.openUsbAccessoryAfterRetirement(
+                    usbCloseTracker = sharedUsbCloseTracker,
+                    attemptTracker = instance2Tracker,
+                    attempt = attempt3,
+                    isCancelledOrStopped = { false },
+                    retireWaitTimeoutMs = 40L,
+                    onRetirementTimeout = { timeoutObserved3.countDown() },
+                ) {
+                    Closeable { closedUsbTags.add("usb-3") }
+                }
+            }
+            assertTrue(timeoutObserved3.await(2, TimeUnit.SECONDS))
+            waitingJob3.cancel()
+            withTimeout(2_000L) { waitingJob3.join() }
+            assertTrue(waitingJob3.isCancelled)
+            instance2Tracker.closeAttempt(attempt3)
+
+            // Pending old close I/O stays tracked until it actually finishes; TCP remains active.
+            assertFalse(sharedUsbCloseTracker.snapshot().first.isEmpty())
+            assertFalse(
+                CamCraftStreamService.isUsbBlockingTcpAdmission(
+                    usbJobActive = true,
+                    attemptTracker = instance2Tracker,
+                ),
+            )
+            assertFalse(tcpSocket2Closed.get())
+
+            // Once old close I/O completes, a new USB attempt acquires its descriptor and takes over from TCP.
+            allowOldClose3.countDown()
+            closeFuture3.get(2, TimeUnit.SECONDS)
+            workerFailure.get()?.let { throw it }
+            assertEquals(1, oldCloseCount3.get())
+            assertTrue(sharedUsbCloseTracker.snapshot().first.isEmpty())
+
+            val attempt4 = instance2Tracker.beginAttempt()
+            val usbDesc4 = CamCraftStreamService.openUsbAccessoryAfterRetirement(
+                usbCloseTracker = sharedUsbCloseTracker,
+                attemptTracker = instance2Tracker,
+                attempt = attempt4,
+                isCancelledOrStopped = { false },
+                retireWaitTimeoutMs = 2_000L,
+            ) {
+                Closeable { closedUsbTags.add("usb-4") }
+            }
+            assertNotNull(usbDesc4)
+            assertTrue(
+                CamCraftStreamService.attachUsbDescriptorAndPreemptTcp(
+                    lifecycleLock = lifecycleLock,
+                    attemptTracker = instance2Tracker,
+                    attempt = attempt4,
+                    descriptor = usbDesc4!!,
+                    isCancelledOrStopped = { false },
+                    activeTcpSockets = activeTcpSockets,
+                ),
+            )
+            assertTrue(tcpSocket2Closed.get())
+            assertTrue(activeTcpSockets.isEmpty())
+            assertTrue(instance2Tracker.hasActiveDescriptor())
+            instance2Tracker.closeAttempt(attempt4)
+            assertTrue(closedUsbTags.contains("usb-4"))
+        } finally {
+            allowOldClose1.countDown()
+            allowOldClose3.countDown()
+            ioExecutor.shutdownNow()
+        }
+    }
+
+    @Test
     fun listenerBindRetriesAfterCrossInstanceRetiringListenerClosesAndFailsOnExternalOwner() = runBlocking {
         val sharedListenerTracker = PendingCloseTracker()
         val ioExecutor = Executors.newSingleThreadExecutor { r ->
@@ -3079,7 +3316,7 @@ class CamCraftStreamServiceTest {
             assertEquals(2, retryAttemptsA2.get())
 
             // A3a. Unpublished CamCraft startup tracks ownership before bind until unpublished socket closes.
-            val startup1InPublish = CountDownLatch(1)
+            val startup1InBind = CountDownLatch(1)
             val startup2EnteredPreBindWait = CountDownLatch(1)
             val startup1Closed = AtomicBoolean(false)
             val startup1Published = AtomicBoolean(false)
@@ -3093,25 +3330,24 @@ class CamCraftStreamServiceTest {
                     isCancelledOrStopped = { false },
                     bindSocket = {
                         assertTrue(portInUseA3.compareAndSet(false, true))
+                        startup1InBind.countDown()
+                        val released = allowStartup1Reject.await(5, TimeUnit.SECONDS)
+                        if (!released) {
+                            throw AssertionError("Timed out waiting for allowStartup1Reject gate")
+                        }
                         Closeable {
                             startup1Closed.set(true)
                             portInUseA3.set(false)
                         }
                     },
-                    publishSocket = {
-                        startup1InPublish.countDown()
-                        val released = allowStartup1Reject.await(5, TimeUnit.SECONDS)
-                        if (!released) {
-                            throw AssertionError("Timed out waiting for allowStartup1Reject gate")
-                        }
-                        false
-                    },
+                    publishSocket = { false },
                 )?.also {
                     startup1Published.set(true)
                     it.close()
                 }
             }
-            assertTrue(startup1InPublish.await(2, TimeUnit.SECONDS))
+            assertTrue(startup1InBind.await(2, TimeUnit.SECONDS))
+            assertEquals(1, sharedListenerTracker.snapshot().first.size)
 
             val startup2Job = async(Dispatchers.IO) {
                 CamCraftStreamService.bindAndPublishListenerSocket(
@@ -3152,7 +3388,9 @@ class CamCraftStreamServiceTest {
             assertTrue(sharedListenerTracker.snapshot().first.isEmpty())
 
             // A3b. Pre-bind wait expires while unpublished startup still holds port -> retries after socket closes.
-            val startup3InPublish = CountDownLatch(1)
+            val startup3InBind = CountDownLatch(1)
+            val startup4EnteredPreBindWait = CountDownLatch(1)
+            val startup4ObservedPreBindBeforeFirstBind = AtomicBoolean(false)
             val startup3Closed = AtomicBoolean(false)
             val portInUseA3b = AtomicBoolean(false)
             val startup4Attempts = AtomicInteger(0)
@@ -3164,22 +3402,21 @@ class CamCraftStreamServiceTest {
                     isCancelledOrStopped = { false },
                     bindSocket = {
                         assertTrue(portInUseA3b.compareAndSet(false, true))
+                        startup3InBind.countDown()
+                        val hit = startup2HitBindConflict.await(5, TimeUnit.SECONDS)
+                        if (!hit) {
+                            throw AssertionError("Timed out waiting for startup2HitBindConflict gate")
+                        }
                         Closeable {
                             startup3Closed.set(true)
                             portInUseA3b.set(false)
                         }
                     },
-                    publishSocket = {
-                        startup3InPublish.countDown()
-                        val hit = startup2HitBindConflict.await(5, TimeUnit.SECONDS)
-                        if (!hit) {
-                            throw AssertionError("Timed out waiting for startup2HitBindConflict gate")
-                        }
-                        false
-                    },
+                    publishSocket = { false },
                 )
             }
-            assertTrue(startup3InPublish.await(2, TimeUnit.SECONDS))
+            assertTrue(startup3InBind.await(2, TimeUnit.SECONDS))
+            assertEquals(1, sharedListenerTracker.snapshot().first.size)
 
             val startup4Job = async(Dispatchers.IO) {
                 CamCraftStreamService.bindAndPublishListenerSocket(
@@ -3187,6 +3424,12 @@ class CamCraftStreamServiceTest {
                     isCancelledOrStopped = { false },
                     maxRetryAttempts = 40,
                     retryWaitTimeoutMs = 40L,
+                    onPreBindWaitEntered = {
+                        if (startup4Attempts.get() == 0) {
+                            startup4ObservedPreBindBeforeFirstBind.set(true)
+                        }
+                        startup4EnteredPreBindWait.countDown()
+                    },
                     bindSocket = {
                         startup4Attempts.incrementAndGet()
                         if (!portInUseA3b.compareAndSet(false, true)) {
@@ -3203,6 +3446,8 @@ class CamCraftStreamServiceTest {
                     },
                 )
             }
+            assertTrue(startup4EnteredPreBindWait.await(2, TimeUnit.SECONDS))
+            assertTrue(startup4ObservedPreBindBeforeFirstBind.get())
             val boundStartup4 = withTimeout(3_000L) { startup4Job.await() }
             assertNull(withTimeout(2_000L) { startup3Job.await() })
             assertTrue(startup3Closed.get())
