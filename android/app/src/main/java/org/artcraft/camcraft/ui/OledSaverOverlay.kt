@@ -92,20 +92,15 @@ object OledSaverMotion {
         StreamConnectionStatus.STOPPED -> "CAMCRAFT STANDBY"
     }
 
-    fun formatDetailLine(state: StreamServiceState): String = when (state.status) {
-        StreamConnectionStatus.CONNECTED,
-        StreamConnectionStatus.LISTENING,
-        -> {
-            val micLabel = when {
-                !state.activeState.audioEnabled -> "Mic OFF"
-                state.activeState.audioMuted -> "Mic Muted"
-                else -> "Mic ON"
-            }
-            "$micLabel • Double-tap anywhere to wake"
+    fun formatDetailLine(state: StreamServiceState): String = if (state.isServerActive) {
+        val micLabel = when {
+            !state.activeState.audioEnabled -> "Mic OFF"
+            state.activeState.audioMuted -> "Mic Muted"
+            else -> "Mic ON"
         }
-        StreamConnectionStatus.ERROR,
-        StreamConnectionStatus.STOPPED,
-        -> "Double-tap anywhere to wake"
+        "$micLabel • Double-tap anywhere to wake"
+    } else {
+        "Double-tap anywhere to wake"
     }
 
     fun formatDetailLine(state: StreamServiceState, batterySummary: String?): String {

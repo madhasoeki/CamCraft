@@ -107,8 +107,7 @@ fun CamCraftScreen(
     onCheckUpdates: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
-    val isRunning = state.status == StreamConnectionStatus.LISTENING ||
-        state.status == StreamConnectionStatus.CONNECTED
+    val isRunning = state.isServerActive
     val activeCamera = state.cameras.find { it.id == state.activeState.cameraId }
     val activeCameraLabel = activeCamera?.label ?: "Camera ${state.activeState.cameraId}"
     val hasFlash = activeCamera?.hasFlash ?: true
@@ -145,6 +144,7 @@ fun CamCraftScreen(
 
         ViewfinderStage(
             status = state.status,
+            hasActiveSession = state.hasActiveSession,
             showViewfinder = showViewfinder,
             wifiEndpoint = state.wifiEndpoint,
             listenPort = state.listenPort,
@@ -672,6 +672,7 @@ private fun UpdateBanner(
 @Composable
 private fun ViewfinderStage(
     status: StreamConnectionStatus,
+    hasActiveSession: Boolean,
     showViewfinder: Boolean,
     wifiEndpoint: String?,
     listenPort: Int,
@@ -740,6 +741,7 @@ private fun ViewfinderStage(
         } else {
             IdleStageContent(
                 status = status,
+                hasActiveSession = hasActiveSession,
                 wifiEndpoint = wifiEndpoint,
                 listenPort = listenPort,
                 mdnsRegistered = mdnsRegistered,
@@ -1042,6 +1044,7 @@ private fun ViewfinderPausedPlaceholder() {
 @Composable
 private fun IdleStageContent(
     status: StreamConnectionStatus,
+    hasActiveSession: Boolean,
     wifiEndpoint: String?,
     listenPort: Int,
     mdnsRegistered: Boolean,
@@ -1135,7 +1138,7 @@ private fun IdleStageContent(
                 }
                 Spacer(modifier = Modifier.height(14.dp))
                 Text(
-                    text = "SERVER ERROR",
+                    text = if (hasActiveSession) "VIDEO UNAVAILABLE" else "SERVER ERROR",
                     color = ArtCraftColors.StatusRose,
                     style = MaterialTheme.typography.titleSmall,
                     letterSpacing = 0.8.sp,

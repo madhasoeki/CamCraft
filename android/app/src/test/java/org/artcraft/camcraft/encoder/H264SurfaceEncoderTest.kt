@@ -2,8 +2,11 @@ package org.artcraft.camcraft.encoder
 
 import android.media.MediaCodecInfo
 import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicInteger
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class H264SurfaceEncoderTest {
@@ -120,5 +123,160 @@ class H264SurfaceEncoderTest {
             byteArrayOf(0, 0, 0, 1, 0x65, 0x88.toByte(), 0x84.toByte()),
             scratch.copyOfRange(slice.offset, slice.offset + slice.length),
         )
+    }
+
+    @Test
+    fun drainReleaseCoordinatorDefersCleanupWhileCallbackStalledAndFinalizesOnce() {
+        // 1. Stalled drain thread still running when release() is requested:
+        //    requestRelease() must return false so codec/surface are NOT released early,
+        //    and markDrainExited() must trigger cleanup exactly once once drain finishes.
+        val stalledCoord = DrainReleaseCoordinator()
+        stalledCoord.markDrainStarted()
+        assertFalse(stalledCoord.requestRelease())
+        assertTrue(stalledCoord.isReleaseRequested())
+        assertFalse(stalledCoord.isFinalized())
+
+        // Repeated release request remains safe and returns false.
+        assertFalse(stalledCoord.requestRelease())
+        assertFalse(stalledCoord.isFinalized())
+
+        // Stalled callback unblocks and drain exits -> finalizes once.
+        assertTrue(stalledCoord.markDrainExited())
+        assertTrue(stalledCoord.isFinalized())
+        assertFalse(stalledCoord.markDrainExited())
+        assertFalse(stalledCoord.requestRelease())
+
+        // 2. Normal exit before release(): requestRelease() finalizes immediately and idempotently.
+        val normalCoord = DrainReleaseCoordinator()
+        normalCoord.markDrainStarted()
+        assertFalse(normalCoord.markDrainExited())
+        assertTrue(normalCoord.requestRelease())
+        assertTrue(normalCoord.isFinalized())
+        assertFalse(normalCoord.requestRelease())
+
+        // 3. Never-started release(): requestRelease() finalizes immediately once.
+        val unstartedCoord = DrainReleaseCoordinator()
+        assertTrue(unstartedCoord.requestRelease())
+        assertTrue(unstartedCoord.isFinalized())
+        assertFalse(unstartedCoord.requestRelease())
+    }
+
+    @Test
+    fun drainReleaseCoordinatorSignalsCompletionOnlyAfterTeardownIncludingDeferredExit() {
+        // 1. Deferred teardown: callback must NOT fire at requestRelease() nor merely at markDrainExited()
+        //    before releaseCodecAndSurfaceLocked() calls markTeardownCompleted().
+        val deferredCoord = DrainReleaseCoordinator()
+        val deferredCalls = AtomicInteger(0)
+        deferredCoord.markDrainStarted()
+        deferredCoord.onTeardownCompleted { deferredCalls.incrementAndGet() }
+
+        assertFalse(deferredCoord.requestRelease())
+        assertFalse(deferredCoord.isTeardownCompleted())
+        assertEquals(0, deferredCalls.get())
+
+        assertTrue(deferredCoord.markDrainExited())
+        assertFalse(deferredCoord.isTeardownCompleted())
+        assertEquals(0, deferredCalls.get())
+
+        deferredCoord.markTeardownCompleted()
+        assertTrue(deferredCoord.isTeardownCompleted())
+        assertEquals(1, deferredCalls.get())
+
+        // Idempotent markTeardownCompleted() must not re-fire, and late listener fires immediately once.
+        deferredCoord.markTeardownCompleted()
+        assertEquals(1, deferredCalls.get())
+        val lateCalls = AtomicInteger(0)
+        deferredCoord.onTeardownCompleted { lateCalls.incrementAndGet() }
+        assertEquals(1, lateCalls.get())
+
+        // 2. Synchronous teardown: signals once markTeardownCompleted() runs after requestRelease().
+        val syncCoord = DrainReleaseCoordinator()
+        val syncCalls = AtomicInteger(0)
+        syncCoord.markDrainStarted()
+        assertFalse(syncCoord.markDrainExited())
+        syncCoord.onTeardownCompleted { syncCalls.incrementAndGet() }
+        assertTrue(syncCoord.requestRelease())
+        assertEquals(0, syncCalls.get())
+        syncCoord.markTeardownCompleted()
+        assertEquals(1, syncCalls.get())
+    }
+
+    @Test
+    fun drainReleaseCoordinatorSeparatesCodecReleaseFailureFromConfirmedSuccess() {
+        val failedCoord = DrainReleaseCoordinator()
+        val successOnlyCalls = AtomicInteger(0)
+        val resultEvents = mutableListOf<Boolean>()
+
+        failedCoord.markDrainStarted()
+        failedCoord.onTeardownCompleted { successOnlyCalls.incrementAndGet() }
+        failedCoord.onTeardownResult { codecReleased -> resultEvents.add(codecReleased) }
+
+        assertFalse(failedCoord.requestRelease())
+        assertTrue(failedCoord.markDrainExited())
+        failedCoord.markTeardownCompleted(codecReleased = false)
+
+        // Teardown attempt completed, but codec release failed -> success-only listeners MUST NOT run.
+        assertTrue(failedCoord.isTeardownCompleted())
+        assertFalse(failedCoord.isTeardownSucceeded())
+        assertEquals(0, successOnlyCalls.get())
+        assertEquals(listOf(false), resultEvents)
+
+        // Late listeners observe the recorded failure status accurately without firing success hooks.
+        val lateResultEvents = mutableListOf<Boolean>()
+        failedCoord.onTeardownCompleted { successOnlyCalls.incrementAndGet() }
+        failedCoord.onTeardownResult { codecReleased -> lateResultEvents.add(codecReleased) }
+        assertEquals(0, successOnlyCalls.get())
+        assertEquals(listOf(false), lateResultEvents)
+    }
+
+    @Test
+    fun startDrainThreadTransactionallyRollsBackOnFailureAndPreservesOnSuccess() {
+        val rollbackCount = AtomicInteger(0)
+        val createdCount = AtomicInteger(0)
+        var capturedThread: Thread? = null
+
+        // Success path: no rollback runs and thread reference is preserved.
+        H264SurfaceEncoder.startDrainThreadTransactionally(
+            createThread = {
+                createdCount.incrementAndGet()
+                Thread { }
+            },
+            onThreadCreated = { capturedThread = it },
+            startThread = { /* simulated start without spawning extra OS thread */ },
+            onRollback = { rollbackCount.incrementAndGet() },
+        )
+        assertEquals(1, createdCount.get())
+        assertEquals(0, rollbackCount.get())
+        assertTrue(capturedThread != null)
+
+        // Thread creation Error (e.g., OOM) triggers rollback before rethrowing.
+        var threwCreateError = false
+        try {
+            H264SurfaceEncoder.startDrainThreadTransactionally(
+                createThread = { throw OutOfMemoryError("pthread_create failed") },
+                onThreadCreated = { },
+                startThread = { },
+                onRollback = { rollbackCount.incrementAndGet() },
+            )
+        } catch (_: OutOfMemoryError) {
+            threwCreateError = true
+        }
+        assertTrue(threwCreateError)
+        assertEquals(1, rollbackCount.get())
+
+        // Thread.start() failure triggers rollback before rethrowing.
+        var threwStartError = false
+        try {
+            H264SurfaceEncoder.startDrainThreadTransactionally(
+                createThread = { Thread { } },
+                onThreadCreated = { },
+                startThread = { throw OutOfMemoryError("unable to create native thread") },
+                onRollback = { rollbackCount.incrementAndGet() },
+            )
+        } catch (_: OutOfMemoryError) {
+            threwStartError = true
+        }
+        assertTrue(threwStartError)
+        assertEquals(2, rollbackCount.get())
     }
 }

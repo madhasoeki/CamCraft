@@ -95,10 +95,7 @@ class MainActivity : ComponentActivity() {
                     CamCraftScreen(
                         state = serviceState,
                         onToggleServer = {
-                            val isRunning = serviceState.status == StreamConnectionStatus.LISTENING ||
-                                serviceState.status == StreamConnectionStatus.CONNECTED
-
-                            if (isRunning) {
+                            if (serviceState.isServerActive) {
                                 CamCraftStreamService.stop(this@MainActivity)
                             } else {
                                 startServerWithPermissionCheck()
